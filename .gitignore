@@ -1,0 +1,27 @@
+target/
+log/
+.codex_backup/
+
+# Runtime memory/state
+memory/
+context/**/*.json
+context/**/*.jsonl
+context/**/notebook/
+context/*/games/*/context/
+context/*/games/*/notebook/
+context/adviceboard.json
+
+# Sensitive local configuration
+config/**/api.json
+config/**/api.lastgood.json
+config/**/*.lastgood.json
+
+# Local editor / OS noise
+.DS_Store
+Thumbs.db
+
+# Local media links
+media/camera
+media/dcim
+media/pictures
+media/screenshots
