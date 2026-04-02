@@ -217,7 +217,7 @@
                     "action": {
                         "type": "string",
                         "enum": ["write", "summary", "compact", "task_enter", "task_exit", "focus_enter", "focus_exit", "replace"],
-                        "description": "Context action. Prefer `task_mode.enter` / `task_mode.exit`; `task_enter` / `task_exit` remain available here only as compatibility aliases, and legacy `focus_enter` / `focus_exit` remain valid too. `replace` is accepted as an alias of `summary`. `summary` is the normal high-frequency maintenance action. `write` is mainly for fastmemory notes or narrow structured writes. `compact` is whole-area archival compression, and should be used directly when a threshold/system maintenance ticket explicitly asks for it."
+"description": "Context action. Prefer `task_mode.enter` / `task_mode.exit`; `task_enter` / `task_exit` remain available here only as compatibility aliases, and legacy `focus_enter` / `focus_exit` remain valid too. `replace` is accepted as an alias of `summary`. `summary` is the normal high-frequency maintenance action. `write` is mainly for fastmemory notes or narrow structured writes. `compact` is whole-area archival compression, and should be used directly when a threshold/system maintenance ticket explicitly asks for it. For any `compact` call, `text` is required and must contain the new condensed replacement summary (Compact_TEXT) that should remain after compression."
                     },
                     "target": {
                         "type": "string",

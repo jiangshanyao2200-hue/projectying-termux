@@ -2624,7 +2624,12 @@ impl App {
         if current_revision != pending.base_revision
             || current_latest_entry_id != pending.latest_entry_id
         {
-            self.reschedule_stale_advisor_submission();
+            self.discard_stale_advisor_submission(
+                pending.base_revision,
+                pending.latest_entry_id,
+                current_revision,
+                current_latest_entry_id,
+            );
             return true;
         }
 
@@ -2717,27 +2722,34 @@ impl App {
         true
     }
 
-    fn reschedule_stale_advisor_submission(&mut self) {
+    fn discard_stale_advisor_submission(
+        &mut self,
+        base_revision: u64,
+        audited_latest_entry_id: u64,
+        current_revision: u64,
+        current_latest_entry_id: u64,
+    ) {
         context::set_persona(PersonaKind::Matrix);
-        let latest_entry_id = context::latest_active_entry_stable_id().unwrap_or(0);
-        let interval = self.settings.advisor_interval_entries();
         self.pending_advisor_submission = None;
-        self.advisor_last_triggered_entry_id = latest_entry_id.saturating_sub(interval);
         self.bind_active_persona_runtime();
         let _ = crate::departmentrs::log_event(
             "INFO",
-            "flow.advisor.submission_rescheduled",
+            "flow.advisor.submission_discarded",
             json!({
-                "latest_entry_id": latest_entry_id,
-                "interval": interval,
+                "base_revision": base_revision,
+                "audited_latest_entry_id": audited_latest_entry_id,
+                "current_revision": current_revision,
+                "current_latest_entry_id": current_latest_entry_id,
             }),
         );
         self.push_system_request_notice(
             "ADVISOR",
-            format!("Advisor 提案已重排\nReason：context changed\nLatest Entry：{latest_entry_id}")
-                .as_str(),
+            format!(
+                "Advisor 提案已丢弃\nReason：context changed after audit window\nAudit Window：<= e{audited_latest_entry_id}\nCurrent Latest：e{current_latest_entry_id}"
+            )
+            .as_str(),
         );
-        self.apply_status_message("Advisor 提案已过期，已按最新上下文重排审计".to_string());
+        self.apply_status_message("Advisor 提案已过期，本轮跳过提交，等待下一次审计窗口".to_string());
     }
 
     fn build_advisor_notice_text(
@@ -7020,7 +7032,7 @@ mod app_tests {
     }
 
     #[test]
-    fn advisor_submission_revision_conflict_reschedules_audit() {
+    fn advisor_submission_revision_conflict_discards_stale_batch_without_requeue_loop() {
         with_test_context_home(|| {
             context::set_persona(PersonaKind::Matrix);
             context::clear_messages().expect("clear");
@@ -7054,7 +7066,7 @@ mod app_tests {
 
             assert!(app.maybe_commit_advisor_submission());
             assert!(app.pending_advisor_submission.is_none());
-            assert!(app.advisor_last_triggered_entry_id <= latest_entry_id);
+            assert_eq!(app.advisor_last_triggered_entry_id, latest_entry_id);
 
             let package = context::build_advisor_audit_package().expect("advisor package");
             assert!(
@@ -7068,6 +7080,13 @@ mod app_tests {
                     .fastmemory
                     .iter()
                     .all(|item| !item.text.contains("不应写入"))
+            );
+            assert!(
+                app.chat.iter().any(|msg| {
+                    msg.role == chat::Role::System
+                        && msg.content.contains("Advisor 提案已丢弃")
+                }),
+                "should surface discarded stale advisor batch"
             );
         });
     }
@@ -7291,6 +7310,20 @@ mod app_tests {
             ]
         );
         crate::mcp::set_tool_persona(PersonaKind::Matrix);
+    }
+
+    #[test]
+    fn matrix_schema_hides_context_management_tools() {
+        crate::mcp::set_tool_persona(PersonaKind::Matrix);
+        let tools = crate::mcp::codex_tools();
+        let names = tools
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"context_manage"));
+        assert!(!names.contains(&"task_mode"));
     }
 
     #[test]
@@ -21489,9 +21522,8 @@ mod context {
 如需让用户在界面里做结构化对账或确认方案细节，使用 `request_user_input`。优先只问最关键的问题。
 如需查看或终止后台终端，可使用 `pty_list / pty_kill`。
 当前会话的上下文由外置仓储自动注入，并由系统自动保护近期轮次。
-不要直接编辑这些 JSON 文件；如需切换任务模式，优先使用 `task_mode.enter / task_mode.exit`。
-`task_mode` 用于专项任务；`context_manage.task_enter / task_exit / focus_enter / focus_exit` 只保留兼容。进入时写清 `user_goal / reason / task / plan_a / plan_b / fallback / expected_result / exit_condition`；退出时写清 `summary / completed / implemented / steps / key_info / result / exit_reason`。
-表层上下文治理与长期记忆维护由系统和内部治理链负责；你只负责读取记忆、推进任务与在必要时切换任务模式。
+不要直接编辑这些 JSON 文件，也不要主动接管表层上下文治理。
+表层上下文治理与长期记忆维护由系统和 Advisor 等内部治理链负责；你只负责读取记忆、推进任务、调用普通工作工具，以及在需要时把治理需求交还给系统链路。
 长期记忆位于 `memory/`；不要直接编辑这些文件。检索优先 `memory_check -> memory_read`：先定位日期、entry id 或命中范围，再精读。
 `toolmemory` 用于回溯旧工具结果；先定位，再精读。
 如果系统提示上下文或记忆状态异常，只做判断、汇报或交给内部治理链，不要自行执行写入/压缩维护。
@@ -22078,7 +22110,10 @@ mod context {
         let mut lines = vec![
             "[Toolbox]".to_string(),
             "manager: toolbox_manage (always callable)".to_string(),
-            "rule: closed tools cannot be called directly; open them first.".to_string(),
+            "rule: closed tools stay summary-only here and are not projected into provider schema."
+                .to_string(),
+            "rule: open/pinned tools expose full detail in this toolbox block and enter provider schema."
+                .to_string(),
             "rule: use toolbox_manage with reason + plan before changing tool visibility."
                 .to_string(),
         ];
@@ -22195,10 +22230,18 @@ mod context {
             other => anyhow::bail!("不支持的 toolbox_manage.action：{other}"),
         }
         let prompt = render_toolbox_prompt(&load_toolbox_store()?);
-        let visible = projected_toolbox_local_tool_ids()?
+        let detailed = toolbox_specs_from_schema()
             .into_iter()
+            .filter(|spec| {
+                matches!(
+                    state_map.get(spec.tool_id.as_str()).copied(),
+                    Some(ToolboxToolState::Expanded | ToolboxToolState::Pinned)
+                )
+            })
+            .map(|spec| spec.tool_id)
             .collect::<Vec<_>>();
-        let mut model_lines = vec![format!("ToolboxManage succeeded\n• Toolbox · {}", action.to_ascii_uppercase())];
+        let mut model_lines =
+            vec![format!("ToolboxManage succeeded\n• Toolbox · {}", action.to_ascii_uppercase())];
         if let Some(reason) = normalize_optional_text(reason) {
             model_lines.push(format!("• Reason · {reason}"));
         }
@@ -22208,8 +22251,14 @@ mod context {
         if !changed.is_empty() {
             model_lines.push(format!("• Changed · {}", changed.join(", ")));
         }
-        model_lines.push(format!("• Active · {}", visible.join(", ")));
-        model_lines.push(prompt.clone());
+        model_lines.push(format!(
+            "• Detailed In Toolbox · {}",
+            if detailed.is_empty() {
+                "(none)".to_string()
+            } else {
+                detailed.join(", ")
+            }
+        ));
         Ok(ToolboxManageResult {
             model_output: model_lines.join("\n"),
             output_preview: prompt,
@@ -24493,7 +24542,9 @@ protected_rounds: {}",
             } => {
                 let text = normalize_text(text.as_str());
                 if text.is_empty() {
-                    return Err(anyhow!("compact.text 不能为空"));
+                    return Err(anyhow!(
+                        "compact.text 不能为空；compact 必须提供新的压缩摘要 text（Compact_TEXT），它会作为压缩后保留的新内容"
+                    ));
                 }
                 let mut bundle = load_bundle()?;
                 let reply = match target {
@@ -24504,7 +24555,10 @@ protected_rounds: {}",
                             entry_ids.clone()
                         };
                         if resolved_entry_ids.is_empty() {
-                            return Err(anyhow!("compact.{} 没有可压缩条目", target.key()));
+                            return Err(anyhow!(
+                                "compact.{} 没有可被替换的历史条目；compact 需要目标区域里已有旧条目，并且 text 要写成压缩后保留的新摘要",
+                                target.key()
+                            ));
                         }
                         compact_standard_context_into_fastcontext(
                             &mut bundle,
@@ -24519,7 +24573,10 @@ protected_rounds: {}",
                             entry_ids.clone()
                         };
                         if resolved_entry_ids.is_empty() {
-                            return Err(anyhow!("compact.{} 没有可压缩条目", target.key()));
+                            return Err(anyhow!(
+                                "compact.{} 没有可被替换的历史条目；compact 需要目标区域里已有旧条目，并且 text 要写成压缩后保留的新摘要",
+                                target.key()
+                            ));
                         }
                         replace_context_entry_target(
                             &mut bundle,
@@ -24540,7 +24597,9 @@ protected_rounds: {}",
                             item_ids.clone()
                         };
                         if resolved_item_ids.is_empty() {
-                            return Err(anyhow!("compact.fastmemory 没有可压缩条目"));
+                            return Err(anyhow!(
+                                "compact.fastmemory 没有可被替换的历史条目；compact 需要已有旧条目，并且 text 要写成压缩后保留的新摘要"
+                            ));
                         }
                         replace_context_item_target(
                             &mut bundle,
@@ -24558,7 +24617,9 @@ protected_rounds: {}",
                             item_ids.clone()
                         };
                         if resolved_item_ids.is_empty() {
-                            return Err(anyhow!("compact.fastcontext 没有可压缩条目"));
+                            return Err(anyhow!(
+                                "compact.fastcontext 没有可被替换的历史条目；compact 需要已有旧条目，并且 text 要写成压缩后保留的新摘要"
+                            ));
                         }
                         replace_context_item_target(
                             &mut bundle,
@@ -24576,7 +24637,9 @@ protected_rounds: {}",
                             item_ids.clone()
                         };
                         if resolved_item_ids.is_empty() {
-                            return Err(anyhow!("compact.adviceboard 没有可压缩条目"));
+                            return Err(anyhow!(
+                                "compact.adviceboard 没有可被替换的历史条目；compact 需要已有旧条目，并且 text 要写成压缩后保留的新摘要"
+                            ));
                         }
                         replace_context_item_target(
                             &mut bundle,
@@ -25100,6 +25163,72 @@ protected_rounds: {}",
                         .iter()
                         .all(|message| !message.content.contains("[last3round area start]"))
                 );
+            });
+        }
+
+        #[test]
+        fn projected_toolbox_ids_hide_closed_tools_until_opened_in_matrix() {
+            with_test_home(|| {
+                set_persona(crate::PersonaKind::Matrix);
+                crate::mcp::set_tool_persona(crate::PersonaKind::Matrix);
+                clear_messages().expect("clear");
+
+                let specs = toolbox_specs_from_schema();
+                assert!(
+                    specs.len() >= 2,
+                    "expected multiple matrix toolbox specs for regression coverage"
+                );
+                let primary = specs[0].tool_id.clone();
+                let secondary = specs[1].tool_id.clone();
+
+                let prompt = load_toolbox_prompt().expect("load toolbox prompt");
+                assert!(prompt.contains(format!("- [closed] {primary}").as_str()));
+                assert!(
+                    !prompt.contains(format!("desc: {}", specs[0].detail.lines().next().unwrap_or_default().trim_start_matches("desc: ")).as_str()),
+                    "closed tools should stay summary-only inside toolbox prompt"
+                );
+
+                let allowed = projected_toolbox_local_tool_ids().expect("projected ids");
+                assert!(allowed.contains("toolbox_manage"));
+                assert!(!allowed.contains(primary.as_str()));
+                assert!(!allowed.contains(secondary.as_str()));
+            });
+        }
+
+        #[test]
+        fn toolbox_manage_open_projects_schema_and_detail_for_matrix_tools() {
+            with_test_home(|| {
+                set_persona(crate::PersonaKind::Matrix);
+                crate::mcp::set_tool_persona(crate::PersonaKind::Matrix);
+                clear_messages().expect("clear");
+
+                let target = "exec_command".to_string();
+                let before_allowed = projected_toolbox_local_tool_ids().expect("allowed before");
+                assert!(!before_allowed.contains(target.as_str()));
+
+                let before_prompt = load_toolbox_prompt().expect("prompt before");
+                assert!(before_prompt.contains("- [closed] exec_command"));
+                assert!(!before_prompt.contains("desc: Run a shell command."));
+
+                let result = toolbox_manage(
+                    "open",
+                    std::slice::from_ref(&target),
+                    Some("Need detailed guidance for command execution"),
+                    Some("Expose the full tool contract in toolbox"),
+                )
+                .expect("open toolbox item");
+
+                assert!(result.model_output.contains("Detailed In Toolbox"));
+                assert!(result.model_output.contains("exec_command"));
+                assert!(result.model_output.contains("exec_command -> expanded"));
+
+                let after_allowed = projected_toolbox_local_tool_ids().expect("allowed after");
+                assert!(after_allowed.contains(target.as_str()));
+
+                let after_prompt = load_toolbox_prompt().expect("prompt after");
+                assert!(after_prompt.contains("- [expanded] exec_command"));
+                assert!(after_prompt.contains("desc: Run a shell command."));
+                assert!(after_prompt.contains("args:"));
             });
         }
 
@@ -33301,10 +33430,10 @@ mod messageline {
         text: &str,
         placeholders: &[String],
     ) -> (String, Vec<PlaceholderToken>) {
+        let mut prepared = close_unbalanced_fenced_code_blocks(text);
         if placeholders.is_empty() {
-            return (text.to_string(), Vec::new());
+            return (prepared, Vec::new());
         }
-        let mut prepared = text.to_string();
         let mut tokens = Vec::new();
         for (index, placeholder) in placeholders.iter().enumerate() {
             if placeholder.is_empty() || !prepared.contains(placeholder) {
@@ -33318,6 +33447,40 @@ mod messageline {
             });
         }
         (prepared, tokens)
+    }
+
+    fn close_unbalanced_fenced_code_blocks(text: &str) -> String {
+        let mut fence_stack: Vec<String> = Vec::new();
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            let marker = if trimmed.starts_with("```") {
+                Some("```")
+            } else if trimmed.starts_with("~~~") {
+                Some("~~~")
+            } else {
+                None
+            };
+            let Some(marker) = marker else {
+                continue;
+            };
+            if fence_stack.last().is_some_and(|last| last == marker) {
+                fence_stack.pop();
+            } else {
+                fence_stack.push(marker.to_string());
+            }
+        }
+        if fence_stack.is_empty() {
+            return text.to_string();
+        }
+        let mut balanced = text.to_string();
+        if !balanced.ends_with('\n') {
+            balanced.push('\n');
+        }
+        for marker in fence_stack.into_iter().rev() {
+            balanced.push_str(marker.as_str());
+            balanced.push('\n');
+        }
+        balanced
     }
 
     // =============================================================================
@@ -33401,6 +33564,29 @@ mod messageline {
                 .join("\n");
             assert!(joined.contains("标题"));
             assert!(joined.contains("fn main() {}"));
+        }
+
+        #[test]
+        fn unclosed_code_fence_does_not_swallow_following_body() {
+            let lines = render_markdown_to_lines(
+                "前文\n```bash\necho test\n后文结论",
+                80,
+                theme(),
+                MarkdownRenderSpec::default(),
+                &[],
+            );
+            let joined = lines
+                .iter()
+                .flat_map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref().to_string())
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(joined.contains("前文"));
+            assert!(joined.contains("echo test"));
+            assert!(joined.contains("后文结论"));
         }
     }
 }

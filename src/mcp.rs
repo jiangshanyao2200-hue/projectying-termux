@@ -106,8 +106,9 @@ const WAIT_AGENT_MAX_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_AGENT_BATCH_CONCURRENCY: usize = 64;
 const DEFAULT_AGENT_BATCH_CONCURRENCY: usize = 16;
 const DEFAULT_AGENT_BATCH_RUNTIME_SECS: u64 = 1_800;
-const AGENT_EVENT_LOG_LIMIT: usize = 24;
-const AGENT_EVENT_MAX_CHARS: usize = 96;
+const AGENT_EVENT_LOG_LIMIT: usize = 48;
+const AGENT_EVENT_MAX_CHARS: usize = 240;
+const AGENT_COMPLETION_EVENT_MAX_LINES: usize = 24;
 const AGENT_FORK_CONTEXT_MAX_NON_SYSTEM_MESSAGES: usize = 40;
 pub const MIN_AGENT_RETENTION_LIMIT: usize = 10;
 pub const MAX_AGENT_RETENTION_LIMIT: usize = 100;
@@ -1338,12 +1339,26 @@ fn companion_codex_tools() -> Value {
     include!("../context/codexcompanion/schema/codex_tools.rsinc")
 }
 
+fn matrix_schema_hides_tool(name: &str) -> bool {
+    matches!(name, "context_manage" | "task_mode")
+}
+
 pub fn codex_tools() -> Value {
-    match current_tool_persona() {
+    let mut tools = match current_tool_persona() {
         crate::PersonaKind::Matrix => matrix_codex_tools(),
         crate::PersonaKind::Coding => coding_codex_tools(),
         crate::PersonaKind::Companion => companion_codex_tools(),
+    };
+    if matches!(current_tool_persona(), crate::PersonaKind::Matrix)
+        && let Some(items) = tools.as_array_mut()
+    {
+        items.retain(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_none_or(|name| !matrix_schema_hides_tool(name))
+        });
     }
+    tools
 }
 
 pub fn codex_provider_tool_name(name: &str) -> &str {
@@ -2224,6 +2239,7 @@ fn tool_allowed_for_persona(persona: crate::PersonaKind, name: &str) -> bool {
             "exec_command"
                 | "write_stdin"
                 | "view_image"
+                | "toolbox_manage"
                 | "web_search"
                 | "apply_patch"
                 | "request_user_input"
@@ -5014,6 +5030,30 @@ fn agent_completion_preview(text: &str) -> String {
     normalize_agent_event_text(line)
 }
 
+fn push_agent_completion_events(
+    event_lines: &Arc<Mutex<Vec<String>>>,
+    log_path: Option<&Path>,
+    text: &str,
+) {
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(AGENT_COMPLETION_EVENT_MAX_LINES)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        push_agent_event(event_lines, log_path, "✓ 已完成");
+        return;
+    }
+    if let Some(first) = lines.first_mut() {
+        *first = format!("✓ 结论 · {first}");
+    }
+    for line in lines {
+        push_agent_event(event_lines, log_path, line);
+    }
+}
+
 fn compact_agent_preview_line(text: &str, max_chars: usize) -> String {
     let source = text
         .lines()
@@ -5455,11 +5495,6 @@ fn spawn_local_agent_thread(
                     match result {
                         Ok(completion) => {
                             let final_text = completion.text.trim().to_string();
-                            let final_preview = if final_text.is_empty() {
-                                "✓ 已完成".to_string()
-                            } else {
-                                format!("✓ {}", agent_completion_preview(final_text.as_str()))
-                            };
                             if let Ok(mut guard) = transcript.lock() {
                                 guard.push(crate::provider::ApiMessage::user(prompt));
                                 if !final_text.is_empty() {
@@ -5473,7 +5508,21 @@ fn spawn_local_agent_thread(
                                     (!final_text.is_empty()).then_some(final_text),
                                 );
                             }
-                            push_agent_event(&event_lines, Some(log_path.as_path()), final_preview);
+                            if let AgentStatusValue::Completed(Some(text)) =
+                                agent_status_snapshot(&status)
+                            {
+                                push_agent_completion_events(
+                                    &event_lines,
+                                    Some(log_path.as_path()),
+                                    text.as_str(),
+                                );
+                            } else {
+                                push_agent_event(
+                                    &event_lines,
+                                    Some(log_path.as_path()),
+                                    "✓ 已完成",
+                                );
+                            }
                             enforce_multiagent_output_retention();
                         }
                         Err(err) => {
@@ -8974,6 +9023,10 @@ mod tests {
         assert!(tool_allowed_for_persona(
             crate::PersonaKind::Matrix,
             "apply_patch"
+        ));
+        assert!(tool_allowed_for_persona(
+            crate::PersonaKind::Matrix,
+            "toolbox_manage"
         ));
         assert!(tool_allowed_for_persona(
             crate::PersonaKind::Matrix,

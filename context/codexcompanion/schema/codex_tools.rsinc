@@ -322,7 +322,7 @@
                     "action": {
                         "type": "string",
                         "enum": ["write", "summary", "compact", "task_enter", "task_exit", "focus_enter", "focus_exit", "replace"],
-                        "description": "Context management action. Prefer `task_mode.enter` / `task_mode.exit`; `task_enter` / `task_exit` remain available here only as compatibility aliases, and legacy `focus_enter` / `focus_exit` remain valid too. `replace` is accepted as an alias of `summary`. `summary` is the normal high-frequency maintenance action for context, toolcontext, fastmemory, fastcontext, or adviceboard. `write` is mainly for fastmemory notes or narrowly-scoped structured writes. `compact` is low-frequency full-area archival compression, except when a threshold/system maintenance ticket explicitly asks for whole-area compact."
+"description": "Context management action. Prefer `task_mode.enter` / `task_mode.exit`; `task_enter` / `task_exit` remain available here only as compatibility aliases, and legacy `focus_enter` / `focus_exit` remain valid too. `replace` is accepted as an alias of `summary`. `summary` is the normal high-frequency maintenance action for context, toolcontext, fastmemory, fastcontext, or adviceboard. `write` is mainly for fastmemory notes or narrowly-scoped structured writes. `compact` is low-frequency full-area archival compression, except when a threshold/system maintenance ticket explicitly asks for whole-area compact. For any `compact` call, `text` is required and must contain the new condensed replacement summary (Compact_TEXT) that should remain after compression."
                     },
                     "target": {
                         "type": "string",
@@ -363,7 +363,7 @@
                     },
                     "text": {
                         "type": "string",
-                        "description": "Text payload for write / summary / compact. For `summary`, write the condensed surviving text that should remain after merging or shrinking the selected entries/items. Preserve only the facts that still matter. For daily maintenance of `context`, `toolcontext`, `fastmemory`, or `fastcontext`, prefer `summary`; reserve `compact` for full archival compression unless a threshold/system maintenance ticket explicitly asks for it."
+"description": "Text payload for write / summary / compact. For `summary`, write the condensed surviving text that should remain after merging or shrinking the selected entries/items. Preserve only the facts that still matter. For `compact`, this field is required and must be the new condensed replacement summary (Compact_TEXT) that should remain after archival compression. For daily maintenance of `context`, `toolcontext`, `fastmemory`, or `fastcontext`, prefer `summary`; reserve `compact` for full archival compression unless a threshold/system maintenance ticket explicitly asks for it."
                     },
                     "task": {
                         "type": "string",

@@ -19,7 +19,11 @@ pub fn system_prompt() -> String {
 你的重点是四件事：找出重复与噪声、保留后续继续任务必需的关键信息、把短期结论沉淀到交流板或上下文治理结果中、把值得长期保留的稳定事实沉淀到 fastmemory 建议。
 关键信息优先包括：文件路径、模块名、关键函数、编号、阶段结论、失败原因、下一步动作。
 除非上游明确要求，否则不要主动扩写，不要写空泛总结，不要输出用户不可执行的空建议。
-返回结果时只输出一个 JSON 对象，不要输出额外说明、标题或 Markdown 代码块。"#
+返回结果时只输出一个 JSON 对象，不要输出额外说明、标题或 Markdown 代码块。
+固定字段为：status、summary、contextmemory_title、contextmemory_content、fastmemory_writes、adviceboard_writes。
+adviceboard_writes 必须是对象数组，每项固定为 {\"text\":\"...\"}，不要输出字符串数组。
+fastmemory_writes 必须是对象数组，每项固定为 {\"section\":\"environment|self|user|event\",\"text\":\"...\"}。
+不要调用工具；Advisor 当前只负责基于收到的上下文包产出结构化整理结果。"#
         .to_string()
 }
 
@@ -104,6 +108,13 @@ pub struct AdviceWrite {
     pub text: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum AdviceWriteWire {
+    Text(String),
+    Object(AdviceWrite),
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FastMemoryWrite {
     #[serde(default)]
@@ -126,6 +137,22 @@ pub struct AuditResponse {
     pub fastmemory_writes: Vec<FastMemoryWrite>,
     #[serde(default)]
     pub adviceboard_writes: Vec<AdviceWrite>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct AuditResponseWire {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub contextmemory_title: String,
+    #[serde(default)]
+    pub contextmemory_content: String,
+    #[serde(default)]
+    pub fastmemory_writes: Vec<FastMemoryWrite>,
+    #[serde(default)]
+    pub adviceboard_writes: Vec<AdviceWriteWire>,
 }
 
 pub fn load_prompt(project_root: &Path) -> Result<String> {
@@ -165,28 +192,28 @@ pub fn build_request_message(package: &AuditPackage) -> Result<String> {
 请按下面规则审计：\n\
 1. 找出重复、噪声、可压缩段与后续仍必须保留的关键信息。\n\
 2. 只输出一个 JSON 对象，字段固定为：status、summary、contextmemory_title、contextmemory_content、fastmemory_writes、adviceboard_writes。\n\
-3. adviceboard_writes 是短句数组，每条只写结论性建议；不要超过 3 条。\n\
+3. adviceboard_writes 是对象数组；每项字段固定为 text，例如 {{\"text\":\"将 round 4-9 的反复失败压缩成一条阶段结论\"}}；不要超过 3 条。\n\
 4. fastmemory_writes 也是数组；每项字段固定为 section 与 text。section 只能是 environment / self / user / event，用于沉淀真正稳定、后续高概率复用的事实；不要超过 3 条。\n\
 5. contextmemory_content 写本轮审计结论，必须包含关键路径、关键编号、关键结论或下一步。\n\
 6. 若当前无需提出建议，仍要返回 status 与 summary，并把 fastmemory_writes、adviceboard_writes 设为空数组。\n\
-7. 不要调用工具，不要输出 Markdown。\n\n\
+7. 不要调用工具，不要输出 Markdown，不要输出字符串数组形式的 adviceboard_writes。\n\n\
 [managed matrix context package start]\n{payload}\n[managed matrix context package end]"
     ))
 }
 
 pub fn parse_audit_response(raw: &str) -> Result<AuditResponse> {
     let candidate = extract_json_candidate(raw).unwrap_or_else(|| raw.trim().to_string());
-    let mut parsed: AuditResponse =
+    let parsed: AuditResponseWire =
         serde_json::from_str(candidate.as_str()).context("解析 advisor JSON 结果失败")?;
-    parsed.status = normalize_text(parsed.status.as_str(), "completed");
-    parsed.summary = normalize_text(parsed.summary.as_str(), "");
-    parsed.contextmemory_title =
+    let status = normalize_text(parsed.status.as_str(), "completed");
+    let summary = normalize_text(parsed.summary.as_str(), "");
+    let contextmemory_title =
         normalize_text(parsed.contextmemory_title.as_str(), "Advisor 审计");
-    parsed.contextmemory_content = normalize_text(
+    let contextmemory_content = normalize_text(
         parsed.contextmemory_content.as_str(),
-        parsed.summary.as_str(),
+        summary.as_str(),
     );
-    parsed.fastmemory_writes = parsed
+    let fastmemory_writes = parsed
         .fastmemory_writes
         .into_iter()
         .filter_map(|item| {
@@ -195,15 +222,25 @@ pub fn parse_audit_response(raw: &str) -> Result<AuditResponse> {
             (!section.is_empty() && !text.is_empty()).then_some(FastMemoryWrite { section, text })
         })
         .collect();
-    parsed.adviceboard_writes = parsed
+    let adviceboard_writes = parsed
         .adviceboard_writes
         .into_iter()
         .filter_map(|item| {
-            let text = item.text.trim().to_string();
+            let text = match item {
+                AdviceWriteWire::Text(text) => text.trim().to_string(),
+                AdviceWriteWire::Object(item) => item.text.trim().to_string(),
+            };
             (!text.is_empty()).then_some(AdviceWrite { text })
         })
         .collect();
-    Ok(parsed)
+    Ok(AuditResponse {
+        status,
+        summary,
+        contextmemory_title,
+        contextmemory_content,
+        fastmemory_writes,
+        adviceboard_writes,
+    })
 }
 
 fn ensure_file(path: &Path, content: &str) -> Result<()> {
@@ -298,5 +335,18 @@ mod tests {
         assert_eq!(parsed.fastmemory_writes[0].section, "user");
         assert_eq!(parsed.adviceboard_writes.len(), 1);
         assert_eq!(parsed.adviceboard_writes[0].text, "保留 src/main.rs 路径");
+    }
+
+    #[test]
+    fn parse_audit_response_accepts_string_adviceboard_writes() {
+        let parsed = parse_audit_response(
+            "{\"status\":\"completed\",\"summary\":\"收口\",\"contextmemory_title\":\"Advisor 审计\",\"contextmemory_content\":\"保留关键路径\",\"fastmemory_writes\":[],\"adviceboard_writes\":[\"将 round 4-9 的反复失败压缩成一条阶段结论\"]}",
+        )
+        .expect("parse advisor response with string writes");
+        assert_eq!(parsed.adviceboard_writes.len(), 1);
+        assert_eq!(
+            parsed.adviceboard_writes[0].text,
+            "将 round 4-9 的反复失败压缩成一条阶段结论"
+        );
     }
 }

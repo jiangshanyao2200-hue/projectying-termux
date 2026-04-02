@@ -359,7 +359,7 @@
                     "action": {
                         "type": "string",
                         "enum": ["write", "summary", "compact", "task_enter", "task_exit", "focus_enter", "focus_exit", "replace"],
-                        "description": "Context management action. Prefer `task_mode.enter` / `task_mode.exit`; `task_enter` / `task_exit` remain available here only as compatibility aliases, and legacy `focus_enter` / `focus_exit` remain valid too. `replace` is accepted as an alias of `summary`. `summary` is the normal high-frequency maintenance action for context, toolcontext, fastmemory, fastcontext, or adviceboard. `write` is mainly for fastmemory notes or narrowly-scoped structured writes. `compact` is low-frequency full-area archival compression, except when a threshold/system maintenance ticket explicitly asks for whole-area compact."
+"description": "Context management action. Prefer `task_mode.enter` / `task_mode.exit`; `task_enter` / `task_exit` remain available here only as compatibility aliases, and legacy `focus_enter` / `focus_exit` remain valid too. `replace` is accepted as an alias of `summary`. `summary` is the normal high-frequency maintenance action for context, toolcontext, fastmemory, fastcontext, or adviceboard. `write` is mainly for fastmemory notes or narrowly-scoped structured writes. `compact` is low-frequency full-area archival compression, except when a threshold/system maintenance ticket explicitly asks for whole-area compact. For any `compact` call, `text` is required and must contain the new condensed replacement summary (Compact_TEXT) that should remain after compression."
                     },
                     "target": {
                         "type": "string",
@@ -400,7 +400,7 @@
                     },
                     "text": {
                         "type": "string",
-                        "description": "Content for `write`, or the merged digest for `summary` / `compact`."
+"description": "Content for `write`, or the merged digest for `summary` / `compact`. For `compact`, this field is required and must be the new condensed replacement summary (Compact_TEXT) that should remain after archival compression."
                     },
                     "task": {
                         "type": "string",
