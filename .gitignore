@@ -1,0 +1,61 @@
+target/
+target-codex/
+log/
+.codex_backup/
+
+# Runtime memory/state
+memory/
+config/*.json
+!config/matrix/
+config/runtime/
+config/lastgood/
+context/**/*.json
+context/**/*.jsonl
+context/**/notebook/
+context/*/games/*/context/
+context/*/games/*/notebook/
+context/*/games/*/debug/
+context/*/games/*/servemodecontext/
+context/*/games/*/servemodenotebook/
+context/adviceboard.json
+
+# Sensitive local configuration
+config/**/api.json
+config/**/api.lastgood.json
+config/**/*.lastgood.json
+config/companioning/players.json
+config/companioning/user.json
+config/companioning/games.json
+
+# Local editor / OS noise
+.DS_Store
+Thumbs.db
+
+# Local media links
+media/camera
+media/dcim
+media/pictures
+media/screenshots
+
+# Android build/cache artifacts
+android/sdk-cache/
+android/**/.sdk/
+android/**/build/
+android/**/dist/
+*.apk
+*.idsig
+
+# Local diagnostics
+Aidebug/events.jsonl
+Aidebug/status.json
+Aidebug/latest_reply.txt
+Aidebug/performance.json
+Aidebug/health.json
+Aidebug/processed/
+Aidebug/backup/
+Aidebug/artifacts/
+
+# Local notes
+AI笔记.txt
+笔记.txt
+项目记忆.md
