@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-matrix-low-cost-health-token-recheck-20260515-17",
+  "text": "Aidebug T17：T16 收口后的低成本复查。目标：只读 tool_manage health，再用 persona_manage.observe 做一次最小复查，确认 active_context_entries 降低后，下一轮 estimated_input_tokens / message_chars 是否下降。限制：不要再做 context_manage，不要发送 worker，不要启动子代理，不要使用 pty，不要写入 memory/context。最终只输出：HEALTH_TOOL_READ, OBSERVE_MINIMAL, TOKEN_RECHECK_RESULT, NO_WORKER_SEND, NO_PTY_OR_AGENT, NO_DESTRUCTIVE_MEMORY_ACTION。"
+}

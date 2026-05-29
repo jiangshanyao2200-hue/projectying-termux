@@ -1,4 +1,6 @@
 target/
+target-codex/
+tmp/
 log/
 .codex_backup/
 
@@ -9,12 +11,29 @@ context/**/*.jsonl
 context/**/notebook/
 context/*/games/*/context/
 context/*/games/*/notebook/
+context/*/games/*/debug/
+context/*/games/*/servemodecontext/
+context/*/games/*/servemodenotebook/
 context/adviceboard.json
 
 # Sensitive local configuration
 config/**/api.json
 config/**/api.lastgood.json
 config/**/*.lastgood.json
+config/server.json
+config/lastgood/server.json
+config/lastgood/
+config/tokeninfo.json
+config/runtime/server-ssh-askpass.sh
+config/companioning/players.json
+config/companioning/user.json
+config/companioning/games.json
+
+# Local Android build outputs / SDK cache
+android/**/.sdk/
+android/**/build/
+android/**/dist/
+android/sdk-cache/
 
 # Local editor / OS noise
 .DS_Store

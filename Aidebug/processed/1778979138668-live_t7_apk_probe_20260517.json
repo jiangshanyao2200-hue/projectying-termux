@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "live-t7-apk-probe-20260517",
+  "text": "Aidebug live T7 APK 链路探针。请由 Matrix 指挥 Coding 完成，不要自己直接扩写产品。任务范围必须保持最小：1) 复用现有 `android/agentbrowser` 骨架，确认或执行一次 build；2) 通过 adb 安装 `android/agentbrowser/dist/projectying-browser-debug.apk` 到当前在线设备；3) 尝试启动 APK 主 Activity；4) 让 Coding 极短回报：源码路径、APK 路径、adb device、build 结果、install 结果、launch 结果、明显错误。不要做 UI 美化，不要创建大型新项目。"
+}

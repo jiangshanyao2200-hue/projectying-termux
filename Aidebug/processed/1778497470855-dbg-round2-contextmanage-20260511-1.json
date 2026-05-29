@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-round2-contextmanage-20260511-1",
+  "text": "本轮是 context_manage 小范围格式安全测试。请不要打开 command，不要写长期记忆，不要整理真实历史。严格执行：1) 调用 context_manage 写入 fastmemory 一条文本：[debug-round2] context write probe ROUND2_CONTEXT_WRITE_OK；2) 读取工具返回的新 item id；3) 只对这一个新 item id 调用 context_manage summary，summary 文本为：[debug-round2] context summary probe ROUND2_CONTEXT_SUMMARY_OK；4) 回复中文短报，写明 write 是否成功、summary 是否成功、新旧 item id。"
+}

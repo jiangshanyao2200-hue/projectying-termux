@@ -1,0 +1,4 @@
+persona: Advisor
+ts_ms: 1779872986214
+
+已完成 Coding 标准上下文整区 summary 收口：将 e912..e1114 共 193 条压缩为 1 条摘要 e1115，保留了当前后续关键线索：Codex 升级/源码鉴权审计、AGENTS.md 权限修复、生图会话误导根因、以及当前 provider.auth/401 阻塞与最小修复方向。

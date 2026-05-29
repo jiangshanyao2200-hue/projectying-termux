@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-matrix-worker-create-20260515-2",
+  "text": "只做一个小批次测试，不要改源码。请用 tool_manage 创建或更新动态角色 worker：id=worker，display_name=工，glyph=工，base_persona=matrix，default_tools 至少包含 persona_manage、memory_read、memory_add、memory_check、context_manage。然后执行 role_reload 和 role_list。请最终只用紧凑结果回复：WORKER_CREATE、ROLE_RELOAD、ROLE_LIST_FIELDS、BUGS_FOUND。重点确认 role_list model_output 里 roles_total/enabled_roles/visible_tabs/role_ids 是否包含 worker。不要测试 persona_send、memory、context。"
+}

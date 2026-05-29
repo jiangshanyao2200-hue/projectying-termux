@@ -1,0 +1,5 @@
+{
+  "persona": "coding",
+  "debug_session_id": "coding-translator-crash-pressure-20260517",
+  "text": "Coding，本轮是实际链路压测和翻译软件启动闪退排查。目标工程：/data/data/com.termux/files/home/AITranslatorOverlay，包名可能是 com.projectying.aitranslator。请实际测试，不要只审查：1) 读取工程结构和最近构建产物；2) 若 adb 可用，安装/启动 MainActivity，并用 logcat 捕获崩溃栈；3) 如果启动闪退，定位到具体 Java/Manifest/权限/SDK 问题，给出最小修复点；4) 必要时执行构建/安装/启动，但不要碰 Server；5) 最终只汇报证据：命令、APK路径、adb结果、崩溃栈关键行、疑似文件、下一步修复建议。不要泄露任何 API key。"
+}

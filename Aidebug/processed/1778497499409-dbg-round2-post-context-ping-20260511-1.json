@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-round2-post-context-ping-20260511-1",
+  "text": "context_manage 后续拼接验证。不要调用任何工具，不要整理上下文，只回复一行：MATRIX_POST_CONTEXT_OK"
+}

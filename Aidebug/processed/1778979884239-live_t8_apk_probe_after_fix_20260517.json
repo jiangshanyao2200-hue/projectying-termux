@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "live-t8-apk-probe-after-fix-20260517",
+  "text": "Aidebug live T8 after-fix APK 链路探针。上一轮 Matrix 欢迎回执疑似复述旧上下文，不能作为通过。请必须重新派单给 Coding，且 Coding 必须实际执行命令，不得复用旧结论。Matrix 只做调度，不直接 build/install/launch。任务范围保持最小：1) Coding 在 `android/agentbrowser` 下执行 `bash build.sh` 或给出明确阻塞；2) Coding 执行 `stat -c '%s %y' dist/projectying-browser-debug.apk`；3) Coding 执行 `adb devices -l`；4) Coding 执行 `adb install -r dist/projectying-browser-debug.apk`；5) Coding 尝试启动包 `com.projectying.browser` 主 Activity 或使用 monkey；6) Coding 极短回报真实命令输出摘要：源码路径、APK 路径、APK 大小/mtime、adb device、build/install/launch 结果、明显错误。"
+}

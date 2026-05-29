@@ -1,0 +1,14 @@
+{
+  "context_summary_entry_limit": 40,
+  "focus_context_summary_entry_limit": 40,
+  "context_max_entry_limit": 100,
+  "context_max_size_kb": 800,
+  "fastmemory_item_limit": 20,
+  "terminal_audit_interval_secs": 300,
+  "default_tool_output_level": "normal",
+  "tool_output_small_kb": 36,
+  "tool_output_normal_kb": 94,
+  "tool_output_large_kb": 128,
+  "image_compression_quality": "medium",
+  "image_upload_max_mb": 4
+}

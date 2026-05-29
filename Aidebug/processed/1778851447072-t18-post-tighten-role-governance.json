@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-matrix-post-tighten-role-governance-20260515-18",
+  "text": "Aidebug T18：T16 context 收口后的动态角色治理稳定性复查。目标：确认 Matrix 收口后仍能读取 worker 动态角色 contract，且不会把 worker 历史正文污染回 Matrix 普通聊天。限制：不要发送 worker 新消息，不要写 memory/context，不要启动子代理，不要使用 pty，不要 role_update/remove。步骤：1) 调用 tool_manage role_list；2) 最小 observe worker，include_recent 不超过 3；3) 最小 observe Matrix，include_recent 不超过 3，用于确认未出现 worker 正文污染；最终只输出 ROLE_LIST_AFTER_TIGHTEN, WORKER_OBSERVE_MINIMAL, MATRIX_POLLUTION_CHECK, NO_WORKER_SEND, NO_PTY_OR_AGENT, NO_WRITE_ACTION。"
+}

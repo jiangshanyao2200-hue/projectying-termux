@@ -1,0 +1,1952 @@
+{
+  "personas": [
+    {
+      "base_persona": "matrix",
+      "callable_tools": [
+        "ask_user",
+        "close_agent",
+        "context_compact",
+        "context_summary",
+        "context_vision",
+        "draw_image",
+        "focus_mode",
+        "list_agent",
+        "memory_add",
+        "memory_check",
+        "memory_read",
+        "persona_manage",
+        "send_input",
+        "spawn_agent",
+        "tool_manage",
+        "update_plan",
+        "view_image",
+        "wait_agent"
+      ],
+      "context_dir": "Matrix",
+      "context_governance": {
+        "compact_threshold_kb": 32,
+        "manage_threshold_kb": 200,
+        "mode": "vision_compact",
+        "report_to_matrix": true
+      },
+      "counts": {
+        "callable_tools": 18,
+        "default_tools": 28,
+        "governance_auto_tools": 2,
+        "observed_tools": 28,
+        "provider_exposed_tools": 18,
+        "tool_entries": 28
+      },
+      "default_tools": [
+        "command",
+        "pty_run",
+        "pty_input",
+        "pty_wait",
+        "view_image",
+        "apply_patch",
+        "update_plan",
+        "focus_mode",
+        "memory_check",
+        "memory_read",
+        "ask_user",
+        "spawn_agent",
+        "send_input",
+        "wait_agent",
+        "list_agent",
+        "close_agent",
+        "pty_list",
+        "pty_kill",
+        "persona_manage",
+        "server_manage",
+        "server_split",
+        "browser",
+        "draw_image",
+        "context_manage",
+        "context_compact",
+        "context_summary",
+        "context_vision",
+        "memory_add"
+      ],
+      "governance_auto_tools": [
+        "context_vision",
+        "context_compact"
+      ],
+      "kind": "builtin_persona",
+      "label": "Matrix",
+      "memory_dir": "Matrix",
+      "observe_view": {
+        "entries": [
+          {
+            "state": "closed",
+            "tool_id": "command"
+          },
+          {
+            "state": "closed",
+            "tool_id": "pty_run"
+          },
+          {
+            "state": "closed",
+            "tool_id": "pty_input"
+          },
+          {
+            "state": "closed",
+            "tool_id": "pty_wait"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "view_image"
+          },
+          {
+            "state": "closed",
+            "tool_id": "apply_patch"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "update_plan"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "focus_mode"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "memory_check"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "memory_read"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "ask_user"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "spawn_agent"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "send_input"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "wait_agent"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "list_agent"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "close_agent"
+          },
+          {
+            "state": "closed",
+            "tool_id": "pty_list"
+          },
+          {
+            "state": "closed",
+            "tool_id": "pty_kill"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "persona_manage"
+          },
+          {
+            "state": "closed",
+            "tool_id": "server_manage"
+          },
+          {
+            "state": "closed",
+            "tool_id": "server_split"
+          },
+          {
+            "state": "closed",
+            "tool_id": "browser"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "draw_image"
+          },
+          {
+            "state": "closed",
+            "tool_id": "context_manage"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "context_compact"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "context_summary"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "context_vision"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "memory_add"
+          }
+        ],
+        "prompt": "[Toolbox]\nmanager: tool_manage (callable)\nrule: hidden tools are unavailable.\nrule: closed tools are listed here but are not callable.\nrule: expanded/pinned tools are callable through the active provider schema.\nrule: use tool_manage open/close/pin/unpin/reload to change visibility.\ndrawer: context_system (collapsed)\ndrawer rule: context_manage stays under 司; summary / vision / compact open only when the selected context mode authorizes them.\ntools:\n- [closed] command · Run a one-shot shell command\n- [closed] pty_run · Start a PTY terminal session for interactive or long-running terminal work\n- [closed] pty_input · Send input into an existing PTY session\n- [closed] pty_wait · Register one wait on a PTY session\n- [expanded] view_image · Load a local image file and attach it to the current round for visual analysis\n- [closed] apply_patch · Apply a Codex-style patch for code edits\n- [expanded] update_plan · Visible planning surface with three modes\n- [expanded] focus_mode · Enter or exit focus mode directly\n- [expanded] memory_check · First-pass locator for long-term memory before deep reading\n- [expanded] memory_read · Read long-term memory or externalized output in detail\n- [expanded] ask_user · Request structured user input through the inline reconciliation UI and wait for the reply\n- [expanded] spawn_agent · Spawn a sub-agent for a well-scoped side task, bounded exploration, or parallel batch work\n- [expanded] send_input · Send follow-up instructions, corrections, or extra material to an existing agent\n- [expanded] wait_agent · Register one wait on one or more active agents when you need to watch them now\n- [expanded] list_agent · List current active sub-agents and their log paths\n- [expanded] close_agent · Close one or more agents when they are no longer needed and return their latest status sum…\n- [closed] pty_list · List live PTY terminal sessions and their external log metadata\n- [closed] pty_kill · Terminate one or more PTY terminal sessions\n- [expanded] persona_manage · Controlled ProjectYing persona communication tool\n- [closed] server_manage · Server-only control surface for the AI-managed SSH registry\n- [closed] server_split · Server-only tool for splitting Server · 御 into a managed 御 network\n- [closed] browser · Unified browser tool with two routes\n- [expanded] draw_image · Generate or edit a real image through ProjectYing's GPT Image pipeline\n- [closed] context_manage · Manage external context, fastmemory, and prompt entries instead of editing context files d…\n- [expanded] context_compact · CONTEXT COMPACT · ALL/OLD/FAST\n- [expanded] context_summary · Low-receipt context entry folding tool\n- [expanded] context_vision · CONTEXT VISION\n- [expanded] memory_add · Write long-term datememory entries"
+      },
+      "persona": "matrix",
+      "projection_override_active": false,
+      "provider_exposed_tools": [
+        "ask_user",
+        "close_agent",
+        "context_compact",
+        "context_summary",
+        "context_vision",
+        "draw_image",
+        "focus_mode",
+        "list_agent",
+        "memory_add",
+        "memory_check",
+        "memory_read",
+        "persona_manage",
+        "send_input",
+        "spawn_agent",
+        "tool_manage",
+        "update_plan",
+        "view_image",
+        "wait_agent"
+      ],
+      "role_id": null,
+      "tool_entries": [
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "command"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "pty_run"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "pty_input"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "pty_wait"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "view_image"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "apply_patch"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "update_plan"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "focus_mode"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "memory_check"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "memory_read"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "ask_user"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "spawn_agent"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "send_input"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "wait_agent"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "list_agent"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "close_agent"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "pty_list"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "pty_kill"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "persona_manage"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "server_manage"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "server_split"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "browser"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "draw_image"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "context_manage"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": true,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=closed; observe=expanded; provider=yes; callable=yes; declared=yes; governance=auto",
+          "tool_id": "context_compact"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "context_summary"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": true,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=closed; observe=expanded; provider=yes; callable=yes; declared=yes; governance=auto",
+          "tool_id": "context_vision"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "memory_add"
+        }
+      ]
+    },
+    {
+      "base_persona": "advisor",
+      "callable_tools": [
+        "context_manage",
+        "context_summary",
+        "focus_mode",
+        "memory_add",
+        "memory_check",
+        "memory_read",
+        "persona_manage",
+        "tool_manage"
+      ],
+      "context_dir": "Advisor",
+      "context_governance": {
+        "compact_threshold_kb": 200,
+        "manage_threshold_kb": 200,
+        "mode": "advisor_managed",
+        "report_to_matrix": true
+      },
+      "counts": {
+        "callable_tools": 8,
+        "default_tools": 28,
+        "governance_auto_tools": 0,
+        "observed_tools": 28,
+        "provider_exposed_tools": 8,
+        "tool_entries": 28
+      },
+      "default_tools": [
+        "command",
+        "pty_run",
+        "pty_input",
+        "pty_wait",
+        "view_image",
+        "apply_patch",
+        "update_plan",
+        "focus_mode",
+        "memory_check",
+        "memory_read",
+        "ask_user",
+        "spawn_agent",
+        "send_input",
+        "wait_agent",
+        "list_agent",
+        "close_agent",
+        "pty_list",
+        "pty_kill",
+        "persona_manage",
+        "server_manage",
+        "server_split",
+        "browser",
+        "draw_image",
+        "context_manage",
+        "context_compact",
+        "context_summary",
+        "context_vision",
+        "memory_add"
+      ],
+      "governance_auto_tools": [],
+      "kind": "builtin_persona",
+      "label": "Advisor",
+      "memory_dir": "Advisor",
+      "observe_view": {
+        "entries": [
+          {
+            "state": "closed",
+            "tool_id": "command"
+          },
+          {
+            "state": "closed",
+            "tool_id": "pty_run"
+          },
+          {
+            "state": "closed",
+            "tool_id": "pty_input"
+          },
+          {
+            "state": "closed",
+            "tool_id": "pty_wait"
+          },
+          {
+            "state": "closed",
+            "tool_id": "view_image"
+          },
+          {
+            "state": "closed",
+            "tool_id": "apply_patch"
+          },
+          {
+            "state": "closed",
+            "tool_id": "update_plan"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "focus_mode"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "memory_check"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "memory_read"
+          },
+          {
+            "state": "closed",
+            "tool_id": "ask_user"
+          },
+          {
+            "state": "closed",
+            "tool_id": "spawn_agent"
+          },
+          {
+            "state": "closed",
+            "tool_id": "send_input"
+          },
+          {
+            "state": "closed",
+            "tool_id": "wait_agent"
+          },
+          {
+            "state": "closed",
+            "tool_id": "list_agent"
+          },
+          {
+            "state": "closed",
+            "tool_id": "close_agent"
+          },
+          {
+            "state": "closed",
+            "tool_id": "pty_list"
+          },
+          {
+            "state": "closed",
+            "tool_id": "pty_kill"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "persona_manage"
+          },
+          {
+            "state": "closed",
+            "tool_id": "server_manage"
+          },
+          {
+            "state": "closed",
+            "tool_id": "server_split"
+          },
+          {
+            "state": "closed",
+            "tool_id": "browser"
+          },
+          {
+            "state": "closed",
+            "tool_id": "draw_image"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "context_manage"
+          },
+          {
+            "state": "closed",
+            "tool_id": "context_compact"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "context_summary"
+          },
+          {
+            "state": "closed",
+            "tool_id": "context_vision"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "memory_add"
+          }
+        ],
+        "prompt": "[Toolbox]\nmanager: tool_manage (callable)\nrule: hidden tools are unavailable.\nrule: closed tools are listed here but are not callable.\nrule: expanded/pinned tools are callable through the active provider schema.\nrule: use tool_manage open/close/pin/unpin/reload to change visibility.\ndrawer: context_system (collapsed)\ndrawer rule: context_manage stays under 司; summary / vision / compact open only when the selected context mode authorizes them.\ntools:\n- [closed] command · Run a one-shot shell command\n- [closed] pty_run · Start a PTY terminal session for interactive or long-running terminal work\n- [closed] pty_input · Send input into an existing PTY session\n- [closed] pty_wait · Register one wait on a PTY session\n- [closed] view_image · Load a local image file and attach it to the current round for visual analysis\n- [closed] apply_patch · Apply a Codex-style patch for code edits\n- [closed] update_plan · Visible planning surface with three modes\n- [expanded] focus_mode · Enter or exit focus mode directly\n- [expanded] memory_check · First-pass locator for long-term memory before deep reading\n- [expanded] memory_read · Read long-term memory or externalized output in detail\n- [closed] ask_user · Request structured user input through the inline reconciliation UI and wait for the reply\n- [closed] spawn_agent · Spawn a sub-agent for a well-scoped side task, bounded exploration, or parallel batch work\n- [closed] send_input · Send follow-up instructions, corrections, or extra material to an existing agent\n- [closed] wait_agent · Register one wait on one or more active agents when you need to watch them now\n- [closed] list_agent · List current active sub-agents and their log paths\n- [closed] close_agent · Close one or more agents when they are no longer needed and return their latest status sum…\n- [closed] pty_list · List live PTY terminal sessions and their external log metadata\n- [closed] pty_kill · Terminate one or more PTY terminal sessions\n- [expanded] persona_manage · Controlled ProjectYing persona communication tool\n- [closed] server_manage · Server-only control surface for the AI-managed SSH registry\n- [closed] server_split · Server-only tool for splitting Server · 御 into a managed 御 network\n- [closed] browser · Unified browser tool with two routes\n- [closed] draw_image · Generate or edit a real image through ProjectYing's GPT Image pipeline\n- [expanded] context_manage · Manage external context, fastmemory, and prompt entries instead of editing context files d…\n- [closed] context_compact · CONTEXT COMPACT · ALL/OLD/FAST\n- [expanded] context_summary · Low-receipt context entry folding tool\n- [closed] context_vision · CONTEXT VISION\n- [expanded] memory_add · Write long-term datememory entries"
+      },
+      "persona": "advisor",
+      "projection_override_active": false,
+      "provider_exposed_tools": [
+        "context_manage",
+        "context_summary",
+        "focus_mode",
+        "memory_add",
+        "memory_check",
+        "memory_read",
+        "persona_manage",
+        "tool_manage"
+      ],
+      "role_id": null,
+      "tool_entries": [
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "command"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "pty_run"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "pty_input"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "pty_wait"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "view_image"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "apply_patch"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "update_plan"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "focus_mode"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "memory_check"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "memory_read"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "ask_user"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "spawn_agent"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "send_input"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "wait_agent"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "list_agent"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "close_agent"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "pty_list"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "pty_kill"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "persona_manage"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "server_manage"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "server_split"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "browser"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "draw_image"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "context_manage"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "context_compact"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "context_summary"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "context_vision"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "memory_add"
+        }
+      ]
+    },
+    {
+      "base_persona": "coding",
+      "callable_tools": [
+        "apply_patch",
+        "command",
+        "context_summary",
+        "draw_image",
+        "focus_mode",
+        "memory_check",
+        "memory_read",
+        "persona_manage",
+        "pty_run",
+        "pty_wait",
+        "tool_manage",
+        "update_plan",
+        "view_image"
+      ],
+      "context_dir": "Coding",
+      "context_governance": {
+        "compact_threshold_kb": 200,
+        "manage_threshold_kb": 200,
+        "mode": "advisor_managed",
+        "report_to_matrix": true
+      },
+      "counts": {
+        "callable_tools": 13,
+        "default_tools": 18,
+        "governance_auto_tools": 0,
+        "observed_tools": 28,
+        "provider_exposed_tools": 13,
+        "tool_entries": 28
+      },
+      "default_tools": [
+        "command",
+        "pty_run",
+        "pty_input",
+        "pty_wait",
+        "view_image",
+        "apply_patch",
+        "update_plan",
+        "focus_mode",
+        "memory_check",
+        "memory_read",
+        "pty_list",
+        "pty_kill",
+        "persona_manage",
+        "server_split",
+        "draw_image",
+        "context_compact",
+        "context_summary",
+        "context_vision"
+      ],
+      "governance_auto_tools": [],
+      "kind": "builtin_persona",
+      "label": "Coding",
+      "memory_dir": "Coding",
+      "observe_view": {
+        "entries": [
+          {
+            "state": "pinned",
+            "tool_id": "command"
+          },
+          {
+            "state": "pinned",
+            "tool_id": "pty_run"
+          },
+          {
+            "state": "closed",
+            "tool_id": "pty_input"
+          },
+          {
+            "state": "pinned",
+            "tool_id": "pty_wait"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "view_image"
+          },
+          {
+            "state": "pinned",
+            "tool_id": "apply_patch"
+          },
+          {
+            "state": "pinned",
+            "tool_id": "update_plan"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "focus_mode"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "memory_check"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "memory_read"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "ask_user"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "spawn_agent"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "send_input"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "wait_agent"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "list_agent"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "close_agent"
+          },
+          {
+            "state": "closed",
+            "tool_id": "pty_list"
+          },
+          {
+            "state": "closed",
+            "tool_id": "pty_kill"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "persona_manage"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "server_manage"
+          },
+          {
+            "state": "closed",
+            "tool_id": "server_split"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "browser"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "draw_image"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "context_manage"
+          },
+          {
+            "state": "closed",
+            "tool_id": "context_compact"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "context_summary"
+          },
+          {
+            "state": "closed",
+            "tool_id": "context_vision"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "memory_add"
+          }
+        ],
+        "prompt": "[Toolbox]\nmanager: tool_manage (callable)\nrule: hidden tools are unavailable.\nrule: closed tools are listed here but are not callable.\nrule: expanded/pinned tools are callable through the active provider schema.\nrule: use tool_manage open/close/pin/unpin/reload to change visibility.\ndrawer: context_system (collapsed)\ndrawer rule: context_manage stays under 司; summary / vision / compact open only when the selected context mode authorizes them.\ntools:\n- [pinned] command · Run a one-shot shell command\n- [pinned] pty_run · Start a PTY terminal session for interactive or long-running terminal work\n- [closed] pty_input · Send input into an existing PTY session\n- [pinned] pty_wait · Register one wait on a PTY session\n- [expanded] view_image · Load a local image file and attach it to the current round for visual analysis\n- [pinned] apply_patch · Apply a Codex-style patch for code edits\n- [pinned] update_plan · Visible planning surface with three modes\n- [expanded] focus_mode · Enter or exit focus mode directly\n- [expanded] memory_check · First-pass locator for long-term memory before deep reading\n- [expanded] memory_read · Read long-term memory or externalized output in detail\n- [closed] pty_list · List live PTY terminal sessions and their external log metadata\n- [closed] pty_kill · Terminate one or more PTY terminal sessions\n- [expanded] persona_manage · Controlled ProjectYing persona communication tool\n- [closed] server_split · Server-only tool for splitting Server · 御 into a managed 御 network\n- [expanded] draw_image · Generate or edit a real image through ProjectYing's GPT Image pipeline\n- [closed] context_compact · CONTEXT COMPACT · ALL/OLD/FAST\n- [expanded] context_summary · Low-receipt context entry folding tool\n- [closed] context_vision · CONTEXT VISION"
+      },
+      "persona": "coding",
+      "projection_override_active": false,
+      "provider_exposed_tools": [
+        "apply_patch",
+        "command",
+        "context_summary",
+        "draw_image",
+        "focus_mode",
+        "memory_check",
+        "memory_read",
+        "persona_manage",
+        "pty_run",
+        "pty_wait",
+        "tool_manage",
+        "update_plan",
+        "view_image"
+      ],
+      "role_id": null,
+      "tool_entries": [
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "pinned",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=pinned; provider=yes; callable=yes; declared=yes",
+          "tool_id": "command"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "pinned",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=pinned; provider=yes; callable=yes; declared=yes",
+          "tool_id": "pty_run"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "pty_input"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "pinned",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=pinned; provider=yes; callable=yes; declared=yes",
+          "tool_id": "pty_wait"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "view_image"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "pinned",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=pinned; provider=yes; callable=yes; declared=yes",
+          "tool_id": "apply_patch"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "pinned",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=pinned; provider=yes; callable=yes; declared=yes",
+          "tool_id": "update_plan"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "focus_mode"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "memory_check"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "memory_read"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "ask_user"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "spawn_agent"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "send_input"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "wait_agent"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "list_agent"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "close_agent"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "pty_list"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "pty_kill"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "persona_manage"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "server_manage"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "server_split"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "browser"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "draw_image"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "context_manage"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "context_compact"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "context_summary"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "context_vision"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "memory_add"
+        }
+      ]
+    },
+    {
+      "base_persona": "server",
+      "callable_tools": [
+        "apply_patch",
+        "ask_user",
+        "browser",
+        "command",
+        "context_compact",
+        "context_summary",
+        "draw_image",
+        "focus_mode",
+        "memory_check",
+        "memory_read",
+        "persona_manage",
+        "pty_run",
+        "pty_wait",
+        "server_manage",
+        "server_split",
+        "tool_manage",
+        "update_plan",
+        "view_image"
+      ],
+      "context_dir": "Server",
+      "context_governance": {
+        "compact_threshold_kb": 120,
+        "manage_threshold_kb": 160,
+        "mode": "summary_compact",
+        "report_to_matrix": true
+      },
+      "counts": {
+        "callable_tools": 18,
+        "default_tools": 21,
+        "governance_auto_tools": 2,
+        "observed_tools": 28,
+        "provider_exposed_tools": 18,
+        "tool_entries": 28
+      },
+      "default_tools": [
+        "command",
+        "pty_run",
+        "pty_input",
+        "pty_wait",
+        "view_image",
+        "apply_patch",
+        "update_plan",
+        "focus_mode",
+        "memory_check",
+        "memory_read",
+        "ask_user",
+        "pty_list",
+        "pty_kill",
+        "persona_manage",
+        "server_manage",
+        "server_split",
+        "browser",
+        "draw_image",
+        "context_compact",
+        "context_summary",
+        "context_vision"
+      ],
+      "governance_auto_tools": [
+        "context_summary",
+        "context_compact"
+      ],
+      "kind": "builtin_persona",
+      "label": "Server",
+      "memory_dir": "Server",
+      "observe_view": {
+        "entries": [
+          {
+            "state": "expanded",
+            "tool_id": "command"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "pty_run"
+          },
+          {
+            "state": "closed",
+            "tool_id": "pty_input"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "pty_wait"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "view_image"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "apply_patch"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "update_plan"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "focus_mode"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "memory_check"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "memory_read"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "ask_user"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "spawn_agent"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "send_input"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "wait_agent"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "list_agent"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "close_agent"
+          },
+          {
+            "state": "closed",
+            "tool_id": "pty_list"
+          },
+          {
+            "state": "closed",
+            "tool_id": "pty_kill"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "persona_manage"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "server_manage"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "server_split"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "browser"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "draw_image"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "context_manage"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "context_compact"
+          },
+          {
+            "state": "expanded",
+            "tool_id": "context_summary"
+          },
+          {
+            "state": "closed",
+            "tool_id": "context_vision"
+          },
+          {
+            "state": "hidden",
+            "tool_id": "memory_add"
+          }
+        ],
+        "prompt": "[Toolbox]\nmanager: tool_manage (callable)\nrule: hidden tools are unavailable.\nrule: closed tools are listed here but are not callable.\nrule: expanded/pinned tools are callable through the active provider schema.\nrule: use tool_manage open/close/pin/unpin/reload to change visibility.\ndrawer: context_system (collapsed)\ndrawer rule: context_manage stays under 司; summary / vision / compact open only when the selected context mode authorizes them.\ntools:\n- [expanded] command · Run a one-shot shell command\n- [expanded] pty_run · Start a PTY terminal session for interactive or long-running terminal work\n- [closed] pty_input · Send input into an existing PTY session\n- [expanded] pty_wait · Register one wait on a PTY session\n- [expanded] view_image · Load a local image file and attach it to the current round for visual analysis\n- [expanded] apply_patch · Apply a Codex-style patch for code edits\n- [expanded] update_plan · Visible planning surface with three modes\n- [expanded] focus_mode · Enter or exit focus mode directly\n- [expanded] memory_check · First-pass locator for long-term memory before deep reading\n- [expanded] memory_read · Read long-term memory or externalized output in detail\n- [expanded] ask_user · Request structured user input through the inline reconciliation UI and wait for the reply\n- [closed] pty_list · List live PTY terminal sessions and their external log metadata\n- [closed] pty_kill · Terminate one or more PTY terminal sessions\n- [expanded] persona_manage · Controlled ProjectYing persona communication tool\n- [expanded] server_manage · Server-only control surface for the AI-managed SSH registry\n- [expanded] server_split · Server-only tool for splitting Server · 御 into a managed 御 network\n- [expanded] browser · Unified browser tool with two routes\n- [expanded] draw_image · Generate or edit a real image through ProjectYing's GPT Image pipeline\n- [expanded] context_compact · CONTEXT COMPACT · ALL/OLD/FAST\n- [expanded] context_summary · Low-receipt context entry folding tool\n- [closed] context_vision · CONTEXT VISION"
+      },
+      "persona": "server",
+      "projection_override_active": false,
+      "provider_exposed_tools": [
+        "apply_patch",
+        "ask_user",
+        "browser",
+        "command",
+        "context_compact",
+        "context_summary",
+        "draw_image",
+        "focus_mode",
+        "memory_check",
+        "memory_read",
+        "persona_manage",
+        "pty_run",
+        "pty_wait",
+        "server_manage",
+        "server_split",
+        "tool_manage",
+        "update_plan",
+        "view_image"
+      ],
+      "role_id": null,
+      "tool_entries": [
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "command"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "pty_run"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "pty_input"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "pty_wait"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "view_image"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "apply_patch"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "update_plan"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "focus_mode"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "memory_check"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "memory_read"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "ask_user"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "spawn_agent"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "send_input"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "wait_agent"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "list_agent"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "close_agent"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "pty_list"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "pty_kill"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "persona_manage"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "server_manage"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "server_split"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "browser"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": false,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes",
+          "tool_id": "draw_image"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "context_manage"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": true,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=closed; observe=expanded; provider=yes; callable=yes; declared=yes; governance=auto",
+          "tool_id": "context_compact"
+        },
+        {
+          "callable": true,
+          "declared_tool": true,
+          "default_state": "expanded",
+          "governance_auto": true,
+          "observe_state": "expanded",
+          "provider_exposed": true,
+          "reason": "default=expanded; observe=expanded; provider=yes; callable=yes; declared=yes; governance=auto",
+          "tool_id": "context_summary"
+        },
+        {
+          "callable": false,
+          "declared_tool": true,
+          "default_state": "closed",
+          "governance_auto": false,
+          "observe_state": "closed",
+          "provider_exposed": false,
+          "reason": "default=closed; observe=closed; provider=no; callable=no; declared=yes",
+          "tool_id": "context_vision"
+        },
+        {
+          "callable": false,
+          "declared_tool": false,
+          "default_state": "hidden",
+          "governance_auto": false,
+          "observe_state": "hidden",
+          "provider_exposed": false,
+          "reason": "default=hidden; observe=hidden; provider=no; callable=no",
+          "tool_id": "memory_add"
+        }
+      ]
+    }
+  ],
+  "projection_override": {
+    "active": false,
+    "allow_native_web_search": false,
+    "allowed_tool_ids": []
+  },
+  "protocol_version": 1,
+  "summary": {
+    "builtin_personas": 4,
+    "dynamic_roles": 0,
+    "personas": 4,
+    "tool_catalog": 28
+  },
+  "ts_ms": 1780016315350
+}

@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-backend-context-route-smoke-20260517",
+  "text": "只做后端 smoke，不要做前端。请检查并回报：1) 动态角色 runtime 里 context_summary / context_vision / context_compact 是否会把 base persona=matrix 的输入兜底到当前角色上下文；2) 本轮上下文返回阈值文案是否统一为“返回阈值”而不是“可见度”；3) 若发现上下文治理或路由异常，请先写入 Aidebug 记录，再给出最短结论。只做检查，不要大改代码。"
+}

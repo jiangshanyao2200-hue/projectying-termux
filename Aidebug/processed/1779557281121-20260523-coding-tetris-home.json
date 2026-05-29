@@ -1,0 +1,5 @@
+{
+  "persona": "coding",
+  "debug_session_id": "live-coding-tetris-home-20260523",
+  "text": "实机测试 Coding 的长任务与上下文治理。请在 /data/data/com.termux/files/home 下创建一个网页版俄罗斯方块项目，例如 /data/data/com.termux/files/home/tetris-web/。要求：可直接用浏览器打开 index.html 运行；现代简洁界面；标准俄罗斯方块核心玩法，包括方块移动、旋转、软降、硬降、消行、计分、等级、下一块预览、暂停/继续、重新开始、游戏结束；桌面键盘和移动端按钮都能操作；不依赖联网 CDN；不要做成说明页，要做可玩的游戏。完成后请做一次轻量验证，说明文件路径和如何打开。"
+}

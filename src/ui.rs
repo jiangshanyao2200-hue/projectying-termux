@@ -38,7 +38,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::input::{self, FocusArea, InputTheme};
 use crate::terminal;
-use crate::{App, PersonaKind, Screen, SettingsRenderTheme, ThemePreset, TopLaneKind};
+use crate::{App, HelpSection, PersonaKind, Screen, SettingsRenderTheme, ThemePreset, TopLaneKind};
 
 const INPUT_HEIGHT: u16 = 4;
 const MIN_INPUT_HEIGHT: u16 = 2;
@@ -48,9 +48,12 @@ const TOP_PANEL_FRAME_HEIGHT: u16 = 1;
 const TOP_SEP_HEIGHT: u16 = 1;
 const HEADER_HEIGHT: u16 = 1;
 const FOCUS_SEP_HEIGHT: u16 = 1;
-const INPUT_TOP_HEIGHT: u16 = 2;
+const BASE_INPUT_TOP_HEIGHT: u16 = 2;
+const DYNAMIC_ROLE_TABS_PER_ROW: usize = 5;
+const MAX_DYNAMIC_ROLE_TAB_ROWS: usize = 3;
 const INPUT_STATUS_MIN_HEIGHT: u16 = 1;
 const INPUT_STATUS_MAX_HEIGHT: u16 = 7;
+const BOTTOM_STATUS_HEIGHT: u16 = 1;
 
 // =============================================================================
 // 基础配色区：Theme 与 UiLayout 协议
@@ -123,6 +126,7 @@ pub struct UiLayout {
     pub input_status: Rect,
     pub input: Rect,
     pub input_inner: Rect,
+    pub bottom_status: Rect,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -134,6 +138,12 @@ pub struct TopLaneHit {
 #[derive(Debug, Clone, Copy)]
 pub struct PersonaTabHit {
     pub persona: PersonaKind,
+    pub rect: Rect,
+}
+
+#[derive(Debug, Clone)]
+pub struct DynamicRoleTabHit {
+    pub role_id: String,
     pub rect: Rect,
 }
 
@@ -149,6 +159,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         palette_height(app),
         attention_height(app),
         app.terminal_panel_active(),
+        input_top_height(app),
         status_height(app),
         requested_input_height(app, area),
     );
@@ -163,10 +174,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_focus_sep(frame, &theme, layout.focus_sep, chat_focused);
 
     match app.screen {
-        Screen::Main => {
-            draw_chat(frame, &theme, layout.main, app);
-        }
+        Screen::Main => draw_chat(frame, &theme, layout.main, app),
         Screen::Settings => draw_settings(frame, &theme, layout.main, app),
+        Screen::Help => draw_help(frame, &theme, layout.main, app),
     }
 
     if layout.palette.height > 0 {
@@ -175,6 +185,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_input_top(frame, &theme, layout.input_top, app);
     draw_input_status(frame, &theme, layout.input_status, app);
     draw_input(frame, &theme, layout.input, app);
+    draw_bottom_status(frame, &theme, layout.bottom_status, app);
 }
 
 pub fn chat_content_area(area: Rect) -> Rect {
@@ -197,17 +208,21 @@ pub fn layout(
     palette_h: u16,
     attention_height: u16,
     terminal_panel_active: bool,
+    requested_input_top_height: u16,
     requested_status_height: u16,
     requested_input_height: u16,
 ) -> UiLayout {
     let width = area.width;
     let total_height = area.height;
+    let bottom_status_height = BOTTOM_STATUS_HEIGHT.min(total_height);
     let fixed_top = TOP_SEP_HEIGHT + HEADER_HEIGHT + attention_height + FOCUS_SEP_HEIGHT;
-    let body_height = total_height.saturating_sub(fixed_top);
+    let body_height = total_height
+        .saturating_sub(fixed_top)
+        .saturating_sub(bottom_status_height);
     let desired_palette = palette_h.min(body_height);
 
     let mut palette_height = desired_palette;
-    let mut input_top_height = INPUT_TOP_HEIGHT;
+    let mut input_top_height = requested_input_top_height;
     let mut input_status_height =
         requested_status_height.clamp(INPUT_STATUS_MIN_HEIGHT, INPUT_STATUS_MAX_HEIGHT);
     let min_tail =
@@ -309,7 +324,18 @@ pub fn layout(
         input_status_height.min(total_height.saturating_sub(y - area.y)),
     );
     y = y.saturating_add(input_status.height);
-    let input = Rect::new(area.x, y, width, total_height.saturating_sub(y - area.y));
+    let input_height = total_height
+        .saturating_sub(bottom_status_height)
+        .saturating_sub(y - area.y);
+    let input = Rect::new(area.x, y, width, input_height);
+    let bottom_status = Rect::new(
+        area.x,
+        area.y
+            .saturating_add(total_height)
+            .saturating_sub(bottom_status_height),
+        width,
+        bottom_status_height,
+    );
 
     UiLayout {
         top_sep,
@@ -323,6 +349,7 @@ pub fn layout(
         input_status,
         input,
         input_inner: input,
+        bottom_status,
     }
 }
 
@@ -348,18 +375,28 @@ pub fn attention_height(app: &App) -> u16 {
     let lane_rows = app.topbar_lanes().len() as u16;
     let focus_rows = u16::from(app.focus_attention_text().is_some());
     let idle_row = u16::from(
-        app.active_persona.supports_topbar()
+        app.active_view_supports_topbar()
             && app.focus == FocusArea::Terminal
             && app.topbar_lanes().is_empty(),
     );
     lane_rows + focus_rows + idle_row
 }
 
-pub fn persona_tab_hits(area: Rect, _app: &App) -> Vec<PersonaTabHit> {
+pub fn input_top_height(app: &App) -> u16 {
+    if app.persona_tabs().is_empty() {
+        return BASE_INPUT_TOP_HEIGHT;
+    }
+    BASE_INPUT_TOP_HEIGHT.saturating_add(dynamic_role_tab_row_count() as u16)
+}
+
+pub fn persona_tab_hits(area: Rect, app: &App) -> Vec<PersonaTabHit> {
     if area.width == 0 || area.height == 0 {
         return Vec::new();
     }
-    let personas = PersonaKind::ALL;
+    let personas = app.persona_tabs();
+    if personas.is_empty() {
+        return Vec::new();
+    }
     let total = personas.len() as u16;
     let base = area.width / total.max(1);
     let mut remainder = area.width % total.max(1);
@@ -652,10 +689,8 @@ pub fn palette_height(app: &App) -> u16 {
 }
 
 pub fn status_height(app: &App) -> u16 {
-    app.status
-        .lines()
-        .len()
-        .clamp(1, INPUT_STATUS_MAX_HEIGHT as usize) as u16
+    let base = app.input_status_lines().len();
+    base.clamp(1, INPUT_STATUS_MAX_HEIGHT as usize) as u16
 }
 
 fn draw_sep(frame: &mut Frame, theme: &Theme, area: Rect, active: bool) {
@@ -748,22 +783,6 @@ pub fn attention_lane_hits(area: Rect, app: &App) -> Vec<TopLaneHit> {
 fn top_lane_summary(app: &App, lane: TopLaneKind) -> String {
     let expanded = app.expanded_topbar_lane == Some(lane);
     match lane {
-        TopLaneKind::Advisor => {
-            let Some(snapshot) = app.advisor_panel_snapshot() else {
-                return "ADVISOR · Idle".to_string();
-            };
-            if expanded {
-                format!(
-                    "ADVISOR · {} · rev {} · e{}",
-                    snapshot.state_label, snapshot.base_revision, snapshot.latest_entry_id
-                )
-            } else {
-                format!(
-                    "ADVISOR · {} · AdviceBoard {} · FastMemory {}",
-                    snapshot.state_label, snapshot.adviceboard_writes, snapshot.fastmemory_writes
-                )
-            }
-        }
         TopLaneKind::Agent => {
             if expanded {
                 let active = app
@@ -857,6 +876,23 @@ fn render_persona_tab_cell(width: usize, label: &str) -> String {
     format!("{}{}{}", " ".repeat(left + 1), shown, " ".repeat(right + 1))
 }
 
+fn tab_row_colors(preset: ThemePreset) -> (Color, Color, Color, Color) {
+    match preset {
+        ThemePreset::Rose => (
+            Color::Rgb(12, 10, 14),
+            Color::Rgb(24, 18, 26),
+            Color::Rgb(68, 40, 56),
+            Color::Rgb(98, 58, 80),
+        ),
+        ThemePreset::Cyan => (
+            Color::Rgb(9, 14, 18),
+            Color::Rgb(16, 22, 28),
+            Color::Rgb(28, 50, 60),
+            Color::Rgb(46, 76, 90),
+        ),
+    }
+}
+
 fn active_persona_glitch_badge(tick: u64) -> &'static str {
     match tick % 6 {
         0 => "░▒",
@@ -869,17 +905,182 @@ fn active_persona_glitch_badge(tick: u64) -> &'static str {
 }
 
 fn persona_tab_label(app: &App, persona: PersonaKind) -> String {
-    let base = persona.tab_title();
-    if app.persona_api_active(persona) {
+    let base = persona.tab_glyph();
+    if app.active_dynamic_role_id().is_none() && app.persona_api_active(persona) {
         format!("{base} {}", active_persona_glitch_badge(app.tick))
     } else {
         base.to_string()
     }
 }
 
+fn dynamic_role_tab_row_count() -> usize {
+    crate::roles::visible_role_tabs()
+        .len()
+        .min(MAX_DYNAMIC_ROLE_TAB_ROWS * DYNAMIC_ROLE_TABS_PER_ROW)
+        .div_ceil(DYNAMIC_ROLE_TABS_PER_ROW)
+        .min(MAX_DYNAMIC_ROLE_TAB_ROWS)
+}
+
+fn dynamic_role_tab_rows() -> Vec<Vec<crate::roles::RoleTab>> {
+    let roles = crate::roles::visible_role_tabs();
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    for role in roles
+        .into_iter()
+        .take(MAX_DYNAMIC_ROLE_TAB_ROWS * DYNAMIC_ROLE_TABS_PER_ROW)
+    {
+        row.push(role);
+        if row.len() == DYNAMIC_ROLE_TABS_PER_ROW {
+            rows.push(row);
+            row = Vec::new();
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows.truncate(MAX_DYNAMIC_ROLE_TAB_ROWS);
+    rows
+}
+
+pub fn dynamic_role_tab_hits(area: Rect) -> Vec<DynamicRoleTabHit> {
+    if area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    let rows = dynamic_role_tab_rows();
+    let available_role_rows = area.height.saturating_sub(2) as usize;
+    let mut hits = Vec::new();
+    for (row_index, roles) in rows.into_iter().take(available_role_rows).enumerate() {
+        if roles.is_empty() {
+            continue;
+        }
+        let row_y = area.y.saturating_add(1).saturating_add(row_index as u16);
+        if row_y >= area.y.saturating_add(area.height).saturating_sub(1) {
+            break;
+        }
+        let cols = DYNAMIC_ROLE_TABS_PER_ROW;
+        let used = roles.len().min(cols);
+        let start_slot = (cols.saturating_sub(used)) / 2;
+        let base = area.width / cols.max(1) as u16;
+        let mut remainder = area.width % cols.max(1) as u16;
+        let mut x = area.x;
+        for slot in 0..cols {
+            let mut width = base.max(1);
+            if remainder > 0 {
+                width = width.saturating_add(1);
+                remainder = remainder.saturating_sub(1);
+            }
+            let remaining_width = area.x.saturating_add(area.width).saturating_sub(x).max(1);
+            let width = width.min(remaining_width);
+            if slot >= start_slot && slot < start_slot + used {
+                let role = &roles[slot - start_slot];
+                hits.push(DynamicRoleTabHit {
+                    role_id: role.id.clone(),
+                    rect: Rect::new(x, row_y, width, 1),
+                });
+            }
+            x = x.saturating_add(width);
+        }
+    }
+    hits
+}
+
+#[cfg(test)]
+fn render_dynamic_role_tab_row(width: usize, roles: &[crate::roles::RoleTab]) -> String {
+    if roles.is_empty() {
+        return " ".repeat(width);
+    }
+    let cols = DYNAMIC_ROLE_TABS_PER_ROW;
+    let used = roles.len().min(cols);
+    let start_slot = (cols.saturating_sub(used)) / 2;
+    let base = width / cols.max(1);
+    let mut remainder = width % cols.max(1);
+    let mut rendered = String::new();
+    for slot in 0..cols {
+        let mut cell_width = base.max(1);
+        if remainder > 0 {
+            cell_width = cell_width.saturating_add(1);
+            remainder = remainder.saturating_sub(1);
+        }
+        if slot >= start_slot && slot < start_slot + used {
+            let role = &roles[slot - start_slot];
+            rendered
+                .push_str(render_persona_tab_cell(cell_width, role.glyph_label.as_str()).as_str());
+        } else {
+            rendered.push_str(" ".repeat(cell_width).as_str());
+        }
+    }
+    let shown_w = UnicodeWidthStr::width(rendered.as_str());
+    if shown_w < width {
+        rendered.push_str(" ".repeat(width.saturating_sub(shown_w)).as_str());
+    }
+    input::truncate_to_width(rendered.as_str(), width)
+}
+
+fn render_dynamic_role_tab_row_line(
+    width: usize,
+    roles: &[crate::roles::RoleTab],
+    active_role_id: Option<&str>,
+    theme: &Theme,
+    theme_preset: ThemePreset,
+    tabs_focused: bool,
+) -> Line<'static> {
+    if roles.is_empty() {
+        return Line::from(" ".repeat(width));
+    }
+    let (line_bg, inactive_bg, selected_bg, focused_bg) = tab_row_colors(theme_preset);
+    let cols = DYNAMIC_ROLE_TABS_PER_ROW;
+    let used = roles.len().min(cols);
+    let start_slot = (cols.saturating_sub(used)) / 2;
+    let base = width / cols.max(1);
+    let mut remainder = width % cols.max(1);
+    let inactive_style = Style::default()
+        .fg(if tabs_focused {
+            Color::Rgb(190, 202, 214)
+        } else {
+            theme.dim
+        })
+        .bg(inactive_bg)
+        .add_modifier(Modifier::BOLD);
+    let selected_style = Style::default()
+        .fg(theme.panel_fg)
+        .bg(selected_bg)
+        .add_modifier(Modifier::BOLD);
+    let focused_style = Style::default()
+        .fg(theme.panel_fg)
+        .bg(focused_bg)
+        .add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    for slot in 0..cols {
+        let mut cell_width = base.max(1);
+        if remainder > 0 {
+            cell_width = cell_width.saturating_add(1);
+            remainder = remainder.saturating_sub(1);
+        }
+        if slot >= start_slot && slot < start_slot + used {
+            let role = &roles[slot - start_slot];
+            let shown = render_persona_tab_cell(cell_width, role.glyph_label.as_str());
+            let selected = active_role_id.is_some_and(|id| id == role.id.as_str());
+            let style = if tabs_focused && selected {
+                focused_style
+            } else if selected {
+                selected_style
+            } else {
+                inactive_style
+            };
+            spans.push(Span::styled(shown, style));
+        } else {
+            spans.push(Span::styled(
+                " ".repeat(cell_width),
+                Style::default().fg(theme.dim).bg(line_bg),
+            ));
+        }
+    }
+    Line::from(spans)
+}
+
 fn draw_attention_bar(frame: &mut Frame, theme: &Theme, area: Rect, app: &App) {
     let focus_text = app.focus_attention_text();
-    let topbar_idle = app.active_persona.supports_topbar()
+    let topbar_idle = app.active_view_supports_topbar()
         && app.focus == FocusArea::Terminal
         && app.topbar_lanes().is_empty();
     if area.width == 0 || area.height == 0 {
@@ -966,9 +1167,6 @@ fn draw_top_panel(frame: &mut Frame, theme: &Theme, area: Rect, app: &mut App) {
         return;
     }
     match app.expanded_topbar_lane {
-        Some(TopLaneKind::Advisor) => {
-            draw_advisor_panel(frame, theme, inner, app);
-        }
         Some(TopLaneKind::Terminal) => {
             let terminal_focused = app.focus == FocusArea::Terminal;
             let terminal_active_idx = app.active_terminal_index();
@@ -1197,112 +1395,6 @@ fn draw_agent_panel(frame: &mut Frame, theme: &Theme, area: Rect, app: &App) {
     );
 }
 
-fn draw_advisor_panel(frame: &mut Frame, theme: &Theme, area: Rect, app: &App) {
-    let Some(snapshot) = app.advisor_panel_snapshot() else {
-        return;
-    };
-    let inner = area;
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(
-            "● Advisor · ",
-            Style::default()
-                .fg(Color::Rgb(204, 196, 255))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            snapshot.state_label.clone(),
-            Style::default()
-                .fg(Color::Rgb(238, 228, 255))
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "[- Scope -]: ",
-            Style::default().fg(Color::Rgb(156, 172, 206)),
-        ),
-        Span::styled(
-            format!(
-                "rev {} · latest e{}",
-                snapshot.base_revision, snapshot.latest_entry_id
-            ),
-            Style::default().fg(theme.fg),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "[- Writes -]: ",
-            Style::default().fg(Color::Rgb(156, 172, 206)),
-        ),
-        Span::styled(
-            format!(
-                "AdviceBoard {} · FastMemory {}",
-                snapshot.adviceboard_writes, snapshot.fastmemory_writes
-            ),
-            Style::default().fg(theme.fg),
-        ),
-    ]));
-    if !snapshot.contextmemory_title.trim().is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "[- Context -]: ",
-                Style::default().fg(Color::Rgb(156, 172, 206)),
-            ),
-            Span::styled(
-                snapshot.contextmemory_title.clone(),
-                Style::default().fg(theme.fg),
-            ),
-        ]));
-    }
-    lines.push(Line::from(Span::styled(
-        "[- Summary -]:",
-        Style::default().fg(Color::Rgb(156, 172, 206)),
-    )));
-    let summary_lines = snapshot
-        .summary
-        .lines()
-        .map(|line| {
-            Line::from(Span::styled(
-                truncate_with_ellipsis(line, inner.width as usize),
-                Style::default().fg(theme.fg),
-            ))
-        })
-        .collect::<Vec<_>>();
-    lines.extend(
-        summary_lines
-            .into_iter()
-            .take(inner.height.saturating_sub(lines.len() as u16) as usize),
-    );
-    if !snapshot.workflow_lines.is_empty() && lines.len() < inner.height as usize {
-        lines.push(Line::from(Span::styled(
-            "[- Flow -]:",
-            Style::default().fg(Color::Rgb(156, 172, 206)),
-        )));
-        lines.extend(
-            snapshot
-                .workflow_lines
-                .iter()
-                .take(inner.height.saturating_sub(lines.len() as u16) as usize)
-                .map(|line| {
-                    Line::from(Span::styled(
-                        truncate_with_ellipsis(line, inner.width as usize),
-                        Style::default().fg(theme.fg),
-                    ))
-                }),
-        );
-    }
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .style(Style::default().fg(theme.fg).bg(theme.bg))
-            .wrap(Wrap { trim: false }),
-        inner,
-    );
-}
-
 fn draw_background_command_panel(frame: &mut Frame, theme: &Theme, area: Rect, app: &App) {
     let Some(snapshot) = app.active_background_command() else {
         return;
@@ -1436,6 +1528,85 @@ fn draw_settings(frame: &mut Frame, theme: &Theme, area: Rect, app: &App) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect, app: &App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::NONE)
+            .style(Style::default().bg(theme.bg)),
+        area,
+    );
+    let selected = app.help_section();
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "HELP",
+        Style::default()
+            .fg(theme.accent)
+            .bg(theme.bg)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+    for section in HelpSection::ALL {
+        let active = section == selected;
+        let marker = if active { "●" } else { " " };
+        let text = format!(" {marker} {} {}", section.number(), section.label());
+        let style = if active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg).bg(theme.bg)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        selected.label(),
+        Style::default()
+            .fg(theme.panel_fg)
+            .bg(theme.panel_bg)
+            .add_modifier(Modifier::BOLD),
+    )));
+    for text in help_section_body(selected) {
+        lines.push(Line::from(Span::styled(
+            *text,
+            Style::default().fg(theme.fg).bg(theme.bg),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().fg(theme.fg).bg(theme.bg))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn help_section_body(section: HelpSection) -> &'static [&'static str] {
+    match section {
+        HelpSection::Program => &[
+            "Project 萤是一个多角色 AI 终端。Matrix 负责总控，司负责整理与治理，Coding/Server 负责执行不同任务。",
+            "冷启动后程序保持空闲，不会自动续跑旧任务；输入新消息后才会开始本次请求。",
+            "输入普通消息后按 Enter 发送；输入 / 打开命令菜单。",
+        ],
+        HelpSection::Keys => &[
+            "Enter 发送；Shift+Enter / Ctrl+Down 换行；Ctrl+Up 强制发送或排队。",
+            "Shift+Up 打开队列；Alt+Up 编辑当前标签页上一条真实用户消息。",
+            "PageUp/PageDown 切换焦点；Esc 返回、取消选中或中断当前请求。",
+            "/SETTING 打开设置；/HELP 打开帮助；Matrix 下还有 /TERMINAL 与 /QUIT。",
+        ],
+        HelpSection::Faq => &[
+            "冷启动会把旧调度文件视为遗留任务跳过，避免 Matrix 自动继续之前的工作。",
+            "请求失败会按当前重试策略处理；展开系统错误可查看重试明细。",
+            "生成图片默认写入 DCIM，便于系统相册扫描。",
+            "上下文由角色主动管理，达到保护阈值时会触发整理或暂停。",
+        ],
+        HelpSection::Contact => &["QQ群：1072327662"],
+    }
 }
 
 fn draw_palette(frame: &mut Frame, theme: &Theme, area: Rect, app: &App) {
@@ -1741,20 +1912,7 @@ fn draw_input_top(frame: &mut Frame, theme: &Theme, area: Rect, app: &App) {
     let hits = persona_tab_hits(area, app);
     if !hits.is_empty() {
         let tabs_focused = app.focus == crate::input::FocusArea::PersonaTabs;
-        let (line_bg, inactive_bg, selected_bg, focused_bg) = match app.theme_preset() {
-            ThemePreset::Rose => (
-                Color::Rgb(12, 10, 14),
-                Color::Rgb(24, 18, 26),
-                Color::Rgb(68, 40, 56),
-                Color::Rgb(98, 58, 80),
-            ),
-            ThemePreset::Cyan => (
-                Color::Rgb(9, 14, 18),
-                Color::Rgb(16, 22, 28),
-                Color::Rgb(28, 50, 60),
-                Color::Rgb(46, 76, 90),
-            ),
-        };
+        let (line_bg, inactive_bg, selected_bg, focused_bg) = tab_row_colors(app.theme_preset());
         let inactive_style = Style::default()
             .fg(if tabs_focused {
                 Color::Rgb(190, 202, 214)
@@ -1774,7 +1932,8 @@ fn draw_input_top(frame: &mut Frame, theme: &Theme, area: Rect, app: &App) {
         let spans = hits
             .into_iter()
             .map(|hit| {
-                let selected = app.active_persona() == hit.persona;
+                let selected =
+                    app.active_dynamic_role_id().is_none() && app.active_persona() == hit.persona;
                 let focused = tabs_focused && selected;
                 Span::styled(
                     render_persona_tab_cell(
@@ -1798,8 +1957,31 @@ fn draw_input_top(frame: &mut Frame, theme: &Theme, area: Rect, app: &App) {
                 .style(Style::default().bg(line_bg)),
             Rect::new(area.x, area.y, area.width, 1),
         );
+        let role_rows = dynamic_role_tab_rows();
+        let available_role_rows = area.height.saturating_sub(2) as usize;
+        for row in role_rows.into_iter().take(available_role_rows) {
+            frame.render_widget(
+                Block::default()
+                    .borders(Borders::NONE)
+                    .style(Style::default().bg(line_bg)),
+                Rect::new(
+                    area.x,
+                    area.y.saturating_add(lines.len() as u16),
+                    area.width,
+                    1,
+                ),
+            );
+            lines.push(render_dynamic_role_tab_row_line(
+                area.width.max(1) as usize,
+                row.as_slice(),
+                app.active_dynamic_role_id(),
+                theme,
+                app.theme_preset(),
+                tabs_focused,
+            ));
+        }
     }
-    if area.height > 1 {
+    if lines.len() < area.height as usize {
         let active = app.focus == FocusArea::Input || app.has_user_input_overlay();
         let line = "━".repeat(area.width.max(1) as usize);
         let style = if active {
@@ -1822,25 +2004,35 @@ fn draw_input_status(frame: &mut Frame, theme: &Theme, area: Rect, app: &App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let status_lines = match app.screen {
-        Screen::Main => app.status.lines(),
-        Screen::Settings => vec![app.settings_status_line()],
-    };
+    let status_lines = app.input_status_lines();
     let rendered = status_lines
         .into_iter()
+        .enumerate()
         .take(area.height as usize)
-        .map(|status_text| {
+        .map(|(_, status_text)| {
             Line::from(Span::styled(
                 input::truncate_to_width(&status_text, area.width.max(1) as usize),
-                Style::default()
-                    .fg(theme.panel_fg)
-                    .bg(theme.panel_bg)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.panel_fg).bg(theme.panel_bg),
             ))
         })
         .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(Text::from(rendered)).style(Style::default().bg(theme.panel_bg)),
+        Paragraph::new(Text::from(rendered)).style(Style::default().bg(theme.bg)),
+        area,
+    );
+}
+
+fn draw_bottom_status(frame: &mut Frame, theme: &Theme, area: Rect, app: &App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let line = app.bottom_status_line(area.width as usize);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            line,
+            Style::default().fg(theme.dim).bg(theme.panel_bg),
+        )))
+        .style(Style::default().bg(theme.panel_bg)),
         area,
     );
 }
@@ -1859,6 +2051,9 @@ fn draw_input(frame: &mut Frame, theme: &Theme, area: Rect, app: &App) {
 
     if app.screen == Screen::Settings {
         draw_settings_input(frame, theme, area, app);
+        return;
+    }
+    if app.screen == Screen::Help {
         return;
     }
 
@@ -1982,25 +2177,74 @@ fn settings_render_theme(theme: &Theme) -> SettingsRenderTheme {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ContextMode;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn layout_with_base_input_top(
+        area: Rect,
+        palette_h: u16,
+        attention_h: u16,
+        terminal_panel_active: bool,
+        requested_status_h: u16,
+        requested_input_h: u16,
+    ) -> UiLayout {
+        layout(
+            area,
+            palette_h,
+            attention_h,
+            terminal_panel_active,
+            BASE_INPUT_TOP_HEIGHT,
+            requested_status_h,
+            requested_input_h,
+        )
+    }
+
+    fn with_test_role_registry<T>(roles_json: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = crate::mcp::home_override_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("projectying-ui-test-{ts}"));
+        let project_root: PathBuf = root.join("AItermux/projectying");
+        let context_root = project_root.join("context");
+        fs::create_dir_all(context_root.as_path()).expect("create test context");
+        fs::write(context_root.join("roles.json"), roles_json).expect("write roles");
+        crate::set_thread_home_override_for_test(Some(root.clone()));
+        let result = f();
+        crate::set_thread_home_override_for_test(None);
+        let _ = fs::remove_dir_all(root);
+        result
+    }
 
     #[test]
     fn layout_prefers_chat_height_when_terminal_is_tight() {
-        let layout = layout(Rect::new(0, 0, 80, 12), 4, 0, false, 1, INPUT_HEIGHT);
+        let layout =
+            layout_with_base_input_top(Rect::new(0, 0, 80, 12), 4, 0, false, 1, INPUT_HEIGHT);
         assert_eq!(layout.palette.height, 0);
         assert!(layout.main.height >= MIN_CHAT_HEIGHT.min(12));
         assert!(layout.input.height >= MIN_INPUT_HEIGHT);
+        assert_eq!(layout.bottom_status.y, 11);
     }
 
     #[test]
     fn layout_keeps_requested_palette_when_space_is_sufficient() {
-        let layout = layout(Rect::new(0, 0, 80, 24), 4, 0, false, 1, INPUT_HEIGHT);
+        let layout =
+            layout_with_base_input_top(Rect::new(0, 0, 80, 24), 4, 0, false, 1, INPUT_HEIGHT);
         assert_eq!(layout.palette.height, 4);
         assert_eq!(layout.input.height, INPUT_HEIGHT);
+        assert_eq!(layout.input.y + layout.input.height, layout.bottom_status.y);
+        assert_eq!(layout.bottom_status.height, 1);
     }
 
     #[test]
     fn layout_adds_top_panel_without_stealing_input_area() {
-        let layout = layout(Rect::new(0, 0, 80, 24), 0, 1, true, 1, INPUT_HEIGHT);
+        let layout =
+            layout_with_base_input_top(Rect::new(0, 0, 80, 28), 0, 1, true, 1, INPUT_HEIGHT);
         assert_eq!(layout.attention.height, 1);
         assert!(layout.top_panel.height >= MIN_TERMINAL_PANEL_HEIGHT + TOP_PANEL_FRAME_HEIGHT);
         assert!(layout.main.height >= MIN_CHAT_HEIGHT);
@@ -2008,10 +2252,127 @@ mod tests {
     }
 
     #[test]
+    fn input_top_height_does_not_reserve_dynamic_role_rows_when_empty() {
+        with_test_role_registry(r#"{"version":1,"roles":[]}"#, || {
+            let app = App::new();
+
+            assert_eq!(input_top_height(&app), BASE_INPUT_TOP_HEIGHT);
+        });
+    }
+
+    #[test]
+    fn input_top_height_grows_only_for_visible_dynamic_role_rows() {
+        let roles = (0..18)
+            .map(|idx| {
+                format!(
+                    r#"{{"id":"role_{idx}","display_name":"Role {idx}","context_dir":"Role_{idx}","enabled":true}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let roles_json = format!(r#"{{"version":1,"roles":[{roles}]}}"#);
+        with_test_role_registry(roles_json.as_str(), || {
+            let app = App::new();
+
+            assert_eq!(
+                input_top_height(&app),
+                BASE_INPUT_TOP_HEIGHT + MAX_DYNAMIC_ROLE_TAB_ROWS as u16
+            );
+            let layout = layout(
+                Rect::new(0, 0, 80, 28),
+                0,
+                0,
+                false,
+                input_top_height(&app),
+                1,
+                INPUT_HEIGHT,
+            );
+            assert_eq!(
+                layout.input_top.height,
+                BASE_INPUT_TOP_HEIGHT + MAX_DYNAMIC_ROLE_TAB_ROWS as u16
+            );
+        });
+    }
+
+    #[test]
     fn attention_height_keeps_idle_topbar_focus_visible() {
         let mut app = App::new();
         app.focus = FocusArea::Terminal;
+        app.context_mode = ContextMode::Standard;
+        app.focus_task_brief = None;
         app.selected_topbar_lane = None;
         assert_eq!(attention_height(&app), 1);
+    }
+
+    #[test]
+    fn persona_tab_label_uses_single_chinese_glyph() {
+        let app = App::new();
+
+        assert_eq!(persona_tab_label(&app, PersonaKind::Matrix), "萤");
+        assert_eq!(persona_tab_label(&app, PersonaKind::Advisor), "司");
+        assert_eq!(persona_tab_label(&app, PersonaKind::Coding), "绫");
+        assert_eq!(persona_tab_label(&app, PersonaKind::Server), "御");
+    }
+
+    #[test]
+    fn persona_tab_label_keeps_matrix_static_while_dynamic_role_is_active() {
+        with_test_role_registry(
+            r#"{"version":1,"roles":[{"id":"observe_probe","display_name":"观","glyph":"观","context_dir":"Role_observe_probe","base_persona":"matrix","enabled":true}]}"#,
+            || {
+                let mut app = App::new();
+                app.api_active = true;
+                assert_ne!(persona_tab_label(&app, PersonaKind::Matrix), "萤");
+                assert!(app.select_dynamic_role("observe_probe"));
+                assert_eq!(persona_tab_label(&app, PersonaKind::Matrix), "萤");
+            },
+        );
+    }
+
+    #[test]
+    fn dynamic_role_tab_row_uses_label_without_suffix_id() {
+        with_test_role_registry(
+            r#"{"version":1,"roles":[{"id":"observe_probe","display_name":"观","glyph":"观","context_dir":"Role_observe_probe","enabled":true}]}"#,
+            || {
+                let row =
+                    render_dynamic_role_tab_row(24, crate::roles::visible_role_tabs().as_slice());
+                assert!(row.contains("观"));
+                assert!(!row.contains("observe_probe"));
+            },
+        );
+    }
+
+    #[test]
+    fn dynamic_role_tabs_use_contract_glyph_label_for_rendering() {
+        with_test_role_registry(
+            r#"{"version":1,"roles":[{"id":"ops_bridge","display_name":"运营桥","glyph":"桥","context_dir":"Role_ops_bridge","enabled":true}]}"#,
+            || {
+                let tabs = crate::roles::visible_role_tabs();
+                assert_eq!(tabs.len(), 1);
+                assert_eq!(tabs[0].glyph_label, "桥");
+                assert_eq!(tabs[0].hover_title, "桥 运营桥");
+                let row = render_dynamic_role_tab_row(24, tabs.as_slice());
+                assert!(row.contains("桥"));
+                assert!(!row.contains("运营桥"));
+            },
+        );
+    }
+
+    #[test]
+    fn dynamic_role_tab_hits_follow_rendered_row_cells() {
+        with_test_role_registry(
+            r#"{"version":1,"roles":[{"id":"observe_probe","display_name":"观","glyph":"观","context_dir":"Role_observe_probe","enabled":true},{"id":"review_probe","display_name":"审","glyph":"审","context_dir":"Role_review_probe","enabled":true}]}"#,
+            || {
+                let hits = dynamic_role_tab_hits(Rect::new(0, 0, 40, 5));
+                assert_eq!(hits.len(), 2);
+                assert_eq!(hits[0].role_id, "observe_probe");
+                assert_eq!(hits[1].role_id, "review_probe");
+                assert_eq!(hits[0].rect.y, 1);
+                assert_eq!(hits[1].rect.y, 1);
+                assert_eq!(hits[0].rect.x, 8);
+                assert_eq!(hits[1].rect.x, 16);
+                assert_eq!(hits[0].rect.width, 8);
+                assert_eq!(hits[1].rect.width, 8);
+            },
+        );
     }
 }

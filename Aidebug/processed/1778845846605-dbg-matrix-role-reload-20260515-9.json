@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-matrix-role-reload-20260515-9",
+  "text": "Aidebug T9：动态角色治理热刷新稳定性测试。不要修改代码，不要清空笔记。目标是验证 role_reload / role_list 后 worker 的 contract、工具、UI/storage 字段不退化，并且仍可被 Matrix 调度。\n\n请严格按步骤执行，并在最终回复中使用固定 marker：\n\n1. 先读取 `role_list` 中 worker 的当前 contract，记录 enabled、visible_tab、context_dir、memory_dir、tab_label/title/status/input_status、default_tools、supports_topbar。\n2. 执行一次 `role_reload` 或等价热刷新动作；如果工具不支持 reload，请明确 `RELOAD_UNSUPPORTED`，但仍继续执行 reload 后可观测检查。\n3. 再读取 `role_list` 中 worker 的 contract，对比刷新前后是否一致，特别检查 `default_tools` 至少包含 `persona_manage`，并保留 `memory_read|memory_add|memory_check|context_manage`。\n4. 执行一次轻量 worker 调度回归：给 worker 发送唯一标记 `T9_WORKER_RELOAD_ROUTE_20260515`，要求 worker 回复 `T9_RELOAD_ROUTE_OK`。\n5. observe worker 和 Matrix：确认 worker 回复在 worker 侧可见，Matrix 侧未出现 worker 正文污染。\n6. 检查 status/focus/request，确认没有卡住 active_request、残留 focus 或 reload 后治理字段缺失。\n\n最终回复必须包含：\nROLE_RELOAD: PASS/FAIL/RELOAD_UNSUPPORTED\nCONTRACT_STABLE: PASS/FAIL\nTOOL_CONTRACT: PASS/FAIL\nWORKER_DISPATCH_AFTER_RELOAD: PASS/FAIL\nMATRIX_POLLUTION: PASS/FAIL\nBUGS_FOUND: none 或逐条列出\nEVIDENCE: 简短列出关键工具结果和刷新前后对比。"
+}

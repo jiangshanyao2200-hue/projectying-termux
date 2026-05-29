@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-matrix-contextmanage-20260511-1",
+  "text": "Matrix 工具与 context_manage 小范围自检。严格要求：不要联网，不要修改源码、配置或真实长期记忆；只允许写入一条带 [debug] 前缀的 fastmemory 测试项并随后压缩它。步骤：1. 调用 tool_manage list 查看当前工具箱状态。2. 如果 command 未展开，调用 tool_manage open，tool_ids=[\"command\"]，然后继续下一轮。3. 调用 command 执行 `printf MATRIX_TOOL_OK`，workdir 使用项目根目录，output_level=small。4. 调用 context_manage write，target=fastmemory，text=`[debug] contextmanage write probe: MATRIX_CONTEXT_WRITE_OK`。5. 根据 write 返回的 item id，只对该测试项调用 context_manage compact/summary，target=fastmemory，item_ids=[刚写入的id]，text=`[debug] contextmanage compact probe: MATRIX_CONTEXT_COMPACT_OK`；如果无法获得 item id，不要做整区 compact，直接汇报无法安全 compact。6. 调用 tool_manage close，tool_ids=[\"command\"]。最后用很短中文汇报：tool_manage、command、context_manage write、context_manage compact 是否成功，是否出现明显上下文膨胀。"
+}

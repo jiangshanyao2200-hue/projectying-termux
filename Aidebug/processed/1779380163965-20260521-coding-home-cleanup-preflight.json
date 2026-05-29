@@ -1,0 +1,5 @@
+{
+  "persona": "coding",
+  "debug_session_id": "coding-home-cleanup-preflight-20260521",
+  "text": "任务：对 /data/data/com.termux/files/home 做一轮垃圾清理预检。重点是对比 home 下的索引文档 /data/data/com.termux/files/home/目录索引.md 与当前 home 实际目录/文件，找出索引之外新增或疑似临时/垃圾的目录和文件。\n\n严格要求：\n1. 本轮只盘点、分类、给出删除建议，禁止执行 rm、rmdir、trash、mv 到回收目录等任何删除/迁移动作。\n2. 先读取 /data/data/com.termux/files/home/目录索引.md，再用只读命令观察 home 顶层和必要的二级目录，例如 ls、find -maxdepth、du -sh。不要递归扫太深导致输出爆炸。\n3. 输出分为：A 明显运行/项目目录，B 索引外但可能需要保留，C 疑似可清理候选，D 需要用户确认的高风险项。\n4. 对每个清理候选写清楚：路径、大小、mtime、判断理由、风险、建议动作。\n5. 如果发现索引文档过期，也列出应补录/更新的目录，不要直接改索引。\n6. 过程中若需要查看大目录，优先用 du/find 的摘要，不要把大量文件清单刷屏。\n7. 最终只给清理计划和确认清单，等待用户确认后再删除。"
+}

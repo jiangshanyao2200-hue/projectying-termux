@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "live-t1-health-20260517",
+  "text": "Aidebug live T1 smoke。请只调用 tool_manage health 读取当前健康链，然后用极短中文汇报：overall_state、overall_score、是否有 DEGRADED/BLOCKED/BROKEN 链路。不要修改设置，不要创建角色，不要发送其他 persona。"
+}

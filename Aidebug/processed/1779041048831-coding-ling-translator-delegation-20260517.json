@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "coding-ling-translator-delegation-20260517",
+  "text": "本轮是 Coding · 绫专项协同测试。请不要自己长时间直接改代码，要把明确修复任务委派给 Coding，并观察 Coding 与母体协同是否稳定。目标工程：/data/data/com.termux/files/home/AITranslatorOverlay。当前用户观察：AI 翻译 app 启动或进入翻译链路会闪退/报错。已知可疑证据：media/screenshot/aito_foreground_main.xml 中出现 Can't create handler inside thread Thread[translator-http,5,main] that has not called Looper.prepare()。任务要求：1) Matrix 先用 persona_manage 把具体排查修复任务交给 Coding；2) Coding 需要读取最小必要源码、构建、如 adb 可用则安装启动并用 logcat 捕获崩溃栈；3) 如果确认是后台线程触 UI/Looper，做最小修复并构建验证；4) 过程中 Matrix 观察 Coding 是否会回报母体、是否工具使用稳定、是否产生过大输出；5) 如上下文膨胀，观察司是否合理整理；6) 不要泄露任何 API Key；7) 最终回复必须包含：委派是否成功、Coding 做了什么、改动文件、build/install/launch/logcat 证据、协同链路问题清单。"
+}

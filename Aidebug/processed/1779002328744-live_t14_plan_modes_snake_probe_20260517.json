@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "live-t14-plan-modes-snake-probe-20260517",
+  "text": "Aidebug T14：plan 工具三模式真实工作探针。请严格做一个小实战，不要只聊天。目标：围绕 /data/data/com.termux/files/home/snake.html 做最小审查，并生成 /data/data/com.termux/files/home/AItermux/projectying/Aidebug/artifacts/plan_tool_snake_probe.md。要求：1) 先调用 update_plan 的 decision 模式，记录任务范围，不应触发复杂门禁；2) 再调用 update_plan 的 todo/plan 模式，列出实际执行步骤；3) 再调用 update_plan 的 blueprint 模式，给出完整蓝图但必须继续执行；4) 使用 command 检查 snake.html 是否包含 canvas、startBtn、方向控制、requestAnimationFrame；5) 用 command 生成最小报告文件，报告包含检查结果、三种 plan 模式是否调用、是否出现门禁或无法继续执行；6) 最终极短回报：DECISION/TODO/BLUEPRINT/WORK/REPORT/PERF 五项 PASS/FAIL 和证据。不要创建动态角色。不要修改项目源码。"
+}

@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-ai-translator-round4-build-verify-20260513-1",
+  "text": "继续同一轮 AITranslatorOverlay 验收。请不要重新做大范围代码审查，也不要再把长文件全量读入。Aidebug 已观察到 Coding 已修改源码但没有构建/安装/验证，且最终正文为空。\n\n当前事实：\n- 项目：/data/data/com.termux/files/home/AITranslatorOverlay\n- build 脚本：/data/data/com.termux/files/home/AITranslatorOverlay/build.sh\n- APK 文件仍停在上一轮旧时间，说明这轮改动未构建出新包。\n- 本轮源码已改动 ScreenCaptureHelper.java、TraceLog.java、FloatingBubbleService.java、HistoryStore.java、TranslatorRepository.java 等。\n\n请 Matrix 主控收尾：\n1. 直接要求 Coding 做“构建 -> 若失败按错误最小修复 -> adb 在线则安装 -> 启动/抓关键 AITO_TRACE 日志”的闭环。\n2. 不要让 Coding 再做大范围审查；只允许按构建错误读取必要片段。\n3. 如果 Coding 已空正文完成，你要明确指出这是异常，并要求它最终必须给出构建/安装结果，而不是只说更新计划。\n4. 最终向用户汇报：是否构建成功、APK 时间是否更新、是否安装、仍有哪些功能不足。\n\n这是一条收尾验证任务，不是新需求。"
+}

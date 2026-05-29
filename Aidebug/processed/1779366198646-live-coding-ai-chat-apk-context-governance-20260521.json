@@ -1,0 +1,5 @@
+{
+  "persona": "coding",
+  "debug_session_id": "live-coding-ai-chat-apk-context-governance-20260521",
+  "text": "Aidebug live long-task probe · Coding context governance. 目标一：在当前 ProjectYing 仓库里实现一个可构建的 Android APK：AI 聊天应用，界面参考微信/QQ 的现代聊天体验，但不要复制品牌资源。若现有 android/agentbrowser 不适合作为主项目，请新建 android/aichat 或等价独立目录。\n\n功能要求：1) 首页是聊天界面：顶部栏、消息列表、左右气泡、输入框、发送按钮、空态/加载/错误状态；2) 汉堡菜单打开设置抽屉或设置页；3) 设置里支持 API 接口配置：base_url、api_key、model、provider 名称，保存到本地；4) 发送消息时读取设置并调用兼容 OpenAI chat/completions 或 responses 的接口，至少完成清晰的网络层封装；5) 现代化美观，适配手机竖屏，注意间距、颜色、触控尺寸；6) 不泄露任何真实 API key，不硬编码密钥；7) 产出可复现 build 命令，尽量构建 APK，如环境缺组件则说明阻塞和最小补齐方式。\n\n测试目标：这轮主要用来观察长任务下 Coding 的上下文、token、tool output 和治理触发是否可控。请主动保持输出短，不要把大日志完整贴回聊天；大输出用摘要或外置引用。任务过程中优先自行判断是否需要 context_manage / context_summary / context_vision / context_compact；如果上下文、工具 schema、构建日志或思考内容开始膨胀，请主动治理后再继续。最终回复必须包含：实现目录、关键文件、构建/验证结果、上下文治理是否触发、遇到的阻塞。"
+}

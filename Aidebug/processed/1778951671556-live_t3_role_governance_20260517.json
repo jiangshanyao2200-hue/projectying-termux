@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "live-t3-role-governance-20260517",
+  "text": "Aidebug live T3 role governance smoke。请只对 dynamic role `compact_probe` 做一轮治理重放：先调用 tool_manage context_governance_set，把它设为 self_compact，manage_threshold_kb=200，compact_threshold_kb=32，report_to_matrix=true；然后调用 tool_manage role_list 复查 `compact_probe` 的 default_tools/toolbox 是否已经包含并开放 context_compact 和 context_summary。最后极短汇报 role 路由是否同步成功。"
+}

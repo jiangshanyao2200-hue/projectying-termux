@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-round2-toolchain-20260511-1",
+  "text": "本轮是 Aidebug 工具链自检，请严格按顺序做最小闭环，避免整理上下文，避免写长期记忆：1) 调用 tool_manage LIST，确认当前工具箱；2) 调用 tool_manage OPEN 打开 command，理由：debug command probe；3) 调用 command 执行：printf ROUND2_COMMAND_OK；4) 如果 command 返回 toolmemory_entry_id，请用 memory_check target=toolmemory 检查该 entry，再用 memory_read 只读前 6 行；5) 调用 tool_manage CLOSE 关闭 command；6) 最后用中文短报：列出 command 是否成功、toolmemory 是否可读、是否发现异常。"
+}

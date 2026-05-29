@@ -1,0 +1,1 @@
+{"persona":"server","debug_session_id":"dbg-server-tool-smoke-20260518","text":"请直接按顺序做一轮工具测试：1) server_manage status 查看当前服务器注册表和 active server；2) server_manage test 测试当前 active server 的连通性；3) command target=ssh 运行一次 harmless 一次性命令，例如 printf projectying-command-ok。请只回报每一步工具回执和结论，不要展开推理。若有多个服务器，默认使用 active_server_id。"}

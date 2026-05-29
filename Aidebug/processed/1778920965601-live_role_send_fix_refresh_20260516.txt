@@ -1,0 +1,2 @@
+persona: matrix
+Aidebug live refresh after role-send fix 2026-05-16. 请只回复：LIVE_FIX_REFRESH_OK

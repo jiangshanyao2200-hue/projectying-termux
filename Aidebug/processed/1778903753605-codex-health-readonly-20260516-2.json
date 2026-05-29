@@ -1,0 +1,1 @@
+{"persona":"matrix","debug_session_id":"codex-health-readonly-20260516-2","text":"Aidebug 只读回归：请调用 tool_manage health 读取健康快照；不要发送 worker，不要写 memory/context，不要清空 datememory，不要启动 pty。请输出这些 marker：HEALTH_READ_OK、overall_score/state、所有 DEGRADED chain id、你建议的下一步但不执行。"}

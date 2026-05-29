@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "matrix-full-chain-pressure-20260517",
+  "text": "本轮执行 Matrix 全链路压力测试，Server persona 不参与。不要节省 token，目标是实际启动链路、收集问题、记录证据。请按顺序但尽量并行：1) 读取 tool_manage health，记录当前健康；2) 用 context_manage action=write target=fastmemory section=public kind=board 写入共享板 marker：MATRIX_PRESSURE_20260517_SHARED_BOARD，并说明这是本轮压测公共情报；3) 观察/复用已有 dynamic roles：sharedprobe、summary_probe、vision_probe，必要时新建一个 fast/self_compact 的临时编程角色，让它测试 context_vision、context_summary、context_compact 的真实可用性；4) 用 persona_manage 联系 Coding 排查 /data/data/com.termux/files/home/AITranslatorOverlay 启动闪退，联系司做上下文/记忆治理观察；5) 不要联系 Server；6) 最终汇报 PASS/FAIL、每条链路证据、发现的问题、是否需要代码修复。重点看：SharedBoard 是否真的对角色可见，工具投影是否缺 command/apply_patch/context 工具，plan/update_plan 是否卡顿，context KB 阈值是否触发正确，工具大输出是否进入 toolmemory/output。"
+}

@@ -1,0 +1,70 @@
+{
+  "version": 4,
+  "context": {
+    "version": 4,
+    "entries": [
+      {
+        "id": 1,
+        "stable_id": 1,
+        "round_id": 1,
+        "role": "user",
+        "kind": "message",
+        "thinking": null,
+        "text": "COMPACT_PROBE_PAYLOAD_1..900 已按用户提供的 PAYLOAD_START/PAYLOAD_END 完整压测意图写入：自管压缩测试片段 1-900。该条用于触发 compact_probe self_compact 自管上下文维护，marker=COMPACT_PROBE_PAYLOAD_1 和 COMPACT_PROBE_PAYLOAD_900。",
+        "codex_item_json": "{\"content\":[{\"text\":\"COMPACT_PROBE_PAYLOAD_1..900 已按用户提供的 PAYLOAD_START/PAYLOAD_END 完整压测意图写入：自管压缩测试片段 1-900。该条用于触发 compact_probe self_compact 自管上下文维护，marker=COMPACT_PROBE_PAYLOAD_1 和 COMPACT_PROBE_PAYLOAD_900。\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"}",
+        "created_at": 1778930060
+      }
+    ]
+  },
+  "focus": {
+    "version": 4,
+    "entries": []
+  },
+  "meta": {
+    "version": 4,
+    "mode": "standard",
+    "next_entry_id": 2,
+    "revision": 2,
+    "next_round_id": 2,
+    "soft_context_bytes": 102400,
+    "hard_context_bytes": 204800,
+    "soft_context_entry_limit": 48,
+    "hard_context_entry_limit": 96,
+    "soft_focus_bytes": 102400,
+    "hard_focus_bytes": 204800,
+    "soft_focus_entry_limit": 48,
+    "hard_focus_entry_limit": 96,
+    "fastmemory_item_limit": 10,
+    "context_governance": {
+      "mode": "self_compact",
+      "manage_threshold_kb": 200,
+      "compact_threshold_kb": 32,
+      "report_to_matrix": true
+    },
+    "focus_brief": null,
+    "focus_entered_at": null,
+    "focus_required_summary": null,
+    "pending_maintenance": []
+  },
+  "toolbox": {
+    "version": 4,
+    "entries": [
+      {
+        "tool_id": "context_compact",
+        "state": "expanded"
+      },
+      {
+        "tool_id": "context_summary",
+        "state": "expanded"
+      },
+      {
+        "tool_id": "memory_check",
+        "state": "expanded"
+      },
+      {
+        "tool_id": "persona_manage",
+        "state": "expanded"
+      }
+    ]
+  }
+}

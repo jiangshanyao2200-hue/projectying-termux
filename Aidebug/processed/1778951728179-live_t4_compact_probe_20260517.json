@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "live-t4-compact-probe-20260517",
+  "text": "Aidebug live T4 compact probe smoke。请把任务发送给 dynamic role `compact_probe`，内容要求它只做两步：1) 在自己的上下文上调用 context_compact mode=fast，reason=live smoke，report_to_matrix=true；2) 再调用 context_summary fold，折叠自己已经确认的旧条目或工具回执，优先 entries 2,3,4。最后让它极短回报：context_compact 是否真的执行、context_summary 是否真的执行、以及是否需要再折叠更多。"
+}

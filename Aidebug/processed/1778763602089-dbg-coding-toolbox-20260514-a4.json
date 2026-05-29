@@ -1,0 +1,1 @@
+{"persona":"matrix","debug_session_id":"dbg-coding-toolbox-20260514-a4","text":"只做一件事，不改代码，不进入新的复杂计划：检查普通 Coding 常驻工具列表里是否出现 role_hello_tool。优先直接用 tool_manage list persona=coding；如果结果里没有 role_hello_tool，就只回一行：CODING_TOOLBOX_OK no role_hello_tool。若出现了，就只回一行：CODING_TOOLBOX_LEAK role_hello_tool。不要做别的解释。"}

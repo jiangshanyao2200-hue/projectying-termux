@@ -2,7 +2,7 @@
 // mcp.rs（工具层：Codex function calling 兼容）
 //
 // 职责：
-// - 提供 codex_tools schema（exec_command / write_stdin / view_image / apply_patch / update_plan / pty_list / pty_kill）
+// - 提供 codex_tools schema（Matrix: command / pty_run / pty_input / pty_wait）
 // - 解析 provider 返回的 function_call / tool_call，并执行本地工具
 // - 统一工具回执的“摘要/预览/外部保存路径”格式（给 UI 与模型同时用）
 // - 内嵌 terminal 运行时：只负责 PTY 会话/输出/终止，不负责任何 UI 绘制
@@ -11,9 +11,9 @@
 // - `main.rs::provider`：解析到 FunctionCall 后调用 execute_function_call(...)
 //
 // 下游：
-// - terminal：tty=true 的命令进入 PTY（后台/交互）
+// - terminal：主路径走 command + 显式 PTY 工具组
 // - std::process::Command：tty=false 的普通命令
-// - 文件系统：`ProjectYing/log/commandoutput/*`
+// - 文件系统：PTY / agent 实时输出使用 `ProjectYing/memory/output/*`，普通 command 完成态归档到 toolmemory
 //
 // 多源（SSOT）约定：
 // - 工具名称/参数 schema 在这里是唯一来源，provider/core 不应复制一份 schema。
@@ -24,16 +24,18 @@
 // 城区总图（mcp 城）
 // - 工具法典区：schema、call 描述、调用结果结构
 // - 调度中心：function_call 解析与执行分发
-// - 执行站：exec_command / write_stdin / view_image / apply_patch / update_plan / pty_kill
+// - 执行站：command / pty_run / pty_input / pty_wait / exec_command / view_image / apply_patch / update_plan / pty_kill
 // - 仓储中心：输出预览、裁剪、落盘
 // - Terminal 港区：真实 PTY 运行时（terminal 子模块）
 // =============================================================================
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 #[cfg(test)]
@@ -44,7 +46,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{
     cmp,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -52,16 +54,24 @@ use base64::Engine as _;
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::webp::WebPEncoder;
 use image::imageops::FilterType;
-use image::{ColorType, DynamicImage, GenericImageView, ImageEncoder};
-use serde::{Deserialize, Serialize};
+use image::{ColorType, DynamicImage, GenericImageView, ImageEncoder, ImageFormat};
+use reqwest::blocking::multipart::{Form, Part};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::{Method, Url};
+use scraper::{Html, Selector};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
-use crate::context::{ContextManageRequest, ContextRole, ContextTarget, FastMemorySection};
+use crate::context::{
+    ContextCompactMode, ContextCompactRequest, ContextManageRequest, ContextRole,
+    ContextSummaryFoldEntry, ContextSummaryRequest, ContextTarget, ContextVisionRequest,
+    FastMemorySection,
+};
+use crate::provider::{AuthVariant, auth_variants};
 
+#[cfg(test)]
 const HOME_OVERRIDE_ENV: &str = "PROJECTYING_HOME_OVERRIDE";
 const PROJECTYING_REL_PATH: &str = "AItermux/projectying";
-const COMMAND_OUTPUT_REL_PATH: &str = "log/commandoutput";
-const MEDIA_DIR_NAME: &str = "media";
 const VIEW_IMAGE_SOURCE_MAX_BYTES: usize = 32 * 1024 * 1024;
 const VIEW_IMAGE_UPLOAD_HARD_MAX_BYTES: usize = 4 * 1024 * 1024;
 const VIEW_IMAGE_UPLOAD_TARGET_UI_BYTES: usize = 2 * 1024 * 1024;
@@ -71,42 +81,38 @@ const VIEW_IMAGE_UI_MAX_HEIGHT: u32 = 6400;
 const VIEW_IMAGE_UI_MIN_WIDTH: u32 = 900;
 const VIEW_IMAGE_PHOTO_MAX_EDGE: u32 = 1600;
 const VIEW_IMAGE_PHOTO_MIN_EDGE: u32 = 960;
+const EXTERNAL_TOOLS_DIR: &str = "tools/external";
+const EXTERNAL_TOOL_MANIFEST_SUFFIX: &str = ".tool.json";
+const EXTERNAL_TOOL_DEFAULT_TIMEOUT_SECS: u64 = 30;
+const EXTERNAL_TOOL_MAX_TIMEOUT_SECS: u64 = 300;
 const APPLY_PATCH_MAX_BYTES: usize = 512 * 1024;
 const COMMAND_OUTPUT_BUDGET_CHARS_PER_LINE: usize = 300;
-const COMMAND_OUTPUT_LEVEL_LOW_LINES: usize = 120;
-const COMMAND_OUTPUT_LEVEL_MEDIUM_LINES: usize = 320;
-const COMMAND_OUTPUT_LEVEL_HIGH_LINES: usize = 520;
-const COMMAND_OUTPUT_LEVEL_LOW_CHARS: usize =
-    COMMAND_OUTPUT_LEVEL_LOW_LINES * COMMAND_OUTPUT_BUDGET_CHARS_PER_LINE;
-const COMMAND_OUTPUT_LEVEL_MEDIUM_CHARS: usize =
-    COMMAND_OUTPUT_LEVEL_MEDIUM_LINES * COMMAND_OUTPUT_BUDGET_CHARS_PER_LINE;
-const COMMAND_OUTPUT_LEVEL_HIGH_CHARS: usize =
-    COMMAND_OUTPUT_LEVEL_HIGH_LINES * COMMAND_OUTPUT_BUDGET_CHARS_PER_LINE;
+const COMMAND_OUTPUT_LEVEL_LOW_KB: usize = 48;
+const COMMAND_OUTPUT_LEVEL_MEDIUM_KB: usize = 96;
+const COMMAND_OUTPUT_LEVEL_HIGH_KB: usize = 128;
 const COMMAND_OUTPUT_SYSTEM_INLINE_MAX_LINES: usize = 1_200;
-const COMMAND_OUTPUT_SYSTEM_INLINE_MAX_BYTES: usize = 5 * 1024 * 1024;
-const COMMAND_OUTPUT_SYSTEM_INLINE_MAX_CHARS: usize = 5 * 1024 * 1024;
-const COMMAND_OUTPUT_PREVIEW_MAX_LINES: usize = 150;
-const COMMAND_OUTPUT_PREVIEW_MAX_CHARS: usize = 12_000;
+const COMMAND_OUTPUT_SYSTEM_INLINE_MAX_BYTES: usize = 128 * 1024;
+const COMMAND_OUTPUT_SYSTEM_INLINE_MAX_CHARS: usize = 128 * 1024;
+const COMMAND_OUTPUT_PREVIEW_MAX_LINES: usize = 120;
+const COMMAND_OUTPUT_PREVIEW_MAX_CHARS: usize = 8_000;
 const OUTPUT_DIR_RETENTION_MAX_ENTRIES: usize = 30;
 const OUTPUT_DIR_RETENTION_PRUNE_COUNT: usize = 15;
-const COMMAND_OUTPUT_ADB_REL_PATH: &str = "log/commandoutput/adboutput";
-const COMMAND_OUTPUT_TERMUX_API_REL_PATH: &str = "log/commandoutput/termuxapioutput";
-const MULTIAGENT_OUTPUT_REL_PATH: &str = "log/multiagentoutput";
-const PARALLEL_TOOL_MAX_USES: usize = 6;
 const COMMAND_BACKGROUND_PROMOTE_SECS: u64 = 30;
 pub(crate) const RUNNING_SNAPSHOT_INTERVAL_SECS: u64 = 5 * 60;
 const COMMAND_BACKGROUND_PROGRESS_SECS: u64 = RUNNING_SNAPSHOT_INTERVAL_SECS;
 const COMMAND_BACKGROUND_OUTPUT_TAIL_MAX_CHARS: usize = 120_000;
-const COMMAND_BACKGROUND_CAPTURE_MAX_CHARS: usize = 512 * 1024;
+const COMMAND_BACKGROUND_CAPTURE_MAX_CHARS: usize = 5 * 1024 * 1024;
 const COMMAND_BACKGROUND_WAIT_POLL_MS: u64 = 80;
 const COMMAND_BACKGROUND_DEFAULT_TIMEOUT_SECS: u64 = 60 * 60;
-const WAIT_AGENT_DEFAULT_TIMEOUT_MS: u64 = 30_000;
-const WAIT_AGENT_MIN_TIMEOUT_MS: u64 = 10_000;
+const OUTPUT_STREAM_DEFAULT_MAX_BYTES: usize = 32 * 1024;
+const OUTPUT_STREAM_HARD_MAX_BYTES: usize = 128 * 1024;
+const OUTPUT_STREAM_DEFAULT_TAIL_LINES: usize = 120;
+const OUTPUT_STREAM_MAX_TAIL_LINES: usize = 2_000;
+const WAIT_AGENT_DEFAULT_TIMEOUT_MS: u64 = 0;
+const WAIT_AGENT_MIN_TIMEOUT_MS: u64 = 0;
 const WAIT_AGENT_MAX_TIMEOUT_MS: u64 = 3_600_000;
-const MAX_AGENT_BATCH_CONCURRENCY: usize = 64;
-const DEFAULT_AGENT_BATCH_CONCURRENCY: usize = 16;
-const DEFAULT_AGENT_BATCH_RUNTIME_SECS: u64 = 1_800;
 const AGENT_EVENT_LOG_LIMIT: usize = 48;
+const AGENT_WAIT_PREVIEW_EVENT_LINES: usize = 6;
 const AGENT_EVENT_MAX_CHARS: usize = 240;
 const AGENT_COMPLETION_EVENT_MAX_LINES: usize = 24;
 const AGENT_FORK_CONTEXT_MAX_NON_SYSTEM_MESSAGES: usize = 40;
@@ -115,12 +121,15 @@ pub const MAX_AGENT_RETENTION_LIMIT: usize = 100;
 const DEFAULT_AGENT_RETENTION_LIMIT: usize = 20;
 const TOOL_OUTPUT_LINES_MIN: usize = 20;
 const TOOL_OUTPUT_LINES_MAX: usize = 2_000;
-const TOOL_OUTPUT_CHARS_MIN: usize = 1_000;
-const TOOL_OUTPUT_CHARS_MAX: usize = 1_000_000;
 const VIEW_IMAGE_UPLOAD_MAX_MB_MIN: u64 = 1;
 const VIEW_IMAGE_UPLOAD_MAX_MB_MAX: u64 = 32;
 const TERMINAL_AUDIT_INTERVAL_SECS_MIN: u64 = 30;
 const TERMINAL_AUDIT_INTERVAL_SECS_MAX: u64 = 3_600;
+const SERVER_SSH_ASKPASS_PASSWORD_ENV: &str = "PROJECTYING_SERVER_SSH_PASSWORD";
+const SERVER_SSH_ASKPASS_SCRIPT: &str = "server-ssh-askpass.sh";
+const SERVER_SPLIT_SUFFIXES: [&str; crate::roles::SERVER_SPLIT_ROLE_LIMIT] =
+    ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"];
+static NEXT_PERSONA_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -143,53 +152,359 @@ impl ImageCompressionQuality {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutputSettings {
-    pub low_lines: usize,
-    pub low_chars: usize,
-    pub medium_lines: usize,
-    pub medium_chars: usize,
-    pub high_lines: usize,
-    pub high_chars: usize,
+    pub low_kb: usize,
+    pub medium_kb: usize,
+    pub high_kb: usize,
 }
 
 impl Default for ToolOutputSettings {
     fn default() -> Self {
         Self {
-            low_lines: COMMAND_OUTPUT_LEVEL_LOW_LINES,
-            low_chars: COMMAND_OUTPUT_LEVEL_LOW_CHARS,
-            medium_lines: COMMAND_OUTPUT_LEVEL_MEDIUM_LINES,
-            medium_chars: COMMAND_OUTPUT_LEVEL_MEDIUM_CHARS,
-            high_lines: COMMAND_OUTPUT_LEVEL_HIGH_LINES,
-            high_chars: COMMAND_OUTPUT_LEVEL_HIGH_CHARS,
+            low_kb: COMMAND_OUTPUT_LEVEL_LOW_KB,
+            medium_kb: COMMAND_OUTPUT_LEVEL_MEDIUM_KB,
+            high_kb: COMMAND_OUTPUT_LEVEL_HIGH_KB,
         }
     }
 }
 
 impl ToolOutputSettings {
-    fn budget_for_level(&self, level: CommandOutputLevel) -> CommandOutputBudget {
-        match level {
-            CommandOutputLevel::Low => CommandOutputBudget {
-                label: format!("low ({} lines · {} chars)", self.low_lines, self.low_chars),
-                inline_lines: self.low_lines,
-                inline_chars: self.low_chars,
-            },
-            CommandOutputLevel::Medium => CommandOutputBudget {
-                label: format!(
-                    "medium ({} lines · {} chars)",
-                    self.medium_lines, self.medium_chars
-                ),
-                inline_lines: self.medium_lines,
-                inline_chars: self.medium_chars,
-            },
-            CommandOutputLevel::High => CommandOutputBudget {
-                label: format!(
-                    "high ({} lines · {} chars)",
-                    self.high_lines, self.high_chars
-                ),
-                inline_lines: self.high_lines,
-                inline_chars: self.high_chars,
-            },
+    fn kb_to_budget(kb: usize, label: String) -> CommandOutputBudget {
+        let inline_chars = sanitize_tool_output_kb(kb)
+            .saturating_mul(1024)
+            .min(COMMAND_OUTPUT_SYSTEM_INLINE_MAX_BYTES);
+        let inline_lines = (inline_chars / COMMAND_OUTPUT_BUDGET_CHARS_PER_LINE)
+            .clamp(TOOL_OUTPUT_LINES_MIN, TOOL_OUTPUT_LINES_MAX);
+        CommandOutputBudget {
+            label,
+            inline_lines,
+            inline_chars,
         }
     }
+
+    fn budget_for_level(&self, level: CommandOutputLevel) -> CommandOutputBudget {
+        match level {
+            CommandOutputLevel::Low => Self::kb_to_budget(
+                self.low_kb,
+                format!("small ({} KB)", sanitize_tool_output_kb(self.low_kb)),
+            ),
+            CommandOutputLevel::Medium => Self::kb_to_budget(
+                self.medium_kb,
+                format!("normal ({} KB)", sanitize_tool_output_kb(self.medium_kb)),
+            ),
+            CommandOutputLevel::High => Self::kb_to_budget(
+                self.high_kb,
+                format!("large ({} KB)", sanitize_tool_output_kb(self.high_kb)),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRunStatus {
+    Ok,
+    Error,
+    Cancelled,
+    Timeout,
+    Running,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolDisplaySpec {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub action_label: String,
+    #[serde(default)]
+    pub brief_template: String,
+    #[serde(default)]
+    pub collapsed_fields: Vec<String>,
+    #[serde(default)]
+    pub expanded_sections: Vec<String>,
+    #[serde(default = "default_display_input_label")]
+    pub input_label: String,
+    #[serde(default = "default_display_output_label")]
+    pub output_label: String,
+    #[serde(default = "default_tool_display_max_inline_bytes")]
+    pub max_inline_bytes: usize,
+    #[serde(default)]
+    pub group_key: Option<String>,
+    #[serde(default = "default_tool_display_chain_mode")]
+    pub chain_mode: String,
+    #[serde(default = "default_tool_display_collapsed")]
+    pub default_collapsed: bool,
+}
+
+impl Default for ToolDisplaySpec {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            action_label: String::new(),
+            brief_template: "{brief}".to_string(),
+            collapsed_fields: vec![
+                "brief".to_string(),
+                "status".to_string(),
+                "duration_ms".to_string(),
+            ],
+            expanded_sections: vec![
+                "input".to_string(),
+                "summary".to_string(),
+                "refs".to_string(),
+            ],
+            input_label: default_display_input_label(),
+            output_label: default_display_output_label(),
+            max_inline_bytes: default_tool_display_max_inline_bytes(),
+            group_key: None,
+            chain_mode: default_tool_display_chain_mode(),
+            default_collapsed: default_tool_display_collapsed(),
+        }
+    }
+}
+
+fn default_display_input_label() -> String {
+    "Input".to_string()
+}
+
+fn default_display_output_label() -> String {
+    "Output".to_string()
+}
+
+fn default_tool_display_max_inline_bytes() -> usize {
+    8 * 1024
+}
+
+fn default_tool_display_chain_mode() -> String {
+    "append".to_string()
+}
+
+fn default_tool_display_collapsed() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolOutputPolicy {
+    #[serde(default = "default_tool_display_max_inline_bytes")]
+    pub max_inline_bytes: usize,
+    #[serde(default = "default_tool_output_externalize_over_bytes")]
+    pub externalize_over_bytes: usize,
+    #[serde(default = "default_tool_output_preferred_store")]
+    pub preferred_store: String,
+}
+
+impl Default for ToolOutputPolicy {
+    fn default() -> Self {
+        Self {
+            max_inline_bytes: default_tool_display_max_inline_bytes(),
+            externalize_over_bytes: default_tool_output_externalize_over_bytes(),
+            preferred_store: default_tool_output_preferred_store(),
+        }
+    }
+}
+
+fn default_tool_output_externalize_over_bytes() -> usize {
+    16 * 1024
+}
+
+fn default_tool_output_preferred_store() -> String {
+    "toolmemory".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchedulerPolicy {
+    #[serde(default)]
+    pub dedupe_key: Option<String>,
+    #[serde(default = "default_scheduler_single_flight")]
+    pub single_flight: bool,
+    #[serde(default = "default_scheduler_deadline_ms")]
+    pub deadline_ms: u64,
+    #[serde(default = "default_scheduler_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    #[serde(default = "default_scheduler_max_retries")]
+    pub max_retries: usize,
+    #[serde(default = "default_scheduler_backoff")]
+    pub backoff: String,
+    #[serde(default = "default_scheduler_cancel_scope")]
+    pub cancel_scope: String,
+    #[serde(default = "default_scheduler_cooldown_ms")]
+    pub cooldown_ms: u64,
+    #[serde(default = "default_scheduler_payload_policy")]
+    pub payload_policy: String,
+}
+
+impl Default for SchedulerPolicy {
+    fn default() -> Self {
+        Self {
+            dedupe_key: None,
+            single_flight: default_scheduler_single_flight(),
+            deadline_ms: default_scheduler_deadline_ms(),
+            poll_interval_ms: default_scheduler_poll_interval_ms(),
+            max_retries: default_scheduler_max_retries(),
+            backoff: default_scheduler_backoff(),
+            cancel_scope: default_scheduler_cancel_scope(),
+            cooldown_ms: default_scheduler_cooldown_ms(),
+            payload_policy: default_scheduler_payload_policy(),
+        }
+    }
+}
+
+fn default_scheduler_single_flight() -> bool {
+    true
+}
+
+fn default_scheduler_deadline_ms() -> u64 {
+    30_000
+}
+
+fn default_scheduler_poll_interval_ms() -> u64 {
+    1_500
+}
+
+fn default_scheduler_max_retries() -> usize {
+    1
+}
+
+fn default_scheduler_backoff() -> String {
+    "none".to_string()
+}
+
+fn default_scheduler_cancel_scope() -> String {
+    "request".to_string()
+}
+
+fn default_scheduler_cooldown_ms() -> u64 {
+    60_000
+}
+
+fn default_scheduler_payload_policy() -> String {
+    "replace_not_stack".to_string()
+}
+
+fn scheduler_dedupe_key(policy: &SchedulerPolicy, fallback: impl Into<String>) -> String {
+    policy
+        .dedupe_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| fallback.into())
+}
+
+fn scheduler_deadline_ms(policy: &SchedulerPolicy, fallback_ms: u64) -> u64 {
+    let deadline = if policy.deadline_ms > 0 {
+        policy.deadline_ms
+    } else {
+        fallback_ms
+    };
+    deadline.max(1)
+}
+
+fn emit_scheduler_event(
+    event: &str,
+    tool_name: &str,
+    policy: &SchedulerPolicy,
+    dedupe_key: &str,
+    extra: Value,
+) {
+    let _ = crate::aidebug::write_tool_event(
+        crate::app_project_root().as_path(),
+        event,
+        json!({
+            "tool_name": tool_name,
+            "dedupe_key": dedupe_key,
+            "single_flight": policy.single_flight,
+            "deadline_ms": policy.deadline_ms,
+            "poll_interval_ms": policy.poll_interval_ms,
+            "max_retries": policy.max_retries,
+            "backoff": policy.backoff,
+            "cancel_scope": policy.cancel_scope,
+            "cooldown_ms": policy.cooldown_ms,
+            "payload_policy": policy.payload_policy,
+            "extra": extra,
+        }),
+    );
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolOutputRef {
+    pub ref_id: String,
+    pub kind: String,
+    pub persona: String,
+    pub tool_run_id: String,
+    #[serde(default)]
+    pub entry_id: Option<u64>,
+    #[serde(default)]
+    pub path: Option<String>,
+    pub byte_len: usize,
+    pub line_count: usize,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadPolicy {
+    Latest,
+    Tail,
+    Range,
+    SinceCursor,
+    Summary,
+    Full,
+}
+
+impl ReadPolicy {
+    fn parse(raw: Option<&str>) -> Self {
+        match raw
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("latest")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "tail" => Self::Tail,
+            "range" => Self::Range,
+            "since_cursor" | "since" | "cursor" => Self::SinceCursor,
+            "summary" => Self::Summary,
+            "full" => Self::Full,
+            _ => Self::Latest,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Latest => "latest",
+            Self::Tail => "tail",
+            Self::Range => "range",
+            Self::SinceCursor => "since_cursor",
+            Self::Summary => "summary",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolOutputEnvelope {
+    pub version: u8,
+    pub tool_id: String,
+    pub run_id: String,
+    pub persona: String,
+    pub action: String,
+    pub status: ToolRunStatus,
+    pub brief: String,
+    pub started_at_unix: u64,
+    pub finished_at_unix: u64,
+    pub display: ToolDisplaySpec,
+    pub input_summary: Value,
+    pub output_summary: Value,
+    #[serde(default)]
+    pub output_refs: Vec<ToolOutputRef>,
+    #[serde(default)]
+    pub artifacts: Vec<Value>,
+    #[serde(default)]
+    pub metrics: Value,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,12 +591,8 @@ pub fn default_view_image_settings() -> ViewImageSettings {
     ViewImageSettings::default()
 }
 
-pub fn sanitize_tool_output_lines(value: usize) -> usize {
-    value.clamp(TOOL_OUTPUT_LINES_MIN, TOOL_OUTPUT_LINES_MAX)
-}
-
-pub fn sanitize_tool_output_chars(value: usize) -> usize {
-    value.clamp(TOOL_OUTPUT_CHARS_MIN, TOOL_OUTPUT_CHARS_MAX)
+pub fn sanitize_tool_output_kb(value: usize) -> usize {
+    value.clamp(16, 128)
 }
 
 pub fn sanitize_view_image_upload_max_mb(value: u64) -> u64 {
@@ -298,21 +609,1618 @@ pub fn sanitize_terminal_audit_interval_secs(value: u64) -> u64 {
 pub fn default_terminal_audit_interval_secs() -> u64 {
     RUNNING_SNAPSHOT_INTERVAL_SECS
 }
-const AGENT_CHILD_SYSTEM_NOTE: &str = "你现在是一个子代理。默认不要继续调用 spawn_agent / send_input / wait_agent / resume_agent / close_agent / spawn_agents_on_csv / request_user_input，也不要再拆分更多子代理；优先直接用现有工具完成手头调查并返回简洁结论。除非上游任务明确要求递归委托，否则禁止继续分包。";
+const AGENT_CHILD_SYSTEM_NOTE: &str = "你现在是一个子代理。默认不要继续调用 spawn_agent / send_input / wait_agent / list_agent / close_agent / ask_user，也不要再拆分更多子代理；优先直接用现有工具完成手头调查并返回简洁结论。除非上游任务明确要求递归委托，否则禁止继续分包。";
 pub(crate) const REQUEST_USER_INPUT_OTHER_LABEL: &str = "自定义";
 pub(crate) const REQUEST_USER_INPUT_OTHER_NOTE_PREFIX: &str = "user_note: ";
 const INTERNAL_PERMISSION_CONFIRM_CALL_ID: &str = "__projectying_permission_confirm__";
+static BROWSER_MANAGER: OnceLock<Mutex<BrowserManager>> = OnceLock::new();
 
 thread_local! {
     static ACTIVE_TOOL_PERSONA: Cell<crate::PersonaKind> = const { Cell::new(crate::PersonaKind::Matrix) };
+    static ACTIVE_TOOL_ROLE_CONTEXT: RefCell<Option<ToolRoleContext>> = const { RefCell::new(None) };
+    static ACTIVE_TOOL_PROJECTION_OVERRIDE: RefCell<Option<ToolProjectionOverride>> = const { RefCell::new(None) };
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolRoleContext {
+    pub base_persona: crate::PersonaKind,
+    pub role_id: String,
+    pub label: String,
+    pub context_dir: String,
 }
 
 pub fn set_tool_persona(persona: crate::PersonaKind) {
     ACTIVE_TOOL_PERSONA.with(|slot| slot.set(persona));
+    ACTIVE_TOOL_ROLE_CONTEXT.with(|slot| {
+        slot.borrow_mut().take();
+    });
+}
+
+pub fn set_tool_dynamic_role_context(
+    base_persona: crate::PersonaKind,
+    role_id: &str,
+    label: &str,
+    context_dir: &str,
+) {
+    ACTIVE_TOOL_PERSONA.with(|slot| slot.set(base_persona));
+    ACTIVE_TOOL_ROLE_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = Some(ToolRoleContext {
+            base_persona,
+            role_id: role_id.trim().to_string(),
+            label: label.trim().to_string(),
+            context_dir: context_dir.trim().to_string(),
+        });
+    });
 }
 
 pub fn current_tool_persona() -> crate::PersonaKind {
     ACTIVE_TOOL_PERSONA.with(Cell::get)
+}
+
+pub(crate) fn current_tool_role_context() -> Option<ToolRoleContext> {
+    ACTIVE_TOOL_ROLE_CONTEXT.with(|slot| slot.borrow().clone())
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ToolProjectionOverride {
+    pub allowed_tool_ids: HashSet<String>,
+    pub allow_native_web_search: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderToolProjection {
+    allowed_tool_ids: Option<HashSet<String>>,
+    bypass_persona_filter: bool,
+}
+
+impl ProviderToolProjection {
+    fn current() -> Self {
+        let override_config = current_tool_projection_override();
+        Self {
+            allowed_tool_ids: override_config
+                .as_ref()
+                .map(|override_config| override_config.allowed_tool_ids.clone())
+                .or_else(|| {
+                    crate::context::projected_toolbox_local_tool_ids_for_persona(
+                        current_tool_persona(),
+                    )
+                    .ok()
+                }),
+            bypass_persona_filter: override_config.is_some(),
+        }
+    }
+
+    fn seed_tools(&self) -> Value {
+        if self.bypass_persona_filter {
+            all_codex_tools()
+        } else {
+            codex_tools()
+        }
+    }
+
+    fn allows(&self, name: &str) -> bool {
+        self.allowed_tool_ids
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(name))
+    }
+
+    fn rejection_reason(&self, name: &str) -> Option<String> {
+        if self.allows(name) {
+            return None;
+        }
+        Some(if self.bypass_persona_filter {
+            format!("当前工具投影不允许调用 `{name}`")
+        } else {
+            format!("当前工具投影未开放 `{name}`")
+        })
+    }
+
+    fn apply_to_schema(&self, tools: &mut Value) {
+        let Some(items) = tools.as_array_mut() else {
+            return;
+        };
+        items.retain(|tool| {
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                return true;
+            };
+            self.allows(name)
+        });
+        for tool in items {
+            if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                tool["name"] = Value::String(codex_provider_tool_name(name).to_string());
+            }
+        }
+    }
+}
+
+struct ToolContractRegistry;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolProjectionState {
+    Hidden,
+    Closed,
+    Expanded,
+}
+
+const MATRIX_PARALLEL_TOOLS: &[&str] = &[
+    "command",
+    "exec_command",
+    "view_image",
+    "memory_check",
+    "memory_read",
+    "context_summary",
+    "list_agent",
+    "pty_list",
+];
+
+const FOCUS_PERSONA_PARALLEL_TOOLS: &[&str] = &[
+    "command",
+    "exec_command",
+    "view_image",
+    "memory_check",
+    "memory_read",
+    "context_summary",
+    "pty_list",
+];
+
+impl ToolContractRegistry {
+    fn append_shared_schema_superset_tools(tools: &mut Value) {
+        let Some(items) = tools.as_array_mut() else {
+            return;
+        };
+        ensure_tool(items, persona_manage_schema());
+        ensure_tool(items, server_manage_schema());
+        ensure_tool(items, server_split_schema());
+        ensure_tool(items, browser_schema());
+        ensure_tool(items, draw_image_schema());
+        ensure_tool(items, context_manage_schema());
+        ensure_tool(items, context_compact_schema());
+        ensure_tool(items, context_summary_schema());
+        ensure_tool(items, context_vision_schema());
+        ensure_tool(items, memory_add_schema());
+    }
+
+    fn tool_allowed_for_persona(persona: crate::PersonaKind, name: &str) -> bool {
+        !matches!(
+            Self::default_tool_projection_state(persona, name),
+            ToolProjectionState::Hidden
+        )
+    }
+
+    fn parallel_tool_allowed_for_persona(persona: crate::PersonaKind, name: &str) -> bool {
+        match persona.tool_profile() {
+            crate::persona::PersonaToolProfile::Governance => {
+                contains_tool(MATRIX_PARALLEL_TOOLS, name)
+            }
+            crate::persona::PersonaToolProfile::Focus => {
+                contains_tool(FOCUS_PERSONA_PARALLEL_TOOLS, name)
+            }
+        }
+    }
+
+    fn default_tool_projection_state(
+        persona: crate::PersonaKind,
+        name: &str,
+    ) -> ToolProjectionState {
+        let builtin_names = builtin_tool_names();
+        if !builtin_names.contains(codex_provider_tool_name(name)) {
+            if external_tool_manifest(name).is_some() {
+                return if persona.tool_management_enabled() {
+                    ToolProjectionState::Closed
+                } else {
+                    ToolProjectionState::Hidden
+                };
+            }
+            return ToolProjectionState::Hidden;
+        }
+        if name == "tool_manage" {
+            return ToolProjectionState::Expanded;
+        }
+        if name == "browser"
+            && matches!(
+                persona.tool_profile(),
+                crate::persona::PersonaToolProfile::Focus
+            )
+        {
+            return browser_tool_projection_state(persona);
+        }
+        if name == "server_split" && !matches!(persona, crate::PersonaKind::Server) {
+            return ToolProjectionState::Closed;
+        }
+        match persona.tool_profile() {
+            crate::persona::PersonaToolProfile::Governance => {
+                if matches!(persona, crate::PersonaKind::Advisor) {
+                    advisor_tool_projection_state(name)
+                } else {
+                    matrix_tool_projection_state(name)
+                }
+            }
+            crate::persona::PersonaToolProfile::Focus => {
+                focus_persona_tool_projection_state(persona, name)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+struct ToolSchemaOverrideStore {
+    #[serde(default = "default_tool_schema_version")]
+    version: u8,
+    #[serde(default)]
+    tools: Vec<Value>,
+}
+
+fn default_tool_schema_version() -> u8 {
+    4
+}
+
+const BUILTIN_TOOL_SCHEMA_OVERRIDE_FILE: &str = "Matrix/schema/codex_tools.overrides.json";
+
+fn tool_schema_override_path() -> PathBuf {
+    crate::app_context_root().join(BUILTIN_TOOL_SCHEMA_OVERRIDE_FILE)
+}
+
+fn default_shared_codex_tools() -> Value {
+    let mut tools = include!("../context/Matrix/schema/codex_tools.rsinc");
+    ToolContractRegistry::append_shared_schema_superset_tools(&mut tools);
+    tools
+}
+
+fn builtin_shared_tool_schema_names() -> HashSet<String> {
+    default_shared_codex_tools()
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .map(codex_provider_tool_name)
+        .map(str::to_string)
+        .collect()
+}
+
+fn validate_shared_tool_schema_value(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let raw_name = object.get("name").and_then(Value::as_str)?.trim();
+    if raw_name.is_empty() || object.get("type").and_then(Value::as_str) != Some("function") {
+        return None;
+    }
+    let parameters = object.get("parameters")?.as_object()?;
+    if let Some(schema_type) = parameters.get("type").and_then(Value::as_str)
+        && schema_type != "object"
+    {
+        return None;
+    }
+    let builtin_names = builtin_shared_tool_schema_names();
+    let canonical_name = codex_provider_tool_name(raw_name);
+    if !builtin_names.contains(canonical_name) {
+        return None;
+    }
+    let mut normalized = Value::Object(object.clone());
+    normalized["name"] = Value::String(canonical_name.to_string());
+    Some(normalized)
+}
+
+fn normalize_shared_tool_schema_value(value: &Value) -> Result<Value> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("schema 必须是 JSON object"))?;
+    let raw_name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow!("schema.name 不能为空"))?;
+    if object.get("type").and_then(Value::as_str) != Some("function") {
+        anyhow::bail!("schema.type 必须是 function");
+    }
+    let parameters = object
+        .get("parameters")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("schema.parameters 必须是 object"))?;
+    if let Some(schema_type) = parameters.get("type").and_then(Value::as_str)
+        && schema_type != "object"
+    {
+        anyhow::bail!("schema.parameters.type 必须是 object");
+    }
+    let builtin_names = builtin_shared_tool_schema_names();
+    let canonical_name = codex_provider_tool_name(raw_name);
+    if !builtin_names.contains(canonical_name) {
+        anyhow::bail!("不支持的内建 schema：{raw_name}");
+    }
+    let mut normalized = Value::Object(object.clone());
+    normalized["name"] = Value::String(canonical_name.to_string());
+    Ok(normalized)
+}
+
+fn load_shared_tool_schema_overrides() -> ToolSchemaOverrideStore {
+    let path = tool_schema_override_path();
+    if !path.exists() {
+        return ToolSchemaOverrideStore::default();
+    }
+    let data = match fs::read_to_string(path.as_path()) {
+        Ok(data) => data,
+        Err(_) => return ToolSchemaOverrideStore::default(),
+    };
+    match serde_json::from_str::<ToolSchemaOverrideStore>(data.as_str()) {
+        Ok(mut store) => {
+            store.version = default_tool_schema_version();
+            store.tools = store
+                .tools
+                .into_iter()
+                .filter_map(|tool| validate_shared_tool_schema_value(&tool))
+                .collect();
+            store
+        }
+        Err(_) => {
+            let _ = fs::write(path.with_extension("invalid.json"), data.as_str());
+            ToolSchemaOverrideStore::default()
+        }
+    }
+}
+
+fn save_shared_tool_schema_overrides(store: &ToolSchemaOverrideStore) -> Result<()> {
+    let path = tool_schema_override_path();
+    if store.tools.is_empty() {
+        if path.exists() {
+            fs::remove_file(path.as_path())
+                .with_context(|| format!("删除 JSON 文件失败：{}", path.display()))?;
+        }
+        return Ok(());
+    }
+    crate::write_json_pretty_shared(
+        path.as_path(),
+        store,
+        format!("JSON 文件 {}", path.display()).as_str(),
+        "codex_tools.overrides.json",
+        "内建 schema 覆盖路径缺少父目录",
+        "创建内建 schema 覆盖目录失败",
+    )
+}
+
+fn apply_shared_tool_schema_overrides(tools: &mut Value) {
+    let Some(items) = tools.as_array_mut() else {
+        return;
+    };
+    let overrides = load_shared_tool_schema_overrides();
+    if overrides.tools.is_empty() {
+        return;
+    }
+    let mut index_by_name = BTreeMap::<String, usize>::new();
+    for (index, tool) in items.iter().enumerate() {
+        if let Some(name) = tool.get("name").and_then(Value::as_str) {
+            index_by_name.insert(name.to_string(), index);
+        }
+    }
+    for override_tool in overrides.tools {
+        let Some(name) = override_tool.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(index) = index_by_name.get(name).copied() {
+            items[index] = override_tool;
+        }
+    }
+}
+
+fn contains_tool(candidates: &[&str], name: &str) -> bool {
+    candidates.iter().any(|candidate| candidate == &name)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExternalToolManifest {
+    name: String,
+    description: String,
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    working_dir: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[serde(default = "external_tool_enabled_default")]
+    enabled: bool,
+    #[serde(default)]
+    parameters: Option<Value>,
+    #[serde(default)]
+    kind_label: Option<String>,
+    #[serde(default)]
+    action_label: Option<String>,
+    #[serde(default)]
+    brief: Option<String>,
+    #[serde(default)]
+    display: Option<ToolDisplaySpec>,
+    #[serde(default)]
+    output_policy: Option<ToolOutputPolicy>,
+    #[serde(default)]
+    scheduler: Option<SchedulerPolicy>,
+}
+
+fn external_tool_enabled_default() -> bool {
+    true
+}
+
+fn external_tools_root() -> PathBuf {
+    crate::app_project_root().join(EXTERNAL_TOOLS_DIR)
+}
+
+fn external_tool_default_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "input": {
+                "type": "string",
+                "description": "Input payload for the external tool. The full JSON arguments are sent to the program on stdin."
+            },
+            "brief": {
+                "type": "string",
+                "description": "Optional short Chinese UI brief."
+            }
+        },
+        "additionalProperties": true
+    })
+}
+
+fn is_valid_external_tool_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    let mut len = 1usize;
+    for ch in chars {
+        len = len.saturating_add(1);
+        if len > 64 || !(ch == '_' || ch.is_ascii_alphanumeric()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn external_tool_manifest_paths() -> Vec<PathBuf> {
+    let root = external_tools_root();
+    let mut paths = Vec::new();
+    if let Ok(entries) = fs::read_dir(root.as_path()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(EXTERNAL_TOOL_MANIFEST_SUFFIX))
+            {
+                paths.push(path);
+            } else if path.is_dir() {
+                let nested = path.join("tool.json");
+                if nested.is_file() {
+                    paths.push(nested);
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+fn sanitize_external_tool_manifest(
+    manifest: ExternalToolManifest,
+    reserved: &HashSet<String>,
+) -> Option<ExternalToolManifest> {
+    let name = manifest.name.trim().to_string();
+    if !manifest.enabled || !is_valid_external_tool_name(name.as_str()) || reserved.contains(&name)
+    {
+        return None;
+    }
+    let description = manifest.description.trim().to_string();
+    let program = manifest.program.trim().to_string();
+    if description.is_empty() || program.is_empty() {
+        return None;
+    }
+    Some(ExternalToolManifest {
+        name,
+        description,
+        program,
+        args: manifest.args,
+        working_dir: manifest.working_dir,
+        timeout_secs: manifest.timeout_secs,
+        enabled: true,
+        parameters: manifest.parameters,
+        kind_label: manifest.kind_label,
+        action_label: manifest.action_label,
+        brief: manifest.brief,
+        display: manifest.display,
+        output_policy: manifest.output_policy,
+        scheduler: manifest.scheduler,
+    })
+}
+
+fn load_external_tool_manifests() -> Vec<ExternalToolManifest> {
+    let reserved = builtin_tool_names();
+    let mut seen = HashSet::new();
+    let mut manifests = Vec::new();
+    for path in external_tool_manifest_paths() {
+        let Some(manifest) = fs::read_to_string(path.as_path())
+            .ok()
+            .and_then(|data| serde_json::from_str::<ExternalToolManifest>(data.as_str()).ok())
+            .and_then(|manifest| sanitize_external_tool_manifest(manifest, &reserved))
+        else {
+            continue;
+        };
+        if seen.insert(manifest.name.clone()) {
+            manifests.push(manifest);
+        }
+    }
+    manifests
+}
+
+fn external_tool_manifest(name: &str) -> Option<ExternalToolManifest> {
+    load_external_tool_manifests()
+        .into_iter()
+        .find(|manifest| manifest.name == name)
+}
+
+pub(crate) fn external_tool_available(name: &str) -> bool {
+    external_tool_manifest(name).is_some()
+}
+
+fn external_tool_flat_manifest_path(name: &str) -> PathBuf {
+    external_tools_root().join(format!("{name}{EXTERNAL_TOOL_MANIFEST_SUFFIX}"))
+}
+
+fn external_tool_manifest_path_candidates(name: &str) -> Vec<PathBuf> {
+    vec![
+        external_tool_flat_manifest_path(name),
+        external_tools_root().join(name).join("tool.json"),
+    ]
+}
+
+fn external_tool_existing_manifest_paths(name: &str) -> Vec<PathBuf> {
+    external_tool_manifest_path_candidates(name)
+        .into_iter()
+        .filter(|path| path.is_file())
+        .collect()
+}
+
+fn validated_external_tool_manifest(
+    manifest: ExternalToolManifest,
+) -> Result<ExternalToolManifest> {
+    let reserved = builtin_tool_names();
+    let name = manifest.name.trim().to_string();
+    sanitize_external_tool_manifest(
+        ExternalToolManifest { name, ..manifest },
+        &reserved,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "外部工具 manifest 无效：name 需匹配 [A-Za-z_][A-Za-z0-9_]*，不能与内建工具冲突，且 description/program 不能为空"
+        )
+    })
+}
+
+fn write_external_tool_manifest(
+    manifest: ExternalToolManifest,
+    create_only: bool,
+) -> Result<(ExternalToolManifest, PathBuf, Vec<PathBuf>)> {
+    let manifest = validated_external_tool_manifest(manifest)?;
+    let existing = external_tool_existing_manifest_paths(manifest.name.as_str());
+    if create_only && !existing.is_empty() {
+        anyhow::bail!("外部工具已存在：{}", manifest.name);
+    }
+    for path in &existing {
+        fs::remove_file(path)
+            .with_context(|| format!("移除旧工具 manifest 失败：{}", path.display()))?;
+    }
+    let path = external_tool_flat_manifest_path(manifest.name.as_str());
+    crate::write_json_pretty_shared(
+        path.as_path(),
+        &manifest,
+        "外部工具 manifest",
+        "tool.tool.json",
+        "外部工具 manifest 缺少父目录",
+        "创建外部工具目录失败",
+    )?;
+    Ok((manifest, path, existing))
+}
+
+fn remove_external_tool_manifests(names: &[String]) -> Result<Vec<PathBuf>> {
+    let normalized = names
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if normalized.is_empty() {
+        anyhow::bail!("tool_manage remove 需要 tool_ids");
+    }
+    let mut removed = Vec::new();
+    for name in normalized {
+        if !is_valid_external_tool_name(name.as_str()) {
+            anyhow::bail!("外部工具名无效：{name}");
+        }
+        let paths = external_tool_existing_manifest_paths(name.as_str());
+        if paths.is_empty() {
+            anyhow::bail!("外部工具 manifest 不存在：{name}");
+        }
+        for path in paths {
+            fs::remove_file(path.as_path())
+                .with_context(|| format!("移除外部工具 manifest 失败：{}", path.display()))?;
+            removed.push(path);
+        }
+    }
+    Ok(removed)
+}
+
+fn external_tool_schema(manifest: &ExternalToolManifest) -> Value {
+    json!({
+        "type": "function",
+        "name": manifest.name,
+        "description": manifest.description,
+        "strict": false,
+        "parameters": manifest.parameters.clone().unwrap_or_else(external_tool_default_parameters)
+    })
+}
+
+fn append_external_tool_schemas(tools: &mut Value) {
+    let Some(items) = tools.as_array_mut() else {
+        return;
+    };
+    let mut existing = items
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    for manifest in load_external_tool_manifests() {
+        if existing.insert(manifest.name.clone()) {
+            items.push(external_tool_schema(&manifest));
+        }
+    }
+}
+
+fn persona_manage_schema() -> Value {
+    let mut persona_enum = vec![
+        json!("matrix"),
+        json!("advisor"),
+        json!("coding"),
+        json!("server"),
+    ];
+    for role_id in crate::roles::enabled_role_ids() {
+        persona_enum.push(json!(role_id));
+    }
+    json!({
+        "type": "function",
+        "name": "persona_manage",
+        "description": "Controlled ProjectYing persona communication tool. Any persona may use `send` to ask another persona or Matrix-created dynamic role for help/report progress without raw tool output. Matrix and 司 may also use `observe` to read folded recent activity and `interrupt` to cancel/correct another persona. Tool/schema/prompt/role governance belongs to Matrix through tool_manage. Dynamic roles are registered identities with context folders and assigned tools; until a role has its own runtime, sends route through its configured base persona with the role prompt attached and must be answered directly instead of being re-dispatched to the same role. This tool coordinates personas; it never exposes raw tool receipts.",
+        "strict": false,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["observe", "send", "interrupt"],
+                    "description": "Coordination action. `send` is available to every persona. `observe` and `interrupt` are Matrix/司 governance actions. `observe` is immediate; `send` and `interrupt` are queued for the app runtime."
+                },
+                "persona": {
+                    "type": "string",
+                    "enum": persona_enum,
+                    "description": "Target persona or Matrix-created dynamic role id. Use `matrix` for front controller guidance/tool governance, `advisor`/`司` for context and diary governance, `coding` for code work, `server` for SSH/server tasks, or a role id returned by tool_manage role_list."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Instruction or report to send. Required for `send`; optional correction for `interrupt`."
+                },
+                "brief": {
+                    "type": "string",
+                    "description": "Optional short Chinese UI brief."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Optional reason for the coordination action."
+                },
+                "include_recent": {
+                    "type": "number",
+                    "description": "For `observe`, folded recent entry count. Default 8, max 24."
+                },
+                "priority": {
+                    "type": "string",
+                    "enum": ["normal", "urgent"],
+                    "description": "Optional send priority. `urgent` interrupts the target active request before injecting the message. Matrix/司 send defaults to urgent for realtime department correction."
+                }
+            },
+            "required": ["action", "persona"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn browser_tool_projection_state(persona: crate::PersonaKind) -> ToolProjectionState {
+    match persona {
+        crate::PersonaKind::Server => ToolProjectionState::Expanded,
+        _ => ToolProjectionState::Hidden,
+    }
+}
+
+fn matrix_tool_projection_state(name: &str) -> ToolProjectionState {
+    match name {
+        "memory_add" | "memory_check" | "memory_read" | "focus_mode" | "persona_manage"
+        | "tool_manage" | "view_image" | "draw_image" | "web_search" | "spawn_agent"
+        | "send_input" | "wait_agent" | "list_agent" | "close_agent" | "update_plan"
+        | "ask_user" | "context_summary" => ToolProjectionState::Expanded,
+        "context_compact" => ToolProjectionState::Closed,
+        _ => ToolProjectionState::Closed,
+    }
+}
+
+fn advisor_tool_projection_state(name: &str) -> ToolProjectionState {
+    match name {
+        "context_manage" | "focus_mode" | "persona_manage" | "memory_add" | "memory_check"
+        | "memory_read" | "context_summary" => ToolProjectionState::Expanded,
+        "context_compact" => ToolProjectionState::Closed,
+        _ => ToolProjectionState::Closed,
+    }
+}
+
+fn focus_persona_tool_projection_state(
+    persona: crate::PersonaKind,
+    name: &str,
+) -> ToolProjectionState {
+    if matches!(persona, crate::PersonaKind::Coding) && name == "ask_user" {
+        return ToolProjectionState::Hidden;
+    }
+    match name {
+        "browser" => ToolProjectionState::Hidden,
+        "server_manage" if matches!(persona, crate::PersonaKind::Server) => {
+            ToolProjectionState::Expanded
+        }
+        "server_manage" => ToolProjectionState::Hidden,
+        "server_split" if matches!(persona, crate::PersonaKind::Server) => {
+            ToolProjectionState::Expanded
+        }
+        "server_split" => ToolProjectionState::Closed,
+        "command" | "view_image" | "draw_image" | "web_search" | "apply_patch" | "ask_user"
+        | "update_plan" | "focus_mode" | "persona_manage" | "tool_manage" | "memory_check"
+        | "memory_read" | "pty_run" | "pty_wait" | "context_summary" => {
+            ToolProjectionState::Expanded
+        }
+        "context_compact" | "context_vision" => ToolProjectionState::Closed,
+        "pty_input" | "pty_list" | "pty_kill" => ToolProjectionState::Closed,
+        _ => ToolProjectionState::Hidden,
+    }
+}
+
+fn draw_image_schema() -> Value {
+    json!({
+        "type": "function",
+        "name": "draw_image",
+        "description": "Generate or edit a real image through ProjectYing's GPT Image pipeline. Use this when the user asks to draw, generate, mock up, illustrate, create a visual asset, or edit an existing image. Keep the prompt concise and structured. The tool blocks until the final image file is saved, defaulting to media/dcim, and does not create request JSON sidecars.",
+        "strict": false,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Concise structured visual prompt. Include subject, composition, style, colors, text requirements, transparent background needs, and important constraints. Avoid dumping long chat history; keep only the details that affect the image."
+                },
+                "brief": {
+                    "type": "string",
+                    "description": "Optional short Chinese UI brief, such as 生成应用图标 or 绘制产品草图."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["generate", "edit"],
+                    "description": "generate creates a new image; edit modifies an existing image referenced by source_path."
+                },
+                "source_path": {
+                    "type": "string",
+                    "description": "Optional local source image path for edit mode. Use view_image first if you need to inspect the image."
+                },
+                "size": {
+                    "type": "string",
+                    "enum": ["auto", "1024x1024", "1024x1536", "1536x1024"],
+                    "description": "Requested output size. Use auto unless the task has a clear aspect ratio."
+                },
+                "transparent_background": {
+                    "type": "boolean",
+                    "description": "Request a transparent background when suitable, for icons, sprites, stickers, or overlays."
+                }
+            },
+            "required": ["prompt"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn server_manage_schema() -> Value {
+    json!({
+        "type": "function",
+        "name": "server_manage",
+        "description": "Server-only control surface for the AI-managed SSH registry. Use it to list the current server registry, add or update servers with cleartext host/user/password fields, delete servers, switch the active server, test one or more servers, and dispatch commands concurrently to multiple servers. For actual remote commands use `command` with `target:\"ssh\"`; for interactive remote sessions use `pty_run` with `target:\"ssh\"`.",
+        "strict": false,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "status",
+                        "list",
+                        "upsert",
+                        "save",
+                        "add",
+                        "update",
+                        "register",
+                        "delete",
+                        "remove",
+                        "select",
+                        "switch",
+                        "use",
+                        "test",
+                        "connect",
+                        "disconnect",
+                        "dispatch",
+                        "run",
+                        "broadcast"
+                    ],
+                    "description": "Server registry action."
+                },
+                "brief": {
+                    "type": "string",
+                    "description": "Optional short Chinese purpose sentence for UI display."
+                },
+                "server_id": {
+                    "type": "string",
+                    "description": "Optional server id or selector."
+                },
+                "server_name": {
+                    "type": "string",
+                    "description": "Optional server name selector."
+                },
+                "server_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "Optional list of server ids or selectors for multi-server operations."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Server name to save during upsert."
+                },
+                "host": {
+                    "type": "string",
+                    "description": "Server host or IP to save during upsert."
+                },
+                "port": {
+                    "type": "integer",
+                    "description": "SSH port to save during upsert."
+                },
+                "user": {
+                    "type": "string",
+                    "description": "SSH username to save during upsert."
+                },
+                "password": {
+                    "type": "string",
+                    "description": "SSH password to save during upsert."
+                },
+                "key_path": {
+                    "type": "string",
+                    "description": "SSH private key path to save during upsert."
+                },
+                "enabled": {
+                    "type": "boolean",
+                    "description": "Whether the server is enabled."
+                },
+                "cmd": {
+                    "type": "string",
+                    "description": "Remote command to run for dispatch/test/connect."
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Optional working directory for dispatch."
+                },
+                "shell": {
+                    "type": "string",
+                    "description": "Optional shell binary for dispatch."
+                },
+                "login": {
+                    "type": "boolean",
+                    "description": "Whether to run the shell with -l / -i semantics."
+                },
+                "yield_time_ms": {
+                    "type": "number",
+                    "description": "Optional wait window for dispatch startup."
+                },
+                "timeout_secs": {
+                    "type": "number",
+                    "description": "Optional timeout for dispatch."
+                },
+                "output_level": {
+                    "type": "string",
+                    "enum": ["small", "normal", "large"],
+                    "description": "Visible output budget for dispatch receipts."
+                },
+                "max_output_tokens": {
+                    "type": "number",
+                    "description": "Legacy optional token cap after budget handling."
+                },
+                "items": {
+                    "type": "array",
+                    "description": "Optional per-server dispatch items. When present, each item can specify its own server selector and remote command.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "server_id": {
+                                "type": "string",
+                                "description": "Optional server id or selector."
+                            },
+                            "server_name": {
+                                "type": "string",
+                                "description": "Optional server name selector."
+                            },
+                            "brief": {
+                                "type": "string",
+                                "description": "Optional short Chinese purpose sentence for this item."
+                            },
+                            "cmd": {
+                                "type": "string",
+                                "description": "Remote command for this item."
+                            },
+                            "workdir": {
+                                "type": "string",
+                                "description": "Optional working directory for this item."
+                            },
+                            "shell": {
+                                "type": "string",
+                                "description": "Optional shell binary for this item."
+                            },
+                            "login": {
+                                "type": "boolean",
+                                "description": "Whether to run the shell with -l / -i semantics."
+                            },
+                            "yield_time_ms": {
+                                "type": "number",
+                                "description": "Optional wait window for this item."
+                            },
+                            "timeout_secs": {
+                                "type": "number",
+                                "description": "Optional timeout for this item."
+                            },
+                            "output_level": {
+                                "type": "string",
+                                "enum": ["small", "normal", "large"],
+                                "description": "Visible output budget for this item."
+                            },
+                            "max_output_tokens": {
+                                "type": "number",
+                                "description": "Legacy optional token cap for this item."
+                            }
+                        },
+                        "required": ["cmd"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn server_split_schema() -> Value {
+    json!({
+        "type": "function",
+        "name": "server_split",
+        "description": "Server-only tool for splitting Server · 御 into a managed 御 network. Each split is a Server-based dynamic role with its own label, context, runtime, tools, and persona communication path. Use it to create/list/communicate/close up to 10 parallel 御 workers for multi-server defense, management, or paired server debugging. Closing a split disables it and preserves context/memory so existing runtime continuity is not destroyed.",
+        "strict": false,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "list",
+                        "status",
+                        "split",
+                        "create",
+                        "add",
+                        "split_batch",
+                        "create_batch",
+                        "batch",
+                        "send",
+                        "communicate",
+                        "message",
+                        "dispatch",
+                        "close",
+                        "remove",
+                        "delete",
+                        "close_batch",
+                        "close_all"
+                    ],
+                    "description": "Network action. `split` creates or reopens one 御 slot; `split_batch` creates/reopens many; `send/communicate` queues a message to one or more split roles; `close` disables selected split roles; `close_all` disables all active split roles; `list` reports the network."
+                },
+                "brief": {
+                    "type": "string",
+                    "description": "Optional short Chinese purpose sentence for UI display."
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "Optional number of split roles to create for split_batch. Max active split roles is 10."
+                },
+                "split_id": {
+                    "type": "string",
+                    "description": "Optional target split id or suffix, such as server_yu_a, 御A, or A."
+                },
+                "split_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional target split ids, labels, or suffixes for batch communicate/close."
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Alias of split_id for communicate/close."
+                },
+                "targets": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Alias of split_ids for communicate/close."
+                },
+                "label": {
+                    "type": "string",
+                    "description": "Optional split label. Examples: 御A, A. If omitted the next A-J slot is used."
+                },
+                "labels": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional labels for batch creation."
+                },
+                "task": {
+                    "type": "string",
+                    "description": "Optional task to assign immediately after splitting, or message body for communicate."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Alias of task for communicate or immediate split assignment."
+                },
+                "tasks": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional per-split tasks for split_batch."
+                },
+                "server_id": {
+                    "type": "string",
+                    "description": "Optional server selector to include in the split assignment."
+                },
+                "server_name": {
+                    "type": "string",
+                    "description": "Optional server name selector to include in the split assignment."
+                },
+                "server_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional per-split server selectors for split_batch."
+                },
+                "priority": {
+                    "type": "string",
+                    "enum": ["normal", "urgent"],
+                    "description": "Optional communication priority. urgent interrupts the target split request before injecting the message."
+                },
+                "all": {
+                    "type": "boolean",
+                    "description": "For communicate/close, target all active split roles."
+                },
+                "items": {
+                    "type": "array",
+                    "description": "Optional per-split batch items.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "split_id": {
+                                "type": "string",
+                                "description": "Optional target split id or suffix."
+                            },
+                            "label": {
+                                "type": "string",
+                                "description": "Optional split label, such as 御A."
+                            },
+                            "task": {
+                                "type": "string",
+                                "description": "Optional task for this split."
+                            },
+                            "message": {
+                                "type": "string",
+                                "description": "Alias of task for this split."
+                            },
+                            "server_id": {
+                                "type": "string",
+                                "description": "Optional server selector for this split."
+                            },
+                            "server_name": {
+                                "type": "string",
+                                "description": "Optional server name selector for this split."
+                            },
+                            "brief": {
+                                "type": "string",
+                                "description": "Optional short Chinese purpose sentence for this split."
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn ensure_tool(items: &mut Vec<Value>, schema: Value) {
+    let Some(name) = schema.get("name").and_then(Value::as_str) else {
+        return;
+    };
+    if items
+        .iter()
+        .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+    {
+        return;
+    }
+    items.push(schema);
+}
+
+fn add_context_visibility_properties(tools: &mut Value) {
+    let Some(items) = tools.as_array_mut() else {
+        return;
+    };
+    for tool in items {
+        let Some(properties) = tool
+            .pointer_mut("/parameters/properties")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        properties.entry("context_percent".to_string()).or_insert_with(|| {
+            json!({
+                "type": ["number", "string"],
+                "description": "Optional Context Vision hint for the next provider round. It sets an approximate context return threshold, not a permanent deletion. Use 0-30% for quick probes, about 67% for reconciliation, and 100% when full context is needed. You can change it any round, so avoid staying low or full by habit."
+            })
+        });
+        properties.entry("context_visibility".to_string()).or_insert_with(|| {
+            json!({
+                "type": ["number", "string"],
+                "description": "Alias of context_percent for the next-round context return threshold."
+            })
+        });
+    }
+}
+
+fn browser_schema() -> Value {
+    json!({
+        "type": "function",
+        "name": "browser",
+        "description": "Unified browser tool with two routes. HTTP session browser route: create/open/read/submit/close for lightweight server-rendered page fetch, cookie continuity, selector reads, and simple form posts without launching a GUI browser. Android app route: use app_status/app_open/app_open_many/app_switch/app_close/app_reload/app_back/app_forward/app_snapshot/app_request_human/app_set_ua/app_click/app_fill/app_submit to drive the ProjectYing Browser app on the phone, inspect live tab state, request a page snapshot, click page elements, fill form fields, submit forms, or hand control to the human for login / verification. Prefer web_search first for broad real-world discovery; use browser when you need a concrete page, cookies, or direct phone-browser interaction.",
+        "strict": false,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "create", "list", "open", "read", "submit", "close",
+                        "app_status", "app_open", "app_open_many", "app_switch", "app_close",
+                        "app_reload", "app_back", "app_forward", "app_snapshot",
+                        "app_request_human", "app_set_ua", "app_click", "app_fill", "app_submit"
+                    ],
+                    "description": "Browser action. `create/list/open/read/submit/close` are the HTTP session route. `app_*` actions control the Android browser bridge."
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Existing browser session id. Required for HTTP open/read/submit/close."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Optional HTTP session label for create."
+                },
+                "url": {
+                    "type": "string",
+                    "description": "Target URL. HTTP route: open/submit target URL. App route: app_open target URL."
+                },
+                "urls": {
+                    "type": "array",
+                    "description": "Multiple URLs for `app_open_many`.",
+                    "items": { "type": "string" }
+                },
+                "method": {
+                    "type": "string",
+                    "description": "Optional HTTP method. `open` defaults to GET. `submit` defaults to POST."
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Optional HTTP headers.",
+                    "additionalProperties": { "type": "string" }
+                },
+                "form": {
+                    "type": "object",
+                    "description": "Optional key/value form fields for HTTP submit.",
+                    "additionalProperties": { "type": "string" }
+                },
+                "selector": {
+                    "type": "string",
+                    "description": "Single CSS selector for HTTP read."
+                },
+                "selectors": {
+                    "type": "array",
+                    "description": "Multiple CSS selectors for HTTP read.",
+                    "items": { "type": "string" }
+                },
+                "max_items": {
+                    "type": "number",
+                    "description": "Optional limit for returned links/forms/selector matches. Default 8."
+                },
+                "tab_id": {
+                    "type": "string",
+                    "description": "Optional app-browser tab id for app_switch/app_close/app_reload/app_back/app_forward/app_snapshot/app_request_human."
+                },
+                "tab_index": {
+                    "type": "number",
+                    "description": "Optional app-browser tab index when tab_id is unavailable."
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "For `app_open` or `app_open_many`, whether new tabs should stay in background."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["android", "windows"],
+                    "description": "User-Agent mode for `app_set_ua`."
+                },
+                "match_text": {
+                    "type": "string",
+                    "description": "App route element match text. Works for `app_click`, `app_fill`, or `app_submit` against visible text/label/name/value."
+                },
+                "href_contains": {
+                    "type": "string",
+                    "description": "App route link match substring for `app_click`."
+                },
+                "field_name": {
+                    "type": "string",
+                    "description": "App route field `name` match for `app_fill` or `app_submit`."
+                },
+                "placeholder": {
+                    "type": "string",
+                    "description": "App route placeholder or label match for `app_fill`."
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Value to write for `app_fill`."
+                },
+                "element_index": {
+                    "type": "number",
+                    "description": "Visible element index inside the app-side candidate list. Optional override for `app_click`, `app_fill`, or `app_submit`."
+                },
+                "brief": {
+                    "type": "string",
+                    "description": "Optional short UI brief."
+                }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn context_manage_schema() -> Value {
+    json!({
+        "type": "function",
+        "name": "context_manage",
+        "description": context_management_tool_description("Manage external context, fastmemory, and prompt entries instead of editing context files directly. Keep `context_manage` for maintenance only; use `focus_mode` for enter/exit. Normal maintenance should be frequent `summary`, not delayed cleanup. Use `summary` to shrink or merge active working memory while keeping facts that still matter; `replace` and `compact` are accepted aliases for `summary`. `write` is only for fastmemory public/surface/experience notes and prompt append; do not free-write into `context` unless the task or system message explicitly requires it. FastMemory has three sections: `public` is the Matrix-maintained shared board for cross-role facts and current coordination state, `surface` stores preferences/profile facts, and `experience` stores reusable lessons/strategies. Matrix writes the shared board by `write` to `target=fastmemory`, `section=public`, `kind=board`. Prompt governance uses `target=prompt`; prompt entries use `entry_ids` / range and hot-reload through `prompt.txt`. Both `write` and `summary` always require `text`. The `entry_ids` / `item_ids` shown to the model are stable ids (`e...` / `i...`); after a summary, the replacement gets a new stable id and old ids stay historical for memory evidence. When a system message already gives `entry_ids` or `item_ids`, use those ids directly. `focuscontext` is the active focus-mode context. Compatibility aliases still parse, and the runtime also accepts the common live-provider key/value fallback when JSON drifts. The main surface here stays canonical. Model-facing output is intentionally compact; the detailed diff stays in UI preview only."),
+        "strict": false,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["write", "summary", "replace", "compact"],
+                    "description": "`write` appends/replaces where allowed. `summary` merges or compresses. `replace` and `compact` are aliases for `summary`. Use `focus_mode.enter` / `focus_mode.exit` for focus routing."
+                },
+                "target": {
+                    "type": "string",
+                    "enum": ["context", "focuscontext", "fastmemory", "prompt"],
+                    "description": "Target store for write or summary. Use `context` for standard context, `focuscontext` for focus-mode context, `fastmemory` for unified reusable memory entries, and `prompt` for persona prompt entries backed by prompt.json + prompt.txt. Compatibility target aliases still parse for old files, but these canonical names are the main surface."
+                },
+                "persona": {
+                    "type": "string",
+                    "description": "Optional governance scope. Omit it to manage the current persona. Matrix and 司 may set this to a static persona (`matrix`/`advisor`/`coding`/`server`) or a Matrix-created dynamic role id returned by `tool_manage role_list`."
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["all"],
+                    "description": "Optional explicit whole-area scope for summary when you intentionally want to summarize the entire target area without ids or ranges. Only `all` is accepted."
+                },
+                "section": {
+                    "type": "string",
+                    "enum": ["public", "surface", "experience"],
+                    "description": "Optional section for target=fastmemory. `public` is Matrix's shared board for roles, responsibilities, active handoffs, blockers, and artifact paths; `surface` stores visible preferences/profile facts; `experience` stores reusable lessons and strategies. Omit to use `surface`."
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["user", "assistant", "system"],
+                    "description": "Optional role for summary/write digests on `context` or `focuscontext`."
+                },
+                "kind": {
+                    "type": "string",
+                    "description": "Optional context entry kind for write or summary, such as note or summary."
+                },
+                "round_id": {
+                    "type": "number",
+                    "description": "Optional round id when writing directly into `context`."
+                },
+                "entry_ids": {
+                    "type": "array",
+                    "description": "Stable entry ids (`e...`) for `summary` on `context`, `focuscontext`, or `prompt`. Prompt entries display as pN but use this same `entry_ids` field. If a system maintenance ticket already gives `entry_ids`, use them directly. A single id is allowed; non-contiguous ids are allowed. For contiguous range summary, you may use `entry_start_id` + `entry_end_id` instead of listing every id. Omitting ids and range only works when you also pass `scope=\"all\"`.",
+                    "items": { "type": "number" }
+                },
+                "entry_start_id": {
+                    "type": "number",
+                    "description": "Optional inclusive start id for `summary` on `context`, `focuscontext`, or `prompt`. Use together with `entry_end_id` to summarize a continuous id range."
+                },
+                "entry_end_id": {
+                    "type": "number",
+                    "description": "Optional inclusive end id for `summary` on `context`, `focuscontext`, or `prompt`. Use together with `entry_start_id`."
+                },
+                "item_ids": {
+                    "type": "array",
+                    "description": "Stable item ids (`i...`) for `summary` on `fastmemory`. A single id is allowed; non-contiguous ids are allowed. For contiguous range summary, you may use `item_start_id` + `item_end_id` instead of listing every id. Omitting ids and range only works when you also pass `scope=\"all\"`.",
+                    "items": { "type": "number" }
+                },
+                "item_start_id": {
+                    "type": "number",
+                    "description": "Optional inclusive start id for `summary` on `fastmemory`. Use together with `item_end_id` to summarize a continuous id range."
+                },
+                "item_end_id": {
+                    "type": "number",
+                    "description": "Optional inclusive end id for `summary` on `fastmemory`. Use together with `item_start_id`."
+                },
+                "brief": {
+                    "type": "string",
+                    "description": "Optional short Chinese summary for UI display."
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Required for both `write` and `summary`. Content for `write`, or the merged digest for `summary`."
+                }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn context_compact_schema() -> Value {
+    json!({
+        "type": "function",
+        "name": "context_compact",
+        "description": context_management_tool_description("CONTEXT COMPACT · ALL/OLD/FAST. Fast, coarse context compression for Matrix-assigned self-management. It works on the external standard context, not fastmemory. `all` compresses the whole target context, `old` compresses the older half and keeps recent entries, and `fast` folds tool receipt outputs. Omit `persona` to manage your own context. Matrix/司 may set `persona`; ordinary personas may only use it for themselves when Matrix has opened the tool. Use `context_manage` instead when precision matters. JSON stays preferred, but the runtime also accepts the common live-provider key/value fallback for flat fields when tool output drifts."),
+        "strict": false,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["all", "old", "fast"],
+                    "description": "Compression mode. all=replace the whole standard context; old=replace the older half; fast=fold tool receipt outputs only."
+                },
+                "persona": {
+                    "type": "string",
+                    "description": "Optional target persona or Matrix-created role id. Omit for the current persona. In a dynamic-role runtime, leave it empty for self-management; a bare base persona name is treated as the active role's own context."
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Optional replacement summary. Recommended for all/old. If omitted, the runtime writes a conservative compact placeholder."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Optional trigger reason, such as context_kb_over_threshold."
+                },
+                "report_to_matrix": {
+                    "type": "boolean",
+                    "description": "Whether the self-managed persona should report completion to Matrix. Default true; this first implementation records the intent in the call only."
+                },
+                "brief": {
+                    "type": "string",
+                    "description": "Optional short UI brief."
+                }
+            },
+            "required": ["mode"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn context_summary_schema() -> Value {
+    json!({
+        "type": "function",
+        "name": "context_summary",
+        "description": context_management_tool_description("Low-receipt context entry folding tool. It does not read context and returns only a tiny success/failure receipt. Use it to fold known entry ids, especially tool receipt entries, often in parallel with the next real tool call. Each entry can provide replacement text; if omitted, it becomes `已折叠`."),
+        "strict": false,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["fold"],
+                    "description": "Only `fold` is supported."
+                },
+                "persona": {
+                    "type": "string",
+                    "description": "Optional target persona or Matrix-created role id. Omit for current persona. In a dynamic-role runtime, leave it empty for self-maintenance; a bare base persona name is treated as the active role's own context."
+                },
+                "entries": {
+                    "type": "array",
+                    "description": "Entries to fold. Use stable entry ids shown as e123 in context/observe.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "entry_id": {
+                                "type": "number",
+                                "description": "Stable context entry id without the e prefix."
+                            },
+                            "text": {
+                                "type": "string",
+                                "description": "Replacement text for this entry. Omit to replace with `已折叠`."
+                            }
+                        },
+                        "required": ["entry_id"],
+                        "additionalProperties": false
+                    }
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Optional reason for the fold."
+                },
+                "brief": {
+                    "type": "string",
+                    "description": "Optional short UI brief."
+                }
+            },
+            "required": ["action", "entries"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn context_vision_schema() -> Value {
+    json!({
+        "type": "function",
+        "name": "context_vision",
+        "description": context_management_tool_description("CONTEXT VISION. Set the approximate next-round context return threshold without summarizing or editing entries. This is on-demand visibility, not context loss: low values only mean older context is not returned this round, and you can raise the next round to 67% or 100% whenever the task needs it. Use 0-30% for quick probes, about 67% for cross-file reconciliation, and 100% for deep debugging. Pair with context_compact in vision_compact mode when old context must be physically compressed."),
+        "strict": false,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "context_percent": {
+                    "type": ["number", "string"],
+                    "description": "Approximate next-round context return threshold, 0-100, or aliases tiny/medium/full. The latest user/tool round is always preserved; this threshold is adjustable every round and is not deletion."
+                },
+                "percent": {
+                    "type": ["number", "string"],
+                    "description": "Alias of context_percent."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["tiny", "medium", "full"],
+                    "description": "Alias for common percentages. tiny≈0%, medium≈67%, full=100%."
+                },
+                "persona": {
+                    "type": "string",
+                    "description": "Optional target persona or Matrix-created role id. Omit for current persona. In a dynamic-role runtime, leave it empty for self-maintenance; a bare base persona name is treated as the active role's own context."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why this visibility budget is enough for the next step."
+                },
+                "brief": {
+                    "type": "string",
+                    "description": "Optional short UI brief."
+                }
+            },
+            "required": [],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn memory_add_schema() -> Value {
+    json!({
+        "type": "function",
+        "name": "memory_add",
+        "description": "Write long-term datememory entries. Prefer this only when the task or system message explicitly requires durable memory writeback.",
+        "strict": false,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "enum": ["datememory"],
+                    "description": "Long-term memory target. Only `datememory` is supported."
+                },
+                "persona": {
+                    "type": "string",
+                    "description": "Optional source persona for the memory write. Omit to use the current persona; 司 or Matrix can set advisor/coding/server when writing a diary for that persona."
+                },
+                "date": {
+                    "type": "string",
+                    "description": "Date for datememory in YYYY-MM-DD format."
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Optional short memory title."
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Optional short memory summary."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Detailed diary-style memory content to write. For maintenance writeback, avoid one-line summaries; include date context, people, project, event flow, results, decisions, and useful retrieval clues."
+                },
+                "keywords": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Keywords for later retrieval, including people, dates, project names, task names, bug names, tools, results, and important decisions."
+                },
+                "kind": {
+                    "type": "string",
+                    "description": "Optional memory kind label for compatibility."
+                },
+                "evidence_entry_ids": {
+                    "type": "array",
+                    "items": { "type": "number" },
+                    "description": "Optional source datememorycontext/context entry ids that this memory entry summarizes."
+                },
+                "clear_context": {
+                    "type": "boolean",
+                    "description": "Whether the maintenance source context should be cleared after all writes succeed."
+                },
+                "entries": {
+                    "type": "array",
+                    "description": "Optional batch datememory entries when one maintenance round writes multiple days.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "date": { "type": "string" },
+                            "title": { "type": "string" },
+                            "summary": { "type": "string" },
+                            "content": { "type": "string" },
+                            "kind": { "type": "string" },
+                            "evidence_entry_ids": {
+                                "type": "array",
+                                "items": { "type": "number" }
+                            },
+                            "keywords": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            }
+                        },
+                        "required": ["date", "content", "keywords"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["target"],
+            "additionalProperties": false
+        }
+    })
+}
+
+pub fn set_tool_projection_override(override_config: Option<ToolProjectionOverride>) {
+    ACTIVE_TOOL_PROJECTION_OVERRIDE.with(|slot| {
+        *slot.borrow_mut() = override_config;
+    });
+}
+
+fn current_tool_projection_override() -> Option<ToolProjectionOverride> {
+    ACTIVE_TOOL_PROJECTION_OVERRIDE.with(|slot| slot.borrow().clone())
+}
+
+pub fn tool_projection_override() -> Option<ToolProjectionOverride> {
+    current_tool_projection_override()
 }
 
 static NEXT_BACKGROUND_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
@@ -324,6 +2232,14 @@ static BACKGROUND_COMMAND_REGISTRY: OnceLock<
 > = OnceLock::new();
 static BACKGROUND_COMMAND_FINISHED: OnceLock<Mutex<BTreeMap<u64, BackgroundCommandSnapshot>>> =
     OnceLock::new();
+static NEXT_DRAW_IMAGE_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+const DRAW_IMAGE_MODEL: &str = "gpt-image-2";
+const DRAW_IMAGE_HTTP_TIMEOUT_MIN_SECS: u64 = 120;
+const DRAW_IMAGE_HTTP_RETRY_ATTEMPTS: usize = 3;
+const DRAW_IMAGE_HTTP_RETRY_BACKOFF_MS: u64 = 400;
+const DRAW_IMAGE_READY_ATTEMPTS: usize = 20;
+const DRAW_IMAGE_READY_SLEEP_MS: u64 = 25;
+const DRAW_IMAGE_CHROMA_KEY_HEX: &str = "#00ff00";
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -362,7 +2278,7 @@ pub struct ExecutedFunctionCall {
     pub command_preview: Option<String>,
     pub output_preview: String,
     pub exit_code: Option<i32>,
-    pub history_entry_id: Option<u64>,
+    pub toolmemory_entry_id: Option<u64>,
     pub archived_output: Option<String>,
 }
 
@@ -374,6 +2290,163 @@ pub struct FunctionCallDisplay {
     pub command_preview: String,
 }
 
+fn resolve_tool_display_spec(
+    manifest_display: Option<&ToolDisplaySpec>,
+    fallback_title: &str,
+    fallback_action: &str,
+) -> ToolDisplaySpec {
+    let mut spec = manifest_display.cloned().unwrap_or_default();
+    if spec.title.trim().is_empty() {
+        spec.title = fallback_title.to_string();
+    }
+    if spec.action_label.trim().is_empty() {
+        spec.action_label = fallback_action.to_string();
+    }
+    if spec.brief_template.trim().is_empty() {
+        spec.brief_template = "{brief}".to_string();
+    }
+    if spec.collapsed_fields.is_empty() {
+        spec.collapsed_fields = ToolDisplaySpec::default().collapsed_fields;
+    }
+    if spec.expanded_sections.is_empty() {
+        spec.expanded_sections = ToolDisplaySpec::default().expanded_sections;
+    }
+    spec
+}
+
+fn default_display_spec_for_call(
+    call: &FunctionCall,
+    display: &FunctionCallDisplay,
+) -> ToolDisplaySpec {
+    let manifest_display =
+        external_tool_manifest(call.name.as_str()).and_then(|manifest| manifest.display);
+    resolve_tool_display_spec(
+        manifest_display.as_ref(),
+        display.kind_label.as_str(),
+        display.action_label.as_str(),
+    )
+}
+
+pub fn tool_display_spec_for(
+    tool_name: &str,
+    fallback_title: &str,
+    fallback_action: &str,
+) -> ToolDisplaySpec {
+    let manifest_display = external_tool_manifest(tool_name).and_then(|manifest| manifest.display);
+    resolve_tool_display_spec(manifest_display.as_ref(), fallback_title, fallback_action)
+}
+
+fn tool_status_from_execution(tool_id: &str, execution: &ExecutedFunctionCall) -> ToolRunStatus {
+    let action = execution.action_label.to_ascii_lowercase();
+    if action.contains("cancel") || action.contains("取消") {
+        return ToolRunStatus::Cancelled;
+    }
+    if action.contains("timeout") || action.contains("超时") || execution.exit_code == Some(124) {
+        return ToolRunStatus::Timeout;
+    }
+    if action.contains("failed")
+        || action.contains("error")
+        || action.contains("rejected")
+        || action.contains("失败")
+        || execution.exit_code.is_some_and(|code| code != 0)
+    {
+        return ToolRunStatus::Error;
+    }
+    if matches!(tool_id, "exec_command" | "pty_run" | "pty_wait")
+        && execution.exit_code.is_none()
+        && execution.toolmemory_entry_id.is_none()
+        && execution.archived_output.is_none()
+    {
+        return ToolRunStatus::Running;
+    }
+    ToolRunStatus::Ok
+}
+
+fn tool_output_refs_for_execution(
+    call: &FunctionCall,
+    persona: crate::PersonaKind,
+    execution: &ExecutedFunctionCall,
+) -> Vec<ToolOutputRef> {
+    let Some(archived_output) = execution.archived_output.as_deref() else {
+        return Vec::new();
+    };
+    let byte_len = archived_output.len();
+    let line_count = count_lines(archived_output);
+    let entry_id = execution.toolmemory_entry_id;
+    let ref_id = entry_id
+        .map(|entry_id| format!("toolmemory:{entry_id}"))
+        .unwrap_or_else(|| format!("toolmemory:pending:{}", call.call_id));
+    vec![ToolOutputRef {
+        ref_id,
+        kind: "toolmemory".to_string(),
+        persona: persona.context_dir_name().to_string(),
+        tool_run_id: call.call_id.clone(),
+        entry_id,
+        path: None,
+        byte_len,
+        line_count,
+        cursor: Some(format!("line:{line_count},byte:{byte_len}")),
+        content_hash: None,
+    }]
+}
+
+pub fn build_tool_output_envelope(
+    call: &FunctionCall,
+    display: &FunctionCallDisplay,
+    execution: &ExecutedFunctionCall,
+    persona: crate::PersonaKind,
+    started_at_unix: u64,
+    finished_at_unix: u64,
+    elapsed_ms: u64,
+) -> ToolOutputEnvelope {
+    let status = tool_status_from_execution(call.name.as_str(), execution);
+    let output_preview = truncate_output(execution.output_preview.as_str(), Some(250));
+    let input_preview = truncate_output(
+        execution
+            .command_preview
+            .as_deref()
+            .unwrap_or(display.command_preview.as_str()),
+        Some(120),
+    );
+    let error = matches!(
+        status,
+        ToolRunStatus::Error | ToolRunStatus::Cancelled | ToolRunStatus::Timeout
+    )
+    .then(|| output_preview.clone());
+    ToolOutputEnvelope {
+        version: 1,
+        tool_id: call.name.clone(),
+        run_id: call.call_id.clone(),
+        persona: persona.context_dir_name().to_string(),
+        action: execution.action_label.clone(),
+        status,
+        brief: execution.brief.clone(),
+        started_at_unix,
+        finished_at_unix,
+        display: default_display_spec_for_call(call, display),
+        input_summary: json!({
+            "preview": input_preview,
+            "chars": display.command_preview.chars().count(),
+        }),
+        output_summary: json!({
+            "preview": output_preview,
+            "chars": execution.output_preview.chars().count(),
+            "bytes": execution.output_preview.len(),
+            "lines": count_lines(execution.output_preview.as_str()),
+            "exit_code": execution.exit_code,
+            "toolmemory_entry_id": execution.toolmemory_entry_id,
+            "archived": execution.archived_output.is_some(),
+        }),
+        output_refs: tool_output_refs_for_execution(call, persona, execution),
+        artifacts: Vec::new(),
+        metrics: json!({
+            "elapsed_ms": elapsed_ms,
+        }),
+        error,
+    }
+}
+
+#[derive(Debug)]
 struct ExecCommandExecution {
     brief: String,
     kind_label: String,
@@ -383,8 +2456,66 @@ struct ExecCommandExecution {
     output_preview: String,
     exit_code: Option<i32>,
     extra_output_items: Vec<Value>,
-    history_entry_id: Option<u64>,
+    toolmemory_entry_id: Option<u64>,
     archived_output: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserLinkSnapshot {
+    href: String,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserFormSnapshot {
+    method: String,
+    action: String,
+    fields: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserPageSnapshot {
+    url: String,
+    status: u16,
+    fetched_at: u64,
+    title: Option<String>,
+    content_type: Option<String>,
+    body: String,
+    text_excerpt: String,
+    links: Vec<BrowserLinkSnapshot>,
+    forms: Vec<BrowserFormSnapshot>,
+}
+
+#[derive(Debug)]
+struct BrowserSession {
+    id: String,
+    name: String,
+    created_at: u64,
+    updated_at: u64,
+    user_agent: String,
+    client: reqwest::blocking::Client,
+    last_page: Option<BrowserPageSnapshot>,
+}
+
+#[derive(Debug, Default)]
+struct BrowserManager {
+    next_id: u64,
+    sessions: BTreeMap<String, BrowserSession>,
+}
+
+const AGENTBROWSER_BRIDGE_DIR_NAME: &str = "projectying";
+const AGENTBROWSER_STATE_FILE: &str = "browser_state.json";
+const AGENTBROWSER_COMMAND_FILE: &str = "browser_commands.jsonl";
+const AGENTBROWSER_SIGNAL_FILE: &str = "manual_signal.json";
+const AGENTBROWSER_ACTION_RESULT_FILE: &str = "browser_action_result.json";
+
+#[derive(Debug, Clone)]
+struct AgentBrowserBridge {
+    root: PathBuf,
+    state_file: PathBuf,
+    command_file: PathBuf,
+    signal_file: PathBuf,
+    action_result_file: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -395,6 +2526,7 @@ pub struct ToolRuntimeContext {
 
 #[derive(Debug, Clone)]
 pub struct BackgroundCommandSnapshot {
+    pub persona: crate::PersonaKind,
     pub job_id: u64,
     pub brief: String,
     pub cmd: String,
@@ -426,8 +2558,19 @@ pub enum BackgroundCommandEvent {
     },
 }
 
+impl BackgroundCommandEvent {
+    pub fn persona(&self) -> crate::PersonaKind {
+        match self {
+            BackgroundCommandEvent::Ready { snapshot }
+            | BackgroundCommandEvent::Progress { snapshot, .. }
+            | BackgroundCommandEvent::Done { snapshot, .. } => snapshot.persona,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct BackgroundCommandShared {
+    persona: crate::PersonaKind,
     job_id: u64,
     brief: String,
     cmd: String,
@@ -513,8 +2656,6 @@ pub struct AgentUiSnapshot {
 struct LocalAgentRecord {
     nickname: Option<String>,
     agent_type: Option<String>,
-    provider: crate::ProviderConfig,
-    transcript: Arc<Mutex<Vec<crate::provider::ApiMessage>>>,
     status: Arc<Mutex<AgentStatusValue>>,
     cancel_flag: Arc<AtomicBool>,
     command_tx: Option<mpsc::Sender<AgentCommand>>,
@@ -528,7 +2669,6 @@ struct LocalAgentRecord {
 struct LocalAgentManager {
     next_agent_id: u64,
     next_submission_id: u64,
-    next_batch_job_id: u64,
     retention_limit: usize,
     agents: BTreeMap<String, LocalAgentRecord>,
 }
@@ -539,23 +2679,8 @@ enum AgentCommand {
     Shutdown,
 }
 
-#[derive(Debug)]
-struct BatchWorkerOutcome {
-    item_id: String,
-    source_id: Option<String>,
-    result: Option<Value>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct BatchFailureSummary {
-    item_id: String,
-    source_id: Option<String>,
-    last_error: String,
-}
-
 #[cfg(test)]
-static EXEC_COMMAND_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+static COMMAND_FAMILY_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
 pub(crate) fn home_override_test_lock() -> &'static Mutex<()> {
@@ -574,7 +2699,6 @@ fn agent_manager() -> &'static Mutex<LocalAgentManager> {
         Mutex::new(LocalAgentManager {
             next_agent_id: 1,
             next_submission_id: 1,
-            next_batch_job_id: 1,
             retention_limit: DEFAULT_AGENT_RETENTION_LIMIT,
             agents: BTreeMap::new(),
         })
@@ -586,7 +2710,7 @@ fn permission_mode_cell() -> &'static Mutex<PermissionMode> {
     MODE.get_or_init(|| Mutex::new(PermissionMode::default()))
 }
 
-pub fn install_request_user_input_sink(tx: mpsc::Sender<UserInputRequest>) {
+pub fn install_ask_user_sink(tx: mpsc::Sender<UserInputRequest>) {
     if let Ok(mut guard) = user_input_sink().lock() {
         *guard = Some(tx);
     }
@@ -722,38 +2846,6 @@ fn enforce_multiagent_output_retention() {
     });
 }
 
-#[allow(dead_code)]
-pub fn list_background_commands() -> Vec<BackgroundCommandSnapshot> {
-    let registry = BACKGROUND_COMMAND_REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let Ok(guard) = registry.lock() else {
-        return Vec::new();
-    };
-    let mut out = Vec::with_capacity(guard.len());
-    for shared in guard.values() {
-        if let Ok(state) = shared.lock() {
-            out.push(background_snapshot_from_shared(&state));
-        }
-    }
-    out.sort_by_key(|snapshot| snapshot.job_id);
-    out
-}
-
-#[allow(dead_code)]
-pub fn snapshot_background_command(job_id: u64) -> Option<BackgroundCommandSnapshot> {
-    let registry = BACKGROUND_COMMAND_REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()));
-    if let Ok(guard) = registry.lock()
-        && let Some(shared) = guard.get(&job_id)
-        && let Ok(state) = shared.lock()
-    {
-        return Some(background_snapshot_from_shared(&state));
-    }
-    BACKGROUND_COMMAND_FINISHED
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .ok()
-        .and_then(|guard| guard.get(&job_id).cloned())
-}
-
 pub fn kill_background_command(job_id: u64) -> Result<()> {
     let registry = BACKGROUND_COMMAND_REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()));
     let pid = registry
@@ -803,23 +2895,273 @@ struct ExecCommandArgs {
 }
 
 #[derive(Debug, Deserialize)]
-struct WriteStdinArgs {
-    session_id: u64,
+struct CommandArgs {
+    cmd: String,
     #[serde(default)]
-    chars: String,
+    target: CommandTarget,
+    #[serde(default)]
+    server_id: Option<String>,
+    #[serde(default)]
+    server_name: Option<String>,
+    #[serde(default)]
+    brief: Option<String>,
+    #[serde(default)]
+    workdir: Option<String>,
+    #[serde(default)]
+    shell: Option<String>,
+    #[serde(default)]
+    login: Option<bool>,
     #[serde(default)]
     yield_time_ms: Option<u64>,
+    #[serde(default)]
+    output_level: CommandOutputLevel,
+    #[serde(default)]
+    max_output_tokens: Option<usize>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[serde(skip, default)]
+    display_cmd: Option<String>,
+    #[serde(skip, default)]
+    env_overrides: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+enum CommandTarget {
+    #[serde(rename = "local")]
+    #[default]
+    Local,
+    #[serde(rename = "ssh")]
+    Ssh,
+}
+
+struct SshCommandSpec {
+    run_cmd: String,
+    display_cmd: String,
+    env_overrides: Vec<(String, String)>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PtyRunArgs {
+    cmd: String,
+    #[serde(default)]
+    target: CommandTarget,
+    #[serde(default)]
+    server_id: Option<String>,
+    #[serde(default)]
+    server_name: Option<String>,
+    #[serde(default)]
+    brief: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    workdir: Option<String>,
+    #[serde(default)]
+    shell: Option<String>,
+    #[serde(default)]
+    login: Option<bool>,
+    #[serde(default)]
+    yield_time_ms: Option<u64>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[serde(skip, default)]
+    display_cmd: Option<String>,
+    #[serde(skip, default)]
+    env_overrides: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ServerManageArgs {
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    brief: Option<String>,
+    #[serde(default)]
+    server_id: Option<String>,
+    #[serde(default)]
+    server_name: Option<String>,
+    #[serde(default)]
+    server_ids: Vec<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    key_path: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    cmd: Option<String>,
+    #[serde(default)]
+    workdir: Option<String>,
+    #[serde(default)]
+    shell: Option<String>,
+    #[serde(default)]
+    login: Option<bool>,
+    #[serde(default)]
+    yield_time_ms: Option<u64>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[serde(default)]
+    output_level: CommandOutputLevel,
+    #[serde(default)]
+    max_output_tokens: Option<usize>,
+    #[serde(default)]
+    items: Vec<ServerDispatchArgs>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ServerSplitArgs {
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    brief: Option<String>,
+    #[serde(default)]
+    count: Option<usize>,
+    #[serde(default)]
+    split_id: Option<String>,
+    #[serde(default)]
+    split_ids: Vec<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    targets: Vec<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default)]
+    task: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    tasks: Vec<String>,
+    #[serde(default)]
+    server_id: Option<String>,
+    #[serde(default)]
+    server_name: Option<String>,
+    #[serde(default)]
+    server_ids: Vec<String>,
+    #[serde(default)]
+    priority: Option<String>,
+    #[serde(default)]
+    all: bool,
+    #[serde(default)]
+    items: Vec<ServerSplitItemArgs>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ServerSplitItemArgs {
+    #[serde(default)]
+    split_id: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    task: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    server_id: Option<String>,
+    #[serde(default)]
+    server_name: Option<String>,
+    #[serde(default)]
+    brief: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ServerDispatchArgs {
+    #[serde(default)]
+    server_id: Option<String>,
+    #[serde(default)]
+    server_name: Option<String>,
+    #[serde(default)]
+    brief: Option<String>,
+    #[serde(default)]
+    cmd: String,
+    #[serde(default)]
+    workdir: Option<String>,
+    #[serde(default)]
+    shell: Option<String>,
+    #[serde(default)]
+    login: Option<bool>,
+    #[serde(default)]
+    yield_time_ms: Option<u64>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[serde(default)]
+    output_level: CommandOutputLevel,
     #[serde(default)]
     max_output_tokens: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum CommandOutputLevel {
+#[derive(Debug, Deserialize)]
+struct PersonaManageArgs {
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    persona: String,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    brief: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    include_recent: Option<usize>,
+    #[serde(default)]
+    priority: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PtyInputArgs {
+    #[serde(default)]
+    session_id: Option<u64>,
+    #[serde(default)]
+    pid: Option<i32>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    chars: String,
+    #[serde(default)]
+    yield_time_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PtyWaitArgs {
+    #[serde(default)]
+    session_id: Option<u64>,
+    #[serde(default)]
+    pid: Option<i32>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CommandOutputLevel {
+    #[serde(rename = "small", alias = "low")]
     Low,
+    #[serde(rename = "normal", alias = "medium")]
     #[default]
     Medium,
+    #[serde(rename = "large", alias = "high")]
     High,
+}
+
+impl CommandOutputLevel {
+    pub fn user_label(self) -> &'static str {
+        match self {
+            Self::Low => "Small",
+            Self::Medium => "Normal",
+            Self::High => "Large",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -828,6 +3170,12 @@ enum ExecCommandFamily {
     Adb,
     TermuxApi,
 }
+
+const EXEC_COMMAND_FAMILIES: [ExecCommandFamily; 3] = [
+    ExecCommandFamily::Generic,
+    ExecCommandFamily::Adb,
+    ExecCommandFamily::TermuxApi,
+];
 
 #[derive(Debug, Deserialize)]
 struct ViewImageArgs {
@@ -840,6 +3188,92 @@ struct ViewImageArgs {
     workdir: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DrawImageArgs {
+    prompt: String,
+    #[serde(default)]
+    brief: Option<String>,
+    #[serde(default)]
+    mode: DrawImageMode,
+    #[serde(default)]
+    source_path: Option<String>,
+    #[serde(default)]
+    size: DrawImageSize,
+    #[serde(default)]
+    transparent_background: bool,
+    #[serde(default)]
+    output_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DrawImageMode {
+    #[default]
+    Generate,
+    Edit,
+}
+
+impl DrawImageMode {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Generate => "generate",
+            Self::Edit => "edit",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Generate => "生成",
+            Self::Edit => "编辑",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DrawImageSize {
+    #[default]
+    Auto,
+    #[serde(rename = "1024x1024")]
+    Square1024,
+    #[serde(rename = "1024x1536")]
+    Portrait1024,
+    #[serde(rename = "1536x1024")]
+    Landscape1536,
+}
+
+impl DrawImageSize {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Square1024 => "1024x1024",
+            Self::Portrait1024 => "1024x1536",
+            Self::Landscape1536 => "1536x1024",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DrawImageSource {
+    path: PathBuf,
+    display_path: String,
+    mime: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DrawImageGenerationResponse {
+    #[serde(default)]
+    data: Vec<DrawImageGenerationData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DrawImageGenerationData {
+    #[serde(default)]
+    b64_json: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -877,6 +3311,10 @@ struct PtyKillArgs {
     session_id: Option<u64>,
     #[serde(default, alias = "ids")]
     session_ids: Vec<u64>,
+    #[serde(default)]
+    pid: Option<i32>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -891,10 +3329,63 @@ struct ApplyPatchArgs {
     cwd: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct BrowserArgs {
+    action: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    form: BTreeMap<String, String>,
+    #[serde(default)]
+    selector: Option<String>,
+    #[serde(default)]
+    selectors: Vec<String>,
+    #[serde(default)]
+    max_items: Option<usize>,
+    #[serde(default)]
+    tab_id: Option<String>,
+    #[serde(default)]
+    tab_index: Option<usize>,
+    #[serde(default)]
+    urls: Vec<String>,
+    #[serde(default)]
+    background: Option<bool>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    match_text: Option<String>,
+    #[serde(default)]
+    href_contains: Option<String>,
+    #[serde(default)]
+    field_name: Option<String>,
+    #[serde(default)]
+    placeholder: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    element_index: Option<usize>,
+    #[serde(default)]
+    brief: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct UpdatePlanArgs {
     #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
     explanation: Option<String>,
+    #[serde(default)]
+    decision: Option<String>,
+    #[serde(default)]
+    blueprint: Option<String>,
     #[serde(default)]
     plan: Vec<UpdatePlanStepArgs>,
 }
@@ -904,6 +3395,10 @@ struct ContextManageArgs {
     action: String,
     #[serde(default)]
     target: Option<String>,
+    #[serde(default)]
+    persona: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
     #[serde(default)]
     section: Option<String>,
     #[serde(default)]
@@ -915,7 +3410,15 @@ struct ContextManageArgs {
     #[serde(default)]
     entry_ids: Vec<u64>,
     #[serde(default)]
+    entry_start_id: Option<u64>,
+    #[serde(default)]
+    entry_end_id: Option<u64>,
+    #[serde(default)]
     item_ids: Vec<u64>,
+    #[serde(default)]
+    item_start_id: Option<u64>,
+    #[serde(default)]
+    item_end_id: Option<u64>,
     #[serde(default)]
     brief: Option<String>,
     #[serde(default)]
@@ -953,16 +3456,128 @@ struct ContextManageArgs {
     #[serde(default)]
     exit_reason: Option<String>,
     #[serde(default)]
-    fastmemory_section: Option<String>,
-    #[serde(default)]
     fastmemory_text: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ContextCompactArgs {
+    mode: String,
+    #[serde(default)]
+    persona: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    brief: Option<String>,
+    #[serde(default)]
+    report_to_matrix: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ContextSummaryEntryArgs {
+    entry_id: u64,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ContextSummaryArgs {
+    action: String,
+    #[serde(default)]
+    persona: Option<String>,
+    #[serde(default)]
+    entries: Vec<ContextSummaryEntryArgs>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    brief: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ContextVisionArgs {
+    #[serde(
+        default,
+        alias = "percent",
+        alias = "context_visibility",
+        alias = "next_context_percent"
+    )]
+    context_percent: Option<Value>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    persona: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    brief: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
-struct ToolboxManageArgs {
+struct ToolManageArgs {
     action: String,
     #[serde(default, alias = "ids", alias = "targets", alias = "names")]
     tool_ids: Vec<String>,
+    #[serde(default, alias = "roles", alias = "role_names")]
+    role_ids: Vec<String>,
+    #[serde(default)]
+    manifest: Option<ExternalToolManifest>,
+    #[serde(default)]
+    schema: Option<Value>,
+    #[serde(default)]
+    role: Option<crate::roles::DynamicRoleDraft>,
+    #[serde(default)]
+    context_governance: Option<crate::roles::ContextGovernanceSpec>,
+    #[serde(default, alias = "context_governance_mode")]
+    mode: Option<String>,
+    #[serde(
+        default,
+        alias = "context_soft_limit",
+        alias = "context_soft_limit_kb",
+        alias = "context_manage_limit"
+    )]
+    manage_threshold_kb: Option<u64>,
+    #[serde(
+        default,
+        alias = "context_hard_limit",
+        alias = "context_hard_limit_kb",
+        alias = "context_compact_limit"
+    )]
+    compact_threshold_kb: Option<u64>,
+    #[serde(default)]
+    report_to_matrix: Option<bool>,
+    #[serde(default, alias = "api_body")]
+    provider_body: Option<crate::ApiBodyKind>,
+    #[serde(default)]
+    provider_index: Option<usize>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    default_tool_output_level: Option<CommandOutputLevel>,
+    #[serde(default)]
+    tool_output_small_kb: Option<usize>,
+    #[serde(default)]
+    tool_output_normal_kb: Option<usize>,
+    #[serde(default)]
+    tool_output_large_kb: Option<usize>,
+    #[serde(default)]
+    name_en: Option<String>,
+    #[serde(default)]
+    name_zh: Option<String>,
+    #[serde(default)]
+    agent_retention_limit: Option<usize>,
+    #[serde(default)]
+    permission_mode: Option<PermissionMode>,
+    #[serde(default)]
+    terminal_audit_interval_secs: Option<u64>,
+    #[serde(default)]
+    image_compression_quality: Option<ImageCompressionQuality>,
+    #[serde(default)]
+    image_upload_max_mb: Option<u64>,
+    #[serde(default)]
+    theme_preset: Option<crate::ThemePreset>,
+    #[serde(default, alias = "target_persona")]
+    persona: Option<String>,
     #[serde(default)]
     brief: Option<String>,
     #[serde(default)]
@@ -971,8 +3586,21 @@ struct ToolboxManageArgs {
     plan: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct OutputStreamReadArgs {
+    ref_id: Option<String>,
+    path: Option<String>,
+    mode: Option<String>,
+    tail_lines: Option<usize>,
+    line_start: Option<usize>,
+    line_end: Option<usize>,
+    cursor: Option<String>,
+    max_bytes: Option<usize>,
+    brief: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
-struct TaskModeArgs {
+struct FocusModeArgs {
     action: String,
     #[serde(default)]
     brief: Option<String>,
@@ -1009,14 +3637,15 @@ struct TaskModeArgs {
     #[serde(default)]
     exit_reason: Option<String>,
     #[serde(default)]
-    fastmemory_section: Option<String>,
-    #[serde(default)]
     fastmemory_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct MemoryEntryArgs {
-    date: String,
+    #[serde(default)]
+    date: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
@@ -1031,7 +3660,25 @@ struct MemoryEntryArgs {
 #[derive(Debug, Clone, Deserialize)]
 struct MemoryAddArgs {
     #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    persona: Option<String>,
+    #[serde(default)]
     brief: Option<String>,
+    #[serde(default)]
+    date: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    keywords: Vec<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    evidence_entry_ids: Vec<u64>,
     #[serde(default)]
     entries: Vec<MemoryEntryArgs>,
     #[serde(default)]
@@ -1039,25 +3686,10 @@ struct MemoryAddArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct MemoryReplaceArgs {
-    entry_id: u64,
-    date: String,
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default)]
-    keywords: Vec<String>,
-    #[serde(default)]
-    summary: Option<String>,
-    content: String,
-    #[serde(default)]
-    evidence_entry_ids: Vec<u64>,
-    #[serde(default)]
-    brief: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct MemoryCheckArgs {
     target: String,
+    #[serde(default)]
+    persona: Option<String>,
     #[serde(default)]
     keywords: Vec<String>,
     #[serde(default)]
@@ -1071,18 +3703,7 @@ struct MemoryCheckArgs {
     #[serde(default)]
     tool_ref: Option<String>,
     #[serde(default)]
-    limit: Option<usize>,
-    #[serde(default)]
-    brief: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct MemorySearchArgs {
-    target: String,
-    #[serde(default)]
-    keywords: Vec<String>,
-    start_date: String,
-    end_date: String,
+    entry_id: Option<u64>,
     #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
@@ -1093,11 +3714,15 @@ struct MemorySearchArgs {
 struct MemoryReadArgs {
     target: String,
     #[serde(default)]
+    persona: Option<String>,
+    #[serde(default)]
     date: Option<String>,
     #[serde(default)]
     tool_ref: Option<String>,
     #[serde(default)]
     entry_id: Option<u64>,
+    #[serde(default)]
+    entry_ids: Vec<u64>,
     #[serde(default)]
     entry_start_id: Option<u64>,
     #[serde(default)]
@@ -1107,38 +3732,19 @@ struct MemoryReadArgs {
     #[serde(default)]
     line_end: Option<usize>,
     #[serde(default)]
-    brief: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ParallelToolArgs {
+    ref_id: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    tail_lines: Option<usize>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    max_bytes: Option<usize>,
     #[serde(default)]
     brief: Option<String>,
-    tool_uses: Vec<ParallelToolUseArgs>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ParallelToolUseArgs {
-    recipient_name: String,
-    parameters: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct ParallelToolPreviewPayload {
-    brief: String,
-    items: Vec<ParallelToolPreviewItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct ParallelToolPreviewItem {
-    tool_name: String,
-    action: String,
-    brief: String,
-    input: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    output: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    status: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1154,6 +3760,13 @@ enum UpdatePlanStatus {
     Completed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdatePlanMode {
+    Decision,
+    Plan,
+    Blueprint,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UpdatePlanStep {
     step: String,
@@ -1162,25 +3775,28 @@ struct UpdatePlanStep {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NormalizedUpdatePlan {
+    mode: UpdatePlanMode,
     explanation: Option<String>,
+    decision: Option<String>,
+    blueprint: Option<String>,
     steps: Vec<UpdatePlanStep>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct RequestUserInputArgs {
-    questions: Vec<RequestUserInputQuestionArgs>,
+struct AskUserArgs {
+    questions: Vec<AskUserQuestionArgs>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct RequestUserInputQuestionArgs {
+struct AskUserQuestionArgs {
     id: String,
     header: String,
     question: String,
-    options: Vec<RequestUserInputOptionArgs>,
+    options: Vec<AskUserOptionArgs>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct RequestUserInputOptionArgs {
+struct AskUserOptionArgs {
     label: String,
     description: String,
 }
@@ -1234,10 +3850,7 @@ struct WaitAgentArgs {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-struct ListAgentArgs {
-    #[serde(default = "default_list_agent_include_closed")]
-    include_closed: bool,
-}
+struct ListAgentArgs {}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct SingleAgentArgs {
@@ -1254,14 +3867,51 @@ impl PtyKillArgs {
             ids.push(session_id);
         }
         ids.extend(self.session_ids.iter().copied());
+        if ids.is_empty()
+            && let Ok(session_id) = resolve_pty_session_selector(
+                self.session_id,
+                self.pid,
+                self.name.as_deref(),
+                "pty_kill",
+            )
+        {
+            ids.push(session_id);
+        }
         ids.sort_unstable();
         ids.dedup();
         if ids.is_empty() {
-            Err(anyhow!("pty_kill 需要 session_id 或 session_ids"))
+            Err(anyhow!(
+                "pty_kill 需要 session_id / session_ids / pid / name"
+            ))
         } else {
             Ok(ids)
         }
     }
+}
+
+fn resolve_pty_session_selector(
+    session_id: Option<u64>,
+    pid: Option<i32>,
+    name: Option<&str>,
+    tool_name: &str,
+) -> Result<u64> {
+    terminal::resolve_session_selector(session_id, pid, name).with_context(|| {
+        let mut selectors = Vec::new();
+        if let Some(session_id) = session_id {
+            selectors.push(format!("session_id={session_id}"));
+        }
+        if let Some(pid) = pid {
+            selectors.push(format!("pid={pid}"));
+        }
+        if let Some(name) = name.map(str::trim).filter(|value| !value.is_empty()) {
+            selectors.push(format!("name={name}"));
+        }
+        if selectors.is_empty() {
+            format!("{tool_name} 需要 session_id / pid / name")
+        } else {
+            format!("{tool_name} 无法定位 PTY 会话：{}", selectors.join(" · "))
+        }
+    })
 }
 
 impl SingleAgentArgs {
@@ -1292,107 +3942,203 @@ impl SingleAgentArgs {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct SpawnAgentsOnCsvArgs {
-    csv_path: String,
-    instruction: String,
-    #[serde(default)]
-    id_column: Option<String>,
-    #[serde(default)]
-    output_csv_path: Option<String>,
-    #[serde(default)]
-    output_schema: Option<Value>,
-    #[serde(default)]
-    max_concurrency: Option<usize>,
-    #[serde(default)]
-    max_workers: Option<usize>,
-    #[serde(default)]
-    max_runtime_seconds: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ReportAgentJobResultArgs {
-    job_id: String,
-    item_id: String,
-    result: Value,
-    #[serde(default)]
-    stop: Option<bool>,
-}
-
-fn default_list_agent_include_closed() -> bool {
-    true
-}
-
 // =============================================================================
 // 调度中心：schema 暴露、调用提取、描述与统一执行入口
 // =============================================================================
 
-fn matrix_codex_tools() -> Value {
-    include!("../context/codex/schema/codex_tools.rsinc")
-}
-
-fn coding_codex_tools() -> Value {
-    include!("../context/codexcoding/schema/codex_tools.rsinc")
-}
-
-fn companion_codex_tools() -> Value {
-    include!("../context/codexcompanion/schema/codex_tools.rsinc")
-}
-
-fn matrix_schema_hides_tool(name: &str) -> bool {
-    matches!(name, "context_manage" | "task_mode")
-}
-
-pub fn codex_tools() -> Value {
-    let mut tools = match current_tool_persona() {
-        crate::PersonaKind::Matrix => matrix_codex_tools(),
-        crate::PersonaKind::Coding => coding_codex_tools(),
-        crate::PersonaKind::Companion => companion_codex_tools(),
-    };
-    if matches!(current_tool_persona(), crate::PersonaKind::Matrix)
-        && let Some(items) = tools.as_array_mut()
-    {
-        items.retain(|tool| {
-            tool.get("name")
-                .and_then(Value::as_str)
-                .is_none_or(|name| !matrix_schema_hides_tool(name))
-        });
-    }
+fn shared_codex_tools() -> Value {
+    let mut tools = default_shared_codex_tools();
+    apply_shared_tool_schema_overrides(&mut tools);
     tools
 }
 
-pub fn codex_provider_tool_name(name: &str) -> &str {
-    match name {
-        "multi_tool_use.parallel" => "multi_tool_use_parallel",
-        _ => name,
+fn builtin_tool_names() -> HashSet<String> {
+    let tools = shared_codex_tools();
+    tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .map(codex_provider_tool_name)
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(test)]
+fn coding_codex_tools() -> Value {
+    shared_codex_tools()
+}
+
+fn normalize_schema_tool_aliases(tools: &mut Value) {
+    let Some(items) = tools.as_array_mut() else {
+        return;
+    };
+    for tool in items {
+        if tool.get("name").and_then(Value::as_str) == Some("toolbox_manage") {
+            tool["name"] = Value::String("tool_manage".to_string());
+        }
     }
 }
 
-fn canonicalize_codex_provider_tool_name(name: &str) -> &str {
-    match name {
-        "multi_tool_use_parallel" => "multi_tool_use.parallel",
-        _ => name,
+fn apply_persona_schema_constraints(tools: &mut Value, persona: crate::PersonaKind) {
+    if matches!(
+        persona,
+        crate::PersonaKind::Matrix | crate::PersonaKind::Advisor
+    ) {
+        return;
+    }
+    let Some(items) = tools.as_array_mut() else {
+        return;
+    };
+    for tool in items {
+        if tool.get("name").and_then(Value::as_str) != Some("persona_manage") {
+            if tool.get("name").and_then(Value::as_str) == Some("tool_manage") {
+                tool["description"] = Value::String(
+                    "Self-service ProjectYing toolbox manager for the current persona. Use it to list, reload, open, close, pin, or unpin tools in your own toolbox. Cross-persona toolbox changes and governance actions stay with Matrix/司."
+                        .to_string(),
+                );
+                if let Some(action) = tool.pointer_mut("/parameters/properties/action") {
+                    action["enum"] = json!(["list", "reload", "open", "close", "pin", "unpin"]);
+                    action["description"] = Value::String(
+                        "Self-service toolbox action for the current persona.".to_string(),
+                    );
+                }
+                if let Some(properties) = tool
+                    .pointer_mut("/parameters/properties")
+                    .and_then(Value::as_object_mut)
+                {
+                    for key in [
+                        "persona",
+                        "role_ids",
+                        "manifest",
+                        "schema",
+                        "role",
+                        "context_governance",
+                        "mode",
+                        "manage_threshold_kb",
+                        "compact_threshold_kb",
+                        "report_to_matrix",
+                        "provider_body",
+                        "provider_index",
+                        "model",
+                        "default_tool_output_level",
+                        "tool_output_small_kb",
+                        "tool_output_normal_kb",
+                        "tool_output_large_kb",
+                        "name_en",
+                        "name_zh",
+                        "agent_retention_limit",
+                        "permission_mode",
+                        "terminal_audit_interval_secs",
+                        "image_compression_quality",
+                        "image_upload_max_mb",
+                        "theme_preset",
+                    ] {
+                        properties.remove(key);
+                    }
+                    if let Some(tool_ids) = properties.get_mut("tool_ids") {
+                        tool_ids["description"] = Value::String(
+                            "Stable tool ids to open, close, pin, or unpin in this persona's toolbox."
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+        tool["description"] = Value::String(
+            "Controlled ProjectYing persona communication tool. This persona may only use `send` to ask another persona for help or report valuable progress without raw tool output."
+                .to_string(),
+        );
+        if let Some(action) = tool.pointer_mut("/parameters/properties/action") {
+            action["enum"] = json!(["send"]);
+            action["description"] = Value::String(
+                "Coordination action. Non-governance personas may only use `send`.".to_string(),
+            );
+        }
+        if let Some(properties) = tool
+            .pointer_mut("/parameters/properties")
+            .and_then(Value::as_object_mut)
+        {
+            properties.remove("include_recent");
+        }
     }
 }
 
-pub fn codex_tools_for_provider() -> Value {
-    let mut tools = codex_tools();
-    let allowed = crate::context::projected_toolbox_local_tool_ids().ok();
+pub fn all_codex_tools() -> Value {
+    let mut tools = shared_codex_tools();
+    normalize_schema_tool_aliases(&mut tools);
+    append_external_tool_schemas(&mut tools);
+    add_context_visibility_properties(&mut tools);
+    tools
+}
+
+pub fn codex_tools() -> Value {
+    let persona = current_tool_persona();
+    let mut tools = all_codex_tools();
     if let Some(items) = tools.as_array_mut() {
         items.retain(|tool| {
             let Some(name) = tool.get("name").and_then(Value::as_str) else {
                 return true;
             };
-            allowed
-                .as_ref()
-                .is_none_or(|allowed| allowed.contains(name))
+            tool_allowed_for_persona(persona, name)
         });
+    }
+    apply_persona_schema_constraints(&mut tools, persona);
+    tools
+}
+
+pub(crate) fn default_tool_projection_state(
+    persona: crate::PersonaKind,
+    name: &str,
+) -> ToolProjectionState {
+    ToolContractRegistry::default_tool_projection_state(persona, name)
+}
+
+pub(crate) fn default_role_tool_ids_for_persona(persona: crate::PersonaKind) -> Vec<String> {
+    let tools = shared_codex_tools();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    if let Some(items) = tools.as_array() {
         for tool in items {
-            if let Some(name) = tool.get("name").and_then(Value::as_str) {
-                tool["name"] = Value::String(codex_provider_tool_name(name).to_string());
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let canonical = codex_provider_tool_name(name).to_string();
+            if canonical == "tool_manage" {
+                continue;
+            }
+            if !seen.insert(canonical.clone()) {
+                continue;
+            }
+            if matches!(
+                default_tool_projection_state(persona, canonical.as_str()),
+                ToolProjectionState::Expanded
+            ) {
+                out.push(canonical);
             }
         }
     }
+    out
+}
+
+pub fn codex_provider_tool_name(name: &str) -> &str {
+    match name {
+        "toolbox_manage" | "tool_manage" => "tool_manage",
+        "image_gen" | "draw_image" => "draw_image",
+        other => other,
+    }
+}
+
+fn canonicalize_codex_provider_tool_name(name: &str) -> &str {
+    codex_provider_tool_name(name)
+}
+
+pub fn codex_tools_for_provider() -> Value {
+    let projection = ProviderToolProjection::current();
+    let mut tools = projection.seed_tools();
+    projection.apply_to_schema(&mut tools);
+    apply_persona_schema_constraints(&mut tools, current_tool_persona());
     tools
 }
 
@@ -1419,46 +4165,15 @@ pub fn function_call_output_item(call_id: &str, output: String) -> Value {
     })
 }
 
-fn strip_parallel_recipient_name(raw: &str) -> String {
-    let trimmed = raw.trim();
-    trimmed
-        .strip_prefix("functions.")
-        .unwrap_or(trimmed)
-        .trim()
-        .to_string()
-}
-
 fn parallel_tool_allowed_for_persona(persona: crate::PersonaKind, name: &str) -> bool {
-    match persona {
-        crate::PersonaKind::Matrix => matches!(
-            name,
-            "exec_command"
-                | "view_image"
-                | "memory_check"
-                | "memory_search"
-                | "memory_read"
-                | "list_agent"
-                | "pty_list"
-        ),
-        crate::PersonaKind::Coding => matches!(name, "exec_command"),
-        crate::PersonaKind::Companion => matches!(
-            name,
-            "exec_command"
-                | "view_image"
-                | "memory_check"
-                | "memory_search"
-                | "memory_read"
-                | "list_agent"
-                | "pty_list"
-        ),
-    }
+    ToolContractRegistry::parallel_tool_allowed_for_persona(persona, name)
 }
 
 fn parallel_tool_action(name: &str, input: &str) -> &'static str {
     match name {
-        "memory_check" | "memory_search" => "Search",
+        "memory_check" => "Search",
         "memory_read" | "view_image" | "list_agent" | "pty_list" => "Read",
-        "exec_command" => {
+        "exec_command" | "command" => {
             let lower = format!(" {} ", input.to_ascii_lowercase());
             let search_needles = [" rg ", " grep ", " git grep ", " find ", " fd "];
             if search_needles.iter().any(|needle| lower.contains(needle)) {
@@ -1486,6 +4201,16 @@ pub fn native_parallel_item_action(name: &str, input: &str) -> &'static str {
 pub fn native_parallel_batch_supported(call: &FunctionCall) -> bool {
     let persona = current_tool_persona();
     match call.name.as_str() {
+        "command" => {
+            if !parallel_tool_allowed_for_persona(persona, "command") {
+                return false;
+            }
+            serde_json::from_str::<CommandArgs>(&call.arguments)
+                .ok()
+                .is_some_and(|args| {
+                    native_parallel_item_action("command", args.cmd.as_str()) != "Run"
+                })
+        }
         "exec_command" => {
             if !parallel_tool_allowed_for_persona(persona, "exec_command") {
                 return false;
@@ -1497,8 +4222,9 @@ pub fn native_parallel_batch_supported(call: &FunctionCall) -> bool {
                         && native_parallel_item_action("exec_command", args.cmd.as_str()) != "Run"
                 })
         }
-        "view_image" | "memory_check" | "memory_search" | "memory_read" | "list_agent"
-        | "pty_list" => parallel_tool_allowed_for_persona(persona, call.name.as_str()),
+        "view_image" | "memory_check" | "memory_read" | "list_agent" | "pty_list" => {
+            parallel_tool_allowed_for_persona(persona, call.name.as_str())
+        }
         _ => false,
     }
 }
@@ -1521,70 +4247,25 @@ pub fn native_parallel_batch_brief(calls: &[FunctionCall]) -> String {
     format!("{noun} {} 项", calls.len())
 }
 
-fn resolve_parallel_tool_brief(args: &ParallelToolArgs) -> String {
-    normalize_brief(args.brief.as_deref()).unwrap_or_else(|| {
-        if args.tool_uses.is_empty() {
-            "并行探索".to_string()
-        } else {
-            format!("并行探索 {} 项", args.tool_uses.len())
-        }
-    })
-}
-
-fn build_parallel_preview_payload_text(payload: &ParallelToolPreviewPayload) -> String {
-    serde_json::to_string(payload).unwrap_or_else(|_| String::from("{\"brief\":\"\",\"items\":[]}"))
-}
-
-fn build_parallel_preview_payload_from_uses(
-    brief: &str,
-    tool_uses: &[ParallelToolUseArgs],
-) -> ParallelToolPreviewPayload {
-    let mut items = Vec::with_capacity(tool_uses.len());
-    for (index, tool_use) in tool_uses.iter().enumerate() {
-        let tool_name = strip_parallel_recipient_name(tool_use.recipient_name.as_str());
-        let arguments = serde_json::to_string(&tool_use.parameters).unwrap_or_else(|_| "{}".into());
-        let display = if tool_name == "multi_tool_use.parallel" {
-            FunctionCallDisplay {
-                brief: default_tool_brief("multi_tool_use.parallel"),
-                kind_label: "Explore".to_string(),
-                action_label: "Run".to_string(),
-                command_preview: arguments.clone(),
-            }
-        } else {
-            describe_function_call(&FunctionCall {
-                call_id: format!("preview_parallel_{}", index + 1),
-                name: tool_name.clone(),
-                arguments,
-            })
-        };
-        items.push(ParallelToolPreviewItem {
-            tool_name: tool_name.clone(),
-            action: parallel_tool_action(tool_name.as_str(), display.command_preview.as_str())
-                .to_string(),
-            brief: if display.brief.trim().is_empty() {
-                default_tool_brief(tool_name.as_str())
-            } else {
-                display.brief
-            },
-            input: display.command_preview,
-            output: None,
-            status: None,
-        });
-    }
-    ParallelToolPreviewPayload {
-        brief: brief.to_string(),
-        items,
-    }
-}
-
-fn build_parallel_tool_command_preview(args: &ParallelToolArgs, brief: &str) -> String {
-    build_parallel_preview_payload_text(&build_parallel_preview_payload_from_uses(
-        brief,
-        &args.tool_uses,
-    ))
-}
-
 pub fn describe_function_call(call: &FunctionCall) -> FunctionCallDisplay {
+    if call.name == "command"
+        && let Ok(args) = serde_json::from_str::<CommandArgs>(&call.arguments)
+        && !args.cmd.trim().is_empty()
+    {
+        let target_prefix = match args.target {
+            CommandTarget::Local => "",
+            CommandTarget::Ssh => "ssh · ",
+        };
+        return FunctionCallDisplay {
+            brief: resolve_exec_command_brief(args.brief.as_deref(), args.cmd.as_str()),
+            kind_label: match args.target {
+                CommandTarget::Local => "Command".to_string(),
+                CommandTarget::Ssh => "Command · SSH".to_string(),
+            },
+            action_label: "Run".to_string(),
+            command_preview: format!("{target_prefix}{}", args.cmd),
+        };
+    }
     if call.name == "exec_command"
         && let Ok(args) = serde_json::from_str::<ExecCommandArgs>(&call.arguments)
         && !args.cmd.trim().is_empty()
@@ -1601,19 +4282,84 @@ pub fn describe_function_call(call: &FunctionCall) -> FunctionCallDisplay {
             command_preview: args.cmd,
         };
     }
-    if call.name == "write_stdin"
-        && let Ok(args) = serde_json::from_str::<WriteStdinArgs>(&call.arguments)
+    if call.name == "pty_run"
+        && let Ok(args) = serde_json::from_str::<PtyRunArgs>(&call.arguments)
     {
-        let preview = if args.chars.trim().is_empty() {
-            format!("session {} · (wait for terminal output)", args.session_id)
-        } else {
-            format!("session {} · {}", args.session_id, args.chars.trim_end())
+        let target_prefix = match args.target {
+            CommandTarget::Local => "",
+            CommandTarget::Ssh => "ssh · ",
         };
         return FunctionCallDisplay {
-            brief: default_tool_brief("write_stdin"),
+            brief: resolve_exec_command_brief(args.brief.as_deref(), args.cmd.as_str()),
+            kind_label: match args.target {
+                CommandTarget::Local => "TERMINAL".to_string(),
+                CommandTarget::Ssh => "TERMINAL · SSH".to_string(),
+            },
+            action_label: "启动中".to_string(),
+            command_preview: format!(
+                "{target_prefix}{}",
+                build_pty_run_preview(args.name.as_deref(), args.cmd.as_str())
+            ),
+        };
+    }
+    if call.name == "server_manage"
+        && let Ok(args) = serde_json::from_str::<ServerManageArgs>(&call.arguments)
+    {
+        let action = server_manage_action_key(args.action.as_str());
+        return FunctionCallDisplay {
+            brief: resolve_server_manage_brief(args.brief.as_deref(), action.as_str()),
+            kind_label: "Server".to_string(),
+            action_label: server_manage_action_label(action.as_str()).to_string(),
+            command_preview: format!("action={action}"),
+        };
+    }
+    if call.name == "server_split"
+        && let Ok(args) = serde_json::from_str::<ServerSplitArgs>(&call.arguments)
+    {
+        let action = server_split_action_key(args.action.as_str());
+        return FunctionCallDisplay {
+            brief: resolve_server_split_brief(args.brief.as_deref(), action.as_str()),
+            kind_label: "Server".to_string(),
+            action_label: server_split_action_label(action.as_str()).to_string(),
+            command_preview: build_server_split_input_preview(&args),
+        };
+    }
+    if call.name == "persona_manage"
+        && let Ok(args) = parse_persona_manage_arguments(call.arguments.as_str())
+    {
+        let action = persona_manage_action_key(&args);
+        return FunctionCallDisplay {
+            brief: resolve_persona_manage_brief(args.brief.as_deref(), &args),
+            kind_label: "Persona".to_string(),
+            action_label: persona_manage_action_label(action.as_str()).to_string(),
+            command_preview: build_persona_manage_input_preview(&args),
+        };
+    }
+    if call.name == "pty_input"
+        && let Ok(args) = serde_json::from_str::<PtyInputArgs>(&call.arguments)
+    {
+        let selector =
+            build_pty_selector_preview(args.session_id, args.pid, args.name.as_deref(), "pty");
+        let preview = if args.chars.trim().is_empty() {
+            format!("{selector} · (empty input)")
+        } else {
+            format!("{selector} · {}", args.chars.trim_end())
+        };
+        return FunctionCallDisplay {
+            brief: default_tool_brief("pty_input"),
             kind_label: "TERMINAL".to_string(),
-            action_label: terminal_input_pending_action_label(args.chars.as_str()),
+            action_label: pty_input_pending_action_label(args.chars.as_str()),
             command_preview: preview,
+        };
+    }
+    if call.name == "pty_wait"
+        && let Ok(args) = serde_json::from_str::<PtyWaitArgs>(&call.arguments)
+    {
+        return FunctionCallDisplay {
+            brief: default_tool_brief("pty_wait"),
+            kind_label: "TERMINAL".to_string(),
+            action_label: "等待中".to_string(),
+            command_preview: build_pty_wait_preview(&args),
         };
     }
     if call.name == "view_image"
@@ -1624,6 +4370,26 @@ pub fn describe_function_call(call: &FunctionCall) -> FunctionCallDisplay {
             kind_label: "Image".to_string(),
             action_label: "View".to_string(),
             command_preview: build_view_image_input_preview(args.path.as_str()),
+        };
+    }
+    if call.name == "draw_image"
+        && let Ok(args) = serde_json::from_str::<DrawImageArgs>(&call.arguments)
+    {
+        return FunctionCallDisplay {
+            brief: resolve_draw_image_brief(args.brief.as_deref(), args.prompt.as_str()),
+            kind_label: "Image".to_string(),
+            action_label: "Draw".to_string(),
+            command_preview: build_draw_image_input_preview(&args),
+        };
+    }
+    if call.name == "browser"
+        && let Ok(args) = serde_json::from_str::<BrowserArgs>(&call.arguments)
+    {
+        return FunctionCallDisplay {
+            brief: resolve_browser_brief(args.brief.as_deref(), &args),
+            kind_label: "BROWSER".to_string(),
+            action_label: browser_action_label(&args).to_string(),
+            command_preview: build_browser_input_preview(&args),
         };
     }
     if call.name == "apply_patch"
@@ -1658,10 +4424,50 @@ pub fn describe_function_call(call: &FunctionCall) -> FunctionCallDisplay {
             command_preview: build_context_manage_input_preview(&args),
         };
     }
-    if call.name == "task_mode"
-        && let Ok(args) = parse_task_mode_arguments(call.arguments.as_str())
+    if call.name == "context_compact"
+        && let Ok(args) = parse_context_compact_arguments(call.arguments.as_str())
     {
-        let context_args = task_mode_to_context_manage_args(args);
+        let (kind_label, action_label) = context_compact_labels(&args);
+        return FunctionCallDisplay {
+            brief: normalize_brief(args.brief.as_deref())
+                .unwrap_or_else(|| "快速压缩上下文".to_string()),
+            kind_label,
+            action_label,
+            command_preview: build_context_compact_input_preview(&args),
+        };
+    }
+    if call.name == "context_summary"
+        && let Ok(args) = parse_context_summary_arguments(call.arguments.as_str())
+    {
+        let (kind_label, action_label) = context_summary_labels(&args);
+        return FunctionCallDisplay {
+            brief: normalize_brief(args.brief.as_deref())
+                .unwrap_or_else(|| "折叠上下文条目".to_string()),
+            kind_label,
+            action_label,
+            command_preview: build_context_summary_input_preview(&args),
+        };
+    }
+    if call.name == "context_vision"
+        && let Ok(args) = parse_context_vision_arguments(call.arguments.as_str())
+    {
+        let (kind_label, action_label) = context_vision_labels(&args);
+        return FunctionCallDisplay {
+            brief: normalize_brief(args.brief.as_deref()).unwrap_or_else(|| {
+                format!(
+                    "上下文返回阈值约 {}%",
+                    resolve_context_vision_percent(&args).unwrap_or(67)
+                )
+            }),
+            kind_label,
+            action_label,
+            command_preview: build_context_vision_input_preview(&args),
+        };
+    }
+    if call.name == "focus_mode"
+        && let Ok(args) = parse_focus_mode_arguments(call.arguments.as_str())
+    {
+        let context_args = focus_mode_to_context_manage_args(args);
         let (kind_label, action_label) = context_manage_labels(&context_args);
         return FunctionCallDisplay {
             brief: resolve_context_manage_brief(context_args.brief.as_deref(), &context_args),
@@ -1670,18 +4476,18 @@ pub fn describe_function_call(call: &FunctionCall) -> FunctionCallDisplay {
             command_preview: build_context_manage_input_preview(&context_args),
         };
     }
-    if call.name == "toolbox_manage"
-        && let Ok(args) = parse_toolbox_manage_arguments(call.arguments.as_str())
+    if matches!(call.name.as_str(), "tool_manage" | "toolbox_manage")
+        && let Ok(args) = parse_tool_manage_arguments(call.arguments.as_str())
     {
         return FunctionCallDisplay {
-            brief: resolve_toolbox_manage_brief(args.brief.as_deref(), &args),
-            kind_label: "Toolbox".to_string(),
+            brief: resolve_tool_manage_brief(args.brief.as_deref(), &args),
+            kind_label: "ToolManage".to_string(),
             action_label: "Manage".to_string(),
-            command_preview: build_toolbox_manage_input_preview(&args),
+            command_preview: build_tool_manage_input_preview(&args),
         };
     }
     if call.name == "memory_add"
-        && let Ok(args) = serde_json::from_str::<MemoryAddArgs>(&call.arguments)
+        && let Ok(args) = parse_memory_add_arguments(call.arguments.as_str())
     {
         return FunctionCallDisplay {
             brief: resolve_memory_add_brief(&args),
@@ -1690,18 +4496,8 @@ pub fn describe_function_call(call: &FunctionCall) -> FunctionCallDisplay {
             command_preview: build_memory_add_input_preview(&args),
         };
     }
-    if call.name == "memory_replace"
-        && let Ok(args) = serde_json::from_str::<MemoryReplaceArgs>(&call.arguments)
-    {
-        return FunctionCallDisplay {
-            brief: resolve_memory_replace_brief(&args),
-            kind_label: "Memory".to_string(),
-            action_label: "Replace".to_string(),
-            command_preview: build_memory_replace_input_preview(&args),
-        };
-    }
     if call.name == "memory_check"
-        && let Ok(args) = serde_json::from_str::<MemoryCheckArgs>(&call.arguments)
+        && let Ok(args) = parse_memory_check_arguments(call.arguments.as_str())
     {
         return FunctionCallDisplay {
             brief: resolve_memory_check_brief(&args),
@@ -1710,18 +4506,8 @@ pub fn describe_function_call(call: &FunctionCall) -> FunctionCallDisplay {
             command_preview: build_memory_check_input_preview(&args),
         };
     }
-    if call.name == "memory_search"
-        && let Ok(args) = serde_json::from_str::<MemorySearchArgs>(&call.arguments)
-    {
-        return FunctionCallDisplay {
-            brief: resolve_memory_search_brief(&args),
-            kind_label: "Memory".to_string(),
-            action_label: "Search".to_string(),
-            command_preview: build_memory_search_input_preview(&args),
-        };
-    }
     if call.name == "memory_read"
-        && let Ok(args) = serde_json::from_str::<MemoryReadArgs>(&call.arguments)
+        && let Ok(args) = parse_memory_read_arguments(call.arguments.as_str())
     {
         return FunctionCallDisplay {
             brief: resolve_memory_read_brief(&args),
@@ -1730,25 +4516,14 @@ pub fn describe_function_call(call: &FunctionCall) -> FunctionCallDisplay {
             command_preview: build_memory_read_input_preview(&args),
         };
     }
-    if call.name == "multi_tool_use.parallel"
-        && let Ok(args) = serde_json::from_str::<ParallelToolArgs>(&call.arguments)
-    {
-        let brief = resolve_parallel_tool_brief(&args);
-        return FunctionCallDisplay {
-            brief: brief.clone(),
-            kind_label: "Explore".to_string(),
-            action_label: "Run".to_string(),
-            command_preview: build_parallel_tool_command_preview(&args, brief.as_str()),
-        };
-    }
-    if call.name == "request_user_input"
-        && let Ok(args) = parse_request_user_input_arguments(call.arguments.as_str())
+    if call.name == "ask_user"
+        && let Ok(args) = parse_ask_user_arguments(call.arguments.as_str())
     {
         return FunctionCallDisplay {
-            brief: derive_request_user_input_brief(&args),
+            brief: derive_ask_user_brief(&args),
             kind_label: "对账".to_string(),
             action_label: "发起".to_string(),
-            command_preview: build_request_user_input_preview(&args),
+            command_preview: build_ask_user_preview(&args),
         };
     }
     if call.name == "spawn_agent"
@@ -1801,26 +4576,7 @@ pub fn describe_function_call(call: &FunctionCall) -> FunctionCallDisplay {
             brief: default_tool_brief("list_agent"),
             kind_label: "Agent".to_string(),
             action_label: "List".to_string(),
-            command_preview: "全部子代理（含已关闭）".to_string(),
-        };
-    }
-    if call.name == "resume_agent"
-        && let Ok(args) = serde_json::from_str::<SingleAgentArgs>(&call.arguments)
-    {
-        let command_preview = args
-            .resolved_ids()
-            .map(|ids| {
-                ids.into_iter()
-                    .map(|id| agent_label_text(id.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_else(|_| call.arguments.clone());
-        return FunctionCallDisplay {
-            brief: default_tool_brief("resume_agent"),
-            kind_label: "Agent".to_string(),
-            action_label: "Resume".to_string(),
-            command_preview,
+            command_preview: "当前活动子代理".to_string(),
         };
     }
     if call.name == "close_agent"
@@ -1842,42 +4598,25 @@ pub fn describe_function_call(call: &FunctionCall) -> FunctionCallDisplay {
             command_preview,
         };
     }
-    if call.name == "spawn_agents_on_csv"
-        && let Ok(args) = serde_json::from_str::<SpawnAgentsOnCsvArgs>(&call.arguments)
-    {
-        return FunctionCallDisplay {
-            brief: default_tool_brief("spawn_agents_on_csv"),
-            kind_label: "Batch".to_string(),
-            action_label: "Run".to_string(),
-            command_preview: format!(
-                "{} · {}",
-                args.csv_path,
-                truncate_preview(args.instruction.as_str(), 72)
-            ),
-        };
-    }
-    if call.name == "report_agent_job_result"
-        && let Ok(args) = serde_json::from_str::<ReportAgentJobResultArgs>(&call.arguments)
-    {
-        return FunctionCallDisplay {
-            brief: default_tool_brief("report_agent_job_result"),
-            kind_label: "Batch".to_string(),
-            action_label: "Report".to_string(),
-            command_preview: format!("{} · {}", args.job_id, args.item_id),
-        };
-    }
     if call.name == "pty_kill"
         && let Ok(args) = serde_json::from_str::<PtyKillArgs>(&call.arguments)
     {
-        let command_preview = args
-            .resolved_session_ids()
-            .map(|ids| {
+        let command_preview = args.resolved_session_ids().map_or_else(
+            |_| {
+                build_pty_selector_preview(
+                    args.session_id,
+                    args.pid,
+                    args.name.as_deref(),
+                    call.arguments.as_str(),
+                )
+            },
+            |ids| {
                 ids.into_iter()
                     .map(|id| format!("session_id={id}"))
                     .collect::<Vec<_>>()
                     .join("\n")
-            })
-            .unwrap_or_else(|_| call.arguments.clone());
+            },
+        );
         return FunctionCallDisplay {
             brief: default_tool_brief("pty_kill"),
             kind_label: "TERMINAL".to_string(),
@@ -1891,6 +4630,30 @@ pub fn describe_function_call(call: &FunctionCall) -> FunctionCallDisplay {
             kind_label: "TERMINAL".to_string(),
             action_label: "List".to_string(),
             command_preview: "(list running terminal sessions)".to_string(),
+        };
+    }
+    if let Some(manifest) = external_tool_manifest(call.name.as_str()) {
+        let display_spec = resolve_tool_display_spec(
+            manifest.display.as_ref(),
+            manifest.kind_label.as_deref().unwrap_or("External"),
+            manifest.action_label.as_deref().unwrap_or("Run"),
+        );
+        return FunctionCallDisplay {
+            brief: manifest
+                .brief
+                .as_deref()
+                .and_then(|brief| normalize_brief(Some(brief)))
+                .or_else(|| {
+                    if display_spec.brief_template.contains('{') {
+                        None
+                    } else {
+                        normalize_brief(Some(display_spec.brief_template.as_str()))
+                    }
+                })
+                .unwrap_or_else(|| format!("运行外部工具 {}", manifest.name)),
+            kind_label: display_spec.title,
+            action_label: display_spec.action_label,
+            command_preview: call.arguments.clone(),
         };
     }
 
@@ -1936,11 +4699,28 @@ fn is_focus_enter_call(call: &FunctionCall) -> bool {
         "context_manage" => serde_json::from_str::<ContextManageArgs>(&call.arguments)
             .ok()
             .is_some_and(|args| context_manage_action_key(&args) == "focus_enter"),
-        "task_mode" => serde_json::from_str::<TaskModeArgs>(&call.arguments)
+        "focus_mode" => serde_json::from_str::<FocusModeArgs>(&call.arguments)
             .ok()
-            .is_some_and(|args| task_mode_action_key(&args) == "task_enter"),
+            .is_some_and(|args| focus_mode_action_key(&args) == "focus_enter"),
         _ => false,
     }
+}
+
+fn focus_gate_allows_recovery_call(call: &FunctionCall) -> bool {
+    matches!(
+        call.name.trim(),
+        "update_plan"
+            | "tool_manage"
+            | "focus_mode"
+            | "persona_manage"
+            | "server_split"
+            | "command"
+            | "exec_command"
+            | "context_manage"
+            | "context_summary"
+            | "context_compact"
+            | "context_vision"
+    ) || is_focus_enter_call(call)
 }
 
 fn focus_gate_failure(
@@ -1953,10 +4733,10 @@ fn focus_gate_failure(
         call.name.as_str(),
         call_display.brief.clone(),
         call_display.kind_label.clone(),
-        call_display.action_label.clone(),
+        "Rejected".to_string(),
         Some(call_display.command_preview.clone()),
         anyhow::anyhow!(
-            "当前任务已列出计划，后续复杂执行必须先进入任务模式。请先调用 task_mode.enter（兼容 context_manage.task_enter），再继续当前工具。\nplan_summary: {}",
+            "当前任务已列出计划，后续复杂执行必须先进入专注模式。请先调用 focus_mode.enter，再继续当前工具；旧 enter 别名仍可解析，但不建议继续使用。\nplan_summary: {}",
             summary.trim()
         ),
     )
@@ -1967,20 +4747,19 @@ fn dispatch_function_call(
     runtime_ctx: Option<&ToolRuntimeContext>,
     call_display: &FunctionCallDisplay,
 ) -> ExecutedFunctionCall {
-    if call.name != "update_plan"
-        && !is_focus_enter_call(call)
+    if !focus_gate_allows_recovery_call(call)
         && let Ok(Some(summary)) = crate::context::focus_required_summary()
     {
         return focus_gate_failure(call, call_display, summary.as_str());
     }
     match call.name.as_str() {
-        "multi_tool_use.parallel" => run_exec_style_tool(
+        "command" => run_exec_style_tool(
             call,
             call_display,
-            "multi_tool_use.parallel",
-            "Explore".to_string(),
-            "Failed".to_string(),
-            || execute_parallel_tool(call.call_id.as_str(), call.arguments.as_str(), runtime_ctx),
+            "command",
+            "Command".to_string(),
+            call_display.action_label.clone(),
+            || execute_command(call.arguments.as_str()),
         ),
         "exec_command" => run_exec_style_tool(
             call,
@@ -1998,17 +4777,33 @@ fn dispatch_function_call(
             },
             || execute_exec_command(call.call_id.as_str(), call.arguments.as_str()),
         ),
-        "write_stdin" => run_exec_style_tool(
+        "pty_run" => run_exec_style_tool(
             call,
             call_display,
-            "write_stdin",
+            "pty_run",
             call_display.kind_label.clone(),
-            if let Ok(args) = serde_json::from_str::<WriteStdinArgs>(&call.arguments) {
-                terminal_input_action_label(args.chars.as_str(), true)
+            "启动失败".to_string(),
+            || execute_pty_run(call.call_id.as_str(), call.arguments.as_str()),
+        ),
+        "pty_input" => run_exec_style_tool(
+            call,
+            call_display,
+            "pty_input",
+            "TERMINAL".to_string(),
+            if let Ok(args) = serde_json::from_str::<PtyInputArgs>(&call.arguments) {
+                pty_input_action_label(args.chars.as_str(), true)
             } else {
                 call_display.action_label.clone()
             },
-            || execute_write_stdin(call.arguments.as_str()),
+            || execute_pty_input(call.arguments.as_str()),
+        ),
+        "pty_wait" => run_exec_style_tool(
+            call,
+            call_display,
+            "pty_wait",
+            "TERMINAL".to_string(),
+            "等待失败".to_string(),
+            || execute_pty_wait(call.arguments.as_str()),
         ),
         "view_image" => run_exec_style_tool(
             call,
@@ -2017,6 +4812,46 @@ fn dispatch_function_call(
             "Image".to_string(),
             "Failed".to_string(),
             || execute_view_image(call.arguments.as_str()),
+        ),
+        "draw_image" => run_exec_style_tool(
+            call,
+            call_display,
+            "draw_image",
+            "Image".to_string(),
+            "Failed".to_string(),
+            || execute_draw_image(call.arguments.as_str(), runtime_ctx),
+        ),
+        "browser" => run_exec_style_tool(
+            call,
+            call_display,
+            "browser",
+            "BROWSER".to_string(),
+            "Failed".to_string(),
+            || execute_browser(call.arguments.as_str()),
+        ),
+        "server_manage" => run_exec_style_tool(
+            call,
+            call_display,
+            "server_manage",
+            "Server".to_string(),
+            "Failed".to_string(),
+            || execute_server_manage(call.arguments.as_str()),
+        ),
+        "server_split" => run_exec_style_tool(
+            call,
+            call_display,
+            "server_split",
+            "Server".to_string(),
+            "Failed".to_string(),
+            || execute_server_split(call.arguments.as_str()),
+        ),
+        "persona_manage" => run_exec_style_tool(
+            call,
+            call_display,
+            "persona_manage",
+            "Persona".to_string(),
+            "Failed".to_string(),
+            || execute_persona_manage(call.arguments.as_str()),
         ),
         "apply_patch" => run_exec_style_tool(
             call,
@@ -2042,21 +4877,45 @@ fn dispatch_function_call(
             "Failed".to_string(),
             || execute_context_manage(call.arguments.as_str()),
         ),
-        "task_mode" => run_exec_style_tool(
+        "context_compact" => run_exec_style_tool(
             call,
             call_display,
-            "task_mode",
+            "context_compact",
             call_display.kind_label.clone(),
             "Failed".to_string(),
-            || execute_task_mode(call.arguments.as_str()),
+            || execute_context_compact(call.arguments.as_str()),
         ),
-        "toolbox_manage" => run_exec_style_tool(
+        "context_summary" => run_exec_style_tool(
             call,
             call_display,
-            "toolbox_manage",
-            "Toolbox".to_string(),
+            "context_summary",
+            call_display.kind_label.clone(),
             "Failed".to_string(),
-            || execute_toolbox_manage(call.arguments.as_str()),
+            || execute_context_summary(call.arguments.as_str()),
+        ),
+        "context_vision" => run_exec_style_tool(
+            call,
+            call_display,
+            "context_vision",
+            call_display.kind_label.clone(),
+            "Failed".to_string(),
+            || execute_context_vision(call.arguments.as_str()),
+        ),
+        "focus_mode" => run_exec_style_tool(
+            call,
+            call_display,
+            "focus_mode",
+            call_display.kind_label.clone(),
+            "Failed".to_string(),
+            || execute_focus_mode(call.arguments.as_str()),
+        ),
+        "tool_manage" | "toolbox_manage" => run_exec_style_tool(
+            call,
+            call_display,
+            "tool_manage",
+            "ToolManage".to_string(),
+            "Failed".to_string(),
+            || execute_tool_manage(call.arguments.as_str()),
         ),
         "memory_add" => run_exec_style_tool(
             call,
@@ -2066,14 +4925,6 @@ fn dispatch_function_call(
             "Failed".to_string(),
             || execute_memory_add(call.arguments.as_str()),
         ),
-        "memory_replace" => run_exec_style_tool(
-            call,
-            call_display,
-            "memory_replace",
-            "Memory".to_string(),
-            "Failed".to_string(),
-            || execute_memory_replace(call.arguments.as_str()),
-        ),
         "memory_check" => run_exec_style_tool(
             call,
             call_display,
@@ -2081,14 +4932,6 @@ fn dispatch_function_call(
             "Memory".to_string(),
             "Failed".to_string(),
             || execute_memory_check(call.arguments.as_str()),
-        ),
-        "memory_search" => run_exec_style_tool(
-            call,
-            call_display,
-            "memory_search",
-            "Memory".to_string(),
-            "Failed".to_string(),
-            || execute_memory_search(call.arguments.as_str()),
         ),
         "memory_read" => run_exec_style_tool(
             call,
@@ -2098,13 +4941,13 @@ fn dispatch_function_call(
             "Failed".to_string(),
             || execute_memory_read(call.arguments.as_str()),
         ),
-        "request_user_input" => run_exec_style_tool(
+        "ask_user" => run_exec_style_tool(
             call,
             call_display,
-            "request_user_input",
+            "ask_user",
             "Prompt".to_string(),
             "Failed".to_string(),
-            || execute_request_user_input(call.call_id.as_str(), call.arguments.as_str()),
+            || execute_ask_user(call.call_id.as_str(), call.arguments.as_str()),
         ),
         "spawn_agent" => run_exec_style_tool(
             call,
@@ -2138,14 +4981,6 @@ fn dispatch_function_call(
             "Failed".to_string(),
             || execute_list_agent(call.arguments.as_str()),
         ),
-        "resume_agent" => run_exec_style_tool(
-            call,
-            call_display,
-            "resume_agent",
-            "Agent".to_string(),
-            "Failed".to_string(),
-            || execute_resume_agent(call.arguments.as_str()),
-        ),
         "close_agent" => run_exec_style_tool(
             call,
             call_display,
@@ -2153,22 +4988,6 @@ fn dispatch_function_call(
             "Agent".to_string(),
             "Failed".to_string(),
             || execute_close_agent(call.arguments.as_str()),
-        ),
-        "spawn_agents_on_csv" => run_exec_style_tool(
-            call,
-            call_display,
-            "spawn_agents_on_csv",
-            "Batch".to_string(),
-            "Failed".to_string(),
-            || execute_spawn_agents_on_csv(call.arguments.as_str(), runtime_ctx),
-        ),
-        "report_agent_job_result" => run_exec_style_tool(
-            call,
-            call_display,
-            "report_agent_job_result",
-            "Batch".to_string(),
-            "Failed".to_string(),
-            || execute_report_agent_job_result(call.arguments.as_str()),
         ),
         "pty_list" => {
             let output = terminal::list_sessions_tool();
@@ -2182,7 +5001,7 @@ fn dispatch_function_call(
                     command_preview: Some(output.command_preview),
                     output_preview: output.output_preview,
                     exit_code: output.exit_code,
-                    history_entry_id: None,
+                    toolmemory_entry_id: None,
                     archived_output: None,
                 },
             )
@@ -2198,7 +5017,7 @@ fn dispatch_function_call(
                     command_preview: Some(output.command_preview),
                     output_preview: output.output_preview,
                     exit_code: output.exit_code,
-                    history_entry_id: None,
+                    toolmemory_entry_id: None,
                     archived_output: None,
                 },
             ),
@@ -2212,6 +5031,14 @@ fn dispatch_function_call(
                 err,
             ),
         },
+        other if external_tool_manifest(other).is_some() => run_exec_style_tool(
+            call,
+            call_display,
+            other,
+            call_display.kind_label.clone(),
+            call_display.action_label.clone(),
+            || execute_external_tool(other, call.arguments.as_str(), call_display),
+        ),
         other => {
             let output_preview = format!("unsupported function call: {other}");
             build_executed_function_text_output(
@@ -2224,7 +5051,7 @@ fn dispatch_function_call(
                     command_preview: Some(call_display.command_preview.clone()),
                     output_preview,
                     exit_code: None,
-                    history_entry_id: None,
+                    toolmemory_entry_id: None,
                     archived_output: None,
                 },
             )
@@ -2233,58 +5060,149 @@ fn dispatch_function_call(
 }
 
 fn tool_allowed_for_persona(persona: crate::PersonaKind, name: &str) -> bool {
-    match persona {
-        crate::PersonaKind::Matrix => matches!(
-            name,
-            "exec_command"
-                | "write_stdin"
-                | "view_image"
-                | "toolbox_manage"
-                | "web_search"
-                | "apply_patch"
-                | "request_user_input"
-                | "update_plan"
-                | "task_mode"
-                | "context_manage"
-                | "memory_add"
-                | "memory_replace"
-                | "memory_check"
-                | "memory_search"
-                | "memory_read"
-                | "spawn_agent"
-                | "send_input"
-                | "wait_agent"
-                | "list_agent"
-                | "resume_agent"
-                | "close_agent"
-                | "spawn_agents_on_csv"
-                | "pty_list"
-                | "pty_kill"
-                | "multi_tool_use.parallel"
-        ),
-        crate::PersonaKind::Coding => matches!(
-            name,
-            "exec_command"
-                | "multi_tool_use.parallel"
-                | "apply_patch"
-                | "request_user_input"
-                | "task_mode"
-                | "context_manage"
-                | "update_plan"
-        ),
-        crate::PersonaKind::Companion => true,
-    }
+    ToolContractRegistry::tool_allowed_for_persona(persona, name)
 }
 
 fn context_manage_allowed_for_persona(persona: crate::PersonaKind, arguments: &str) -> bool {
     let Ok(_args) = parse_context_manage_arguments(arguments) else {
         return false;
     };
-    match persona {
-        crate::PersonaKind::Matrix | crate::PersonaKind::Coding | crate::PersonaKind::Companion => {
-            true
-        }
+    matches!(
+        persona,
+        crate::PersonaKind::Matrix | crate::PersonaKind::Advisor
+    )
+}
+
+fn focus_mode_allowed_for_persona(_persona: crate::PersonaKind, arguments: &str) -> bool {
+    parse_focus_mode_arguments(arguments).is_ok()
+}
+
+fn context_compact_allowed_for_persona(persona: crate::PersonaKind, arguments: &str) -> bool {
+    let Ok(args) = parse_context_compact_arguments(arguments) else {
+        return false;
+    };
+    args.persona
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+        || matches!(
+            persona,
+            crate::PersonaKind::Matrix | crate::PersonaKind::Advisor
+        )
+}
+
+fn context_summary_allowed_for_persona(persona: crate::PersonaKind, arguments: &str) -> bool {
+    let Ok(args) = parse_context_summary_arguments(arguments) else {
+        return false;
+    };
+    args.persona
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+        || matches!(
+            persona,
+            crate::PersonaKind::Matrix | crate::PersonaKind::Advisor
+        )
+}
+
+fn context_vision_allowed_for_persona(persona: crate::PersonaKind, arguments: &str) -> bool {
+    let Ok(args) = parse_context_vision_arguments(arguments) else {
+        return false;
+    };
+    args.persona
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+        || matches!(
+            persona,
+            crate::PersonaKind::Matrix | crate::PersonaKind::Advisor
+        )
+}
+
+fn reject_function_call(
+    call: &FunctionCall,
+    call_display: &FunctionCallDisplay,
+    action_label: &str,
+    err: anyhow::Error,
+) -> ExecutedFunctionCall {
+    build_executed_function_failure(
+        call.call_id.as_str(),
+        call.name.as_str(),
+        call_display.brief.clone(),
+        call_display.kind_label.clone(),
+        action_label.to_string(),
+        Some(call_display.command_preview.clone()),
+        err,
+    )
+}
+
+fn validate_function_call_access(call: &FunctionCall, persona: crate::PersonaKind) -> Result<()> {
+    let access_name = match call.name.as_str() {
+        "exec_command" => "command",
+        other => other,
+    };
+    if !tool_allowed_for_persona(persona, access_name) {
+        let persona_label = persona.header_badge();
+        return Err(anyhow!(
+            "当前 persona `{persona_label}` 不支持工具 `{}`",
+            call.name
+        ));
     }
+
+    let projection = ProviderToolProjection::current();
+    if let Some(reason) = projection.rejection_reason(access_name) {
+        return Err(anyhow!(reason));
+    }
+
+    if call.name.as_str() == "context_manage"
+        && !context_manage_allowed_for_persona(persona, call.arguments.as_str())
+    {
+        let persona_label = persona.header_badge();
+        return Err(anyhow!(
+            "当前 persona `{persona_label}` 不支持本次任务/上下文管理调用"
+        ));
+    }
+
+    if call.name.as_str() == "focus_mode"
+        && !focus_mode_allowed_for_persona(persona, call.arguments.as_str())
+    {
+        let persona_label = persona.header_badge();
+        return Err(anyhow!(
+            "当前 persona `{persona_label}` 不支持本次任务/上下文管理调用"
+        ));
+    }
+
+    if call.name.as_str() == "context_compact"
+        && !context_compact_allowed_for_persona(persona, call.arguments.as_str())
+    {
+        let persona_label = persona.header_badge();
+        return Err(anyhow!(
+            "当前 persona `{persona_label}` 不支持本次 context_compact 调用"
+        ));
+    }
+
+    if call.name.as_str() == "context_summary"
+        && !context_summary_allowed_for_persona(persona, call.arguments.as_str())
+    {
+        let persona_label = persona.header_badge();
+        return Err(anyhow!(
+            "当前 persona `{persona_label}` 不支持本次 context_summary 调用"
+        ));
+    }
+
+    if call.name.as_str() == "context_vision"
+        && !context_vision_allowed_for_persona(persona, call.arguments.as_str())
+    {
+        let persona_label = persona.header_badge();
+        return Err(anyhow!(
+            "当前 persona `{persona_label}` 不支持本次 context_vision 调用"
+        ));
+    }
+
+    Ok(())
 }
 
 pub fn execute_function_call(
@@ -2292,12 +5210,14 @@ pub fn execute_function_call(
     runtime_ctx: Option<&ToolRuntimeContext>,
 ) -> ExecutedFunctionCall {
     #[cfg(test)]
-    if call.name == "exec_command" {
-        EXEC_COMMAND_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+    if matches!(call.name.as_str(), "exec_command" | "command") {
+        COMMAND_FAMILY_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
     }
 
     let call_display = describe_function_call(call);
     let persona = current_tool_persona();
+    let started_at = Instant::now();
+    let started_at_unix = crate::unix_timestamp_secs_shared();
 
     let _ = crate::departmentrs::log_event(
         "INFO",
@@ -2308,43 +5228,55 @@ pub fn execute_function_call(
             "brief": call_display.brief,
         }),
     );
+    let _ = crate::aidebug::write_tool_event(
+        crate::app_project_root().as_path(),
+        "mcp.function_call.start",
+        json!({
+            "persona": persona.context_dir_name(),
+            "call_id": call.call_id.as_str(),
+            "tool_name": call.name.as_str(),
+            "brief": call_display.brief.as_str(),
+            "kind_label": call_display.kind_label.as_str(),
+            "action_label": call_display.action_label.as_str(),
+            "input_chars": call_display.command_preview.chars().count(),
+            "input_preview": truncate_output(call_display.command_preview.as_str(), Some(80)),
+        }),
+    );
 
-    if !tool_allowed_for_persona(persona, call.name.as_str()) {
-        let persona_label = match persona {
-            crate::PersonaKind::Matrix => "MATRIX",
-            crate::PersonaKind::Coding => "CODING",
-            crate::PersonaKind::Companion => "COMPANION",
-        };
-        return build_executed_function_failure(
-            call.call_id.as_str(),
+    let execution = if let Err(err) = validate_function_call_access(call, persona) {
+        reject_function_call(call, &call_display, "Rejected", err)
+    } else {
+        apply_default_tool_output_budget(
+            call,
+            dispatch_function_call(call, runtime_ctx, &call_display),
+        )
+    };
+    let requested_percent = extract_context_visibility_hint(call.arguments.as_str());
+    let reason = if call.name.as_str() == "context_vision" {
+        parse_context_vision_arguments(call.arguments.as_str())
+            .ok()
+            .and_then(|args| args.reason.clone())
+    } else {
+        None
+    };
+    if execution.exit_code.is_some() {
+        let _ = crate::context::record_tool_context_visibility_request(
+            requested_percent,
             call.name.as_str(),
-            call_display.brief.clone(),
-            call_display.kind_label.clone(),
-            "Rejected".to_string(),
-            Some(call_display.command_preview.clone()),
-            anyhow!("当前 persona `{persona_label}` 不支持工具 `{}`", call.name),
+            reason.as_deref(),
         );
     }
-    if matches!(call.name.as_str(), "context_manage" | "task_mode")
-        && !context_manage_allowed_for_persona(persona, call.arguments.as_str())
-    {
-        let persona_label = match persona {
-            crate::PersonaKind::Matrix => "MATRIX",
-            crate::PersonaKind::Coding => "CODING",
-            crate::PersonaKind::Companion => "COMPANION",
-        };
-        return build_executed_function_failure(
-            call.call_id.as_str(),
-            call.name.as_str(),
-            call_display.brief.clone(),
-            call_display.kind_label.clone(),
-            "Rejected".to_string(),
-            Some(call_display.command_preview.clone()),
-            anyhow!("当前 persona `{persona_label}` 不支持本次任务/上下文管理调用"),
-        );
-    }
-
-    let execution = dispatch_function_call(call, runtime_ctx, &call_display);
+    let elapsed_ms = started_at.elapsed().as_millis() as u64;
+    let finished_at_unix = crate::unix_timestamp_secs_shared();
+    let envelope = build_tool_output_envelope(
+        call,
+        &call_display,
+        &execution,
+        persona,
+        started_at_unix,
+        finished_at_unix,
+        elapsed_ms,
+    );
 
     let _ = crate::departmentrs::log_event(
         "INFO",
@@ -2354,6 +5286,55 @@ pub fn execute_function_call(
             "name": call.name,
             "brief": execution.brief,
             "output_chars": execution.output_preview.chars().count(),
+            "elapsed_ms": elapsed_ms,
+        }),
+    );
+    let _ = crate::aidebug::write_tool_event(
+        crate::app_project_root().as_path(),
+        "tool.envelope.created",
+        json!({
+            "persona": persona.context_dir_name(),
+            "tool_name": call.name.as_str(),
+            "call_id": call.call_id.as_str(),
+            "envelope": envelope.clone(),
+        }),
+    );
+    if !envelope.output_refs.is_empty() {
+        let _ = crate::aidebug::write_tool_event(
+            crate::app_project_root().as_path(),
+            "tool.output.externalized",
+            json!({
+                "persona": persona.context_dir_name(),
+                "tool_name": call.name.as_str(),
+                "call_id": call.call_id.as_str(),
+                "refs": envelope.output_refs,
+            }),
+        );
+    }
+    let failed = matches!(
+        tool_status_from_execution(call.name.as_str(), &execution),
+        ToolRunStatus::Error | ToolRunStatus::Cancelled | ToolRunStatus::Timeout
+    );
+    let _ = crate::aidebug::write_tool_event(
+        crate::app_project_root().as_path(),
+        "mcp.function_call.done",
+        json!({
+            "persona": persona.context_dir_name(),
+            "call_id": call.call_id.as_str(),
+            "tool_name": call.name.as_str(),
+            "brief": execution.brief.as_str(),
+            "kind_label": execution.kind_label.as_str(),
+            "action_label": execution.action_label.as_str(),
+            "input_chars": call_display.command_preview.chars().count(),
+            "output_chars": execution.output_preview.chars().count(),
+            "input_preview": truncate_output(call_display.command_preview.as_str(), Some(80)),
+            "output_preview": truncate_output(execution.output_preview.as_str(), Some(100)),
+            "elapsed_ms": elapsed_ms,
+            "exit_code": execution.exit_code,
+            "toolmemory_entry_id": execution.toolmemory_entry_id,
+            "archived": execution.archived_output.is_some(),
+            "status": tool_status_from_execution(call.name.as_str(), &execution),
+            "failed": failed,
         }),
     );
 
@@ -2361,27 +5342,13 @@ pub fn execute_function_call(
 }
 
 #[cfg(test)]
-pub fn reset_test_exec_command_call_count() {
-    EXEC_COMMAND_CALL_COUNT.store(0, Ordering::SeqCst);
+pub fn reset_test_command_family_call_count() {
+    COMMAND_FAMILY_CALL_COUNT.store(0, Ordering::SeqCst);
 }
 
 #[cfg(test)]
-pub fn test_exec_command_call_count() -> usize {
-    EXEC_COMMAND_CALL_COUNT.load(Ordering::SeqCst)
-}
-
-pub fn prepare_command_output_dir() -> Result<()> {
-    prepare_command_output_dir_at(command_output_dir().as_path())?;
-    prepare_command_output_dir_at(
-        projectying_root()
-            .join(COMMAND_OUTPUT_ADB_REL_PATH)
-            .as_path(),
-    )?;
-    prepare_command_output_dir_at(
-        projectying_root()
-            .join(COMMAND_OUTPUT_TERMUX_API_REL_PATH)
-            .as_path(),
-    )
+pub fn test_command_family_call_count() -> usize {
+    COMMAND_FAMILY_CALL_COUNT.load(Ordering::SeqCst)
 }
 
 pub fn prepare_terminal_output_dir() -> Result<()> {
@@ -2391,7 +5358,7 @@ pub fn prepare_terminal_output_dir() -> Result<()> {
 pub fn prepare_multiagent_output_dir() -> Result<()> {
     fs::create_dir_all(multiagent_output_dir()).with_context(|| {
         format!(
-            "创建 multiagentoutput 目录失败：{}",
+            "创建 multiagent output 目录失败：{}",
             multiagent_output_dir().display()
         )
     })
@@ -2401,7 +5368,7 @@ pub fn prepare_multiagent_output_dir() -> Result<()> {
 // 执行站：命令 / PTY / stdin / kill 主入口与参数归一
 // =============================================================================
 
-fn build_executed_function_call(
+struct ExecutedFunctionCallFields {
     output_items: Vec<Value>,
     brief: String,
     kind_label: String,
@@ -2409,37 +5376,171 @@ fn build_executed_function_call(
     command_preview: Option<String>,
     output_preview: String,
     exit_code: Option<i32>,
-    history_entry_id: Option<u64>,
+    toolmemory_entry_id: Option<u64>,
     archived_output: Option<String>,
-) -> ExecutedFunctionCall {
+}
+
+fn build_executed_function_call(fields: ExecutedFunctionCallFields) -> ExecutedFunctionCall {
     ExecutedFunctionCall {
-        output_items,
-        brief,
-        kind_label,
-        action_label,
-        command_preview,
-        output_preview,
-        exit_code,
-        history_entry_id,
-        archived_output,
+        output_items: fields.output_items,
+        brief: fields.brief,
+        kind_label: fields.kind_label,
+        action_label: fields.action_label,
+        command_preview: fields.command_preview,
+        output_preview: fields.output_preview,
+        exit_code: fields.exit_code,
+        toolmemory_entry_id: fields.toolmemory_entry_id,
+        archived_output: fields.archived_output,
     }
+}
+
+fn runtime_default_tool_output_level() -> CommandOutputLevel {
+    crate::settings::load_runtime_context_settings().default_tool_output_level()
+}
+
+fn update_primary_tool_output_item(output_items: &mut [Value], text: &str) {
+    for item in output_items {
+        if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
+            item["output"] = Value::String(text.to_string());
+            break;
+        }
+    }
+}
+
+fn merge_archived_tool_output(primary_output: Option<&str>, output_preview: &str) -> String {
+    match primary_output
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .filter(|text| *text != output_preview.trim())
+    {
+        Some(primary_output) => format!(
+            "[model_output]\n{}\n\n[ui_output_preview]\n{}",
+            primary_output.trim(),
+            output_preview.trim()
+        ),
+        None => output_preview.to_string(),
+    }
+}
+
+fn format_tool_output_archive_note(
+    entry_id: Option<u64>,
+    save_reason: &str,
+    bytes: usize,
+    lines: usize,
+    chars: usize,
+) -> String {
+    let entry_label = entry_id
+        .map(|entry_id| format!("entry_id={entry_id}"))
+        .unwrap_or_else(|| "entry_id=pending".to_string());
+    let lookup_hint = entry_id
+        .map(|entry_id| {
+            format!(
+                "Use memory_check target=toolmemory entry_id={entry_id} keywords=[...] to locate lines, then memory_read target=toolmemory entry_id={entry_id} line_start=N line_end=M."
+            )
+        })
+        .unwrap_or_else(|| {
+            "Use memory_check target=toolmemory entry_id=<tool entry id> keywords=[...] to locate lines, then memory_read target=toolmemory line_start=N line_end=M."
+                .to_string()
+        });
+    format!(
+        "[Tool output truncated · {entry_label} · line_range=1-{lines}] {save_reason} · {bytes} bytes · {lines} lines · {chars} chars\n{lookup_hint}"
+    )
+}
+
+fn summarize_generic_tool_text(
+    text: &str,
+    budget: &CommandOutputBudget,
+    toolmemory_entry_id: Option<u64>,
+) -> Option<String> {
+    let bytes = text.len();
+    let chars = text.chars().count();
+    let lines = count_lines(text);
+    let save_reason = command_output_save_reason(bytes, lines, chars, budget)?;
+    let preview = build_head_tail_preview(
+        text,
+        COMMAND_OUTPUT_PREVIEW_MAX_LINES.min(budget.inline_lines),
+        COMMAND_OUTPUT_PREVIEW_MAX_CHARS.min(budget.inline_chars),
+    );
+    Some(format!(
+        "{}\n{}",
+        format_tool_output_archive_note(
+            toolmemory_entry_id,
+            save_reason.display_text(),
+            bytes,
+            lines,
+            chars,
+        ),
+        preview
+    ))
+}
+
+fn apply_default_tool_output_budget(
+    call: &FunctionCall,
+    mut execution: ExecutedFunctionCall,
+) -> ExecutedFunctionCall {
+    if matches!(
+        call.name.as_str(),
+        "exec_command" | "command" | "pty_run" | "pty_input" | "pty_wait" | "pty_list" | "pty_kill"
+    ) || execution.archived_output.is_some()
+    {
+        return execution;
+    }
+    let budget =
+        runtime_tool_output_settings().budget_for_level(runtime_default_tool_output_level());
+    let original_output_preview = execution.output_preview.clone();
+    let primary_output = extract_primary_tool_output_text(&execution.output_items);
+    let needs_truncation = primary_output
+        .as_deref()
+        .and_then(|text| summarize_generic_tool_text(text, &budget, None))
+        .is_some()
+        || summarize_generic_tool_text(original_output_preview.as_str(), &budget, None).is_some();
+    if !needs_truncation {
+        return execution;
+    }
+    if execution.toolmemory_entry_id.is_none() {
+        execution.toolmemory_entry_id = crate::memory::reserve_toolmemory_entry_id().ok();
+    }
+    let toolmemory_entry_id = execution.toolmemory_entry_id;
+    let truncated_primary = primary_output
+        .as_deref()
+        .and_then(|text| summarize_generic_tool_text(text, &budget, toolmemory_entry_id));
+    let truncated_preview = summarize_generic_tool_text(
+        original_output_preview.as_str(),
+        &budget,
+        toolmemory_entry_id,
+    );
+    if let Some(text) = truncated_primary.as_deref() {
+        update_primary_tool_output_item(&mut execution.output_items, text);
+    }
+    if let Some(text) = truncated_preview {
+        execution.output_preview = text;
+    }
+    execution.archived_output = Some(merge_archived_tool_output(
+        primary_output.as_deref(),
+        original_output_preview.as_str(),
+    ));
+    execution
 }
 
 fn build_executed_function_from_exec(
     call_id: &str,
     output: ExecCommandExecution,
 ) -> ExecutedFunctionCall {
-    build_executed_function_call(
-        build_tool_output_items(call_id, output.model_output, output.extra_output_items),
-        output.brief,
-        output.kind_label,
-        output.action_label,
-        Some(output.command_preview),
-        output.output_preview,
-        output.exit_code,
-        output.history_entry_id,
-        output.archived_output,
-    )
+    build_executed_function_call(ExecutedFunctionCallFields {
+        output_items: build_tool_output_items(
+            call_id,
+            output.model_output,
+            output.extra_output_items,
+        ),
+        brief: output.brief,
+        kind_label: output.kind_label,
+        action_label: output.action_label,
+        command_preview: Some(output.command_preview),
+        output_preview: output.output_preview,
+        exit_code: output.exit_code,
+        toolmemory_entry_id: output.toolmemory_entry_id,
+        archived_output: output.archived_output,
+    })
 }
 
 struct ExecutedFunctionTextOutput {
@@ -2450,7 +5551,7 @@ struct ExecutedFunctionTextOutput {
     command_preview: Option<String>,
     output_preview: String,
     exit_code: Option<i32>,
-    history_entry_id: Option<u64>,
+    toolmemory_entry_id: Option<u64>,
     archived_output: Option<String>,
 }
 
@@ -2458,17 +5559,17 @@ fn build_executed_function_text_output(
     call_id: &str,
     output: ExecutedFunctionTextOutput,
 ) -> ExecutedFunctionCall {
-    build_executed_function_call(
-        vec![function_call_output_item(call_id, output.model_output)],
-        output.brief,
-        output.kind_label,
-        output.action_label,
-        output.command_preview,
-        output.output_preview,
-        output.exit_code,
-        output.history_entry_id,
-        output.archived_output,
-    )
+    build_executed_function_call(ExecutedFunctionCallFields {
+        output_items: vec![function_call_output_item(call_id, output.model_output)],
+        brief: output.brief,
+        kind_label: output.kind_label,
+        action_label: output.action_label,
+        command_preview: output.command_preview,
+        output_preview: output.output_preview,
+        exit_code: output.exit_code,
+        toolmemory_entry_id: output.toolmemory_entry_id,
+        archived_output: output.archived_output,
+    })
 }
 
 fn build_executed_function_failure(
@@ -2481,17 +5582,17 @@ fn build_executed_function_failure(
     err: anyhow::Error,
 ) -> ExecutedFunctionCall {
     let output_preview = format!("{failure_label} failed: {err:#}");
-    build_executed_function_call(
-        vec![function_call_output_item(call_id, output_preview.clone())],
+    build_executed_function_call(ExecutedFunctionCallFields {
+        output_items: vec![function_call_output_item(call_id, output_preview.clone())],
         brief,
         kind_label,
         action_label,
         command_preview,
         output_preview,
-        None,
-        None,
-        None,
-    )
+        exit_code: Some(1),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    })
 }
 
 fn build_tool_output_items(
@@ -2513,152 +5614,6 @@ fn extract_primary_tool_output_text(output_items: &[Value]) -> Option<String> {
                     .map(str::to_string)
             })
             .flatten()
-    })
-}
-
-fn collect_parallel_extra_output_items(output_items: &[Value]) -> Vec<Value> {
-    output_items
-        .iter()
-        .filter(|item| item.get("type").and_then(Value::as_str) != Some("function_call_output"))
-        .cloned()
-        .collect()
-}
-
-fn execute_parallel_tool(
-    call_id: &str,
-    arguments: &str,
-    runtime_ctx: Option<&ToolRuntimeContext>,
-) -> Result<ExecCommandExecution> {
-    #[derive(Debug, Clone)]
-    struct PlannedParallelTool {
-        call: FunctionCall,
-        action: String,
-        brief: String,
-        input: String,
-        tool_name: String,
-    }
-
-    let args = serde_json::from_str::<ParallelToolArgs>(arguments)
-        .context("解析 multi_tool_use.parallel 参数失败")?;
-    if args.tool_uses.is_empty() {
-        return Err(anyhow!("tool_uses 不能为空"));
-    }
-    if args.tool_uses.len() > PARALLEL_TOOL_MAX_USES {
-        return Err(anyhow!(
-            "multi_tool_use.parallel 最多支持 {} 项",
-            PARALLEL_TOOL_MAX_USES
-        ));
-    }
-
-    let persona = current_tool_persona();
-    let brief = resolve_parallel_tool_brief(&args);
-    let command_preview = build_parallel_tool_command_preview(&args, brief.as_str());
-    let runtime_ctx_owned = runtime_ctx.cloned();
-    let mut planned = Vec::with_capacity(args.tool_uses.len());
-
-    for (index, tool_use) in args.tool_uses.iter().enumerate() {
-        let tool_name = strip_parallel_recipient_name(tool_use.recipient_name.as_str());
-        if tool_name.is_empty() {
-            return Err(anyhow!("tool_uses[{}].recipient_name 不能为空", index + 1));
-        }
-        if tool_name == "multi_tool_use.parallel" {
-            return Err(anyhow!("multi_tool_use.parallel 不支持嵌套调用"));
-        }
-        if !parallel_tool_allowed_for_persona(persona, tool_name.as_str()) {
-            return Err(anyhow!("当前 persona 不支持并行调用工具 `{}`", tool_name));
-        }
-        let arguments = serde_json::to_string(&tool_use.parameters)
-            .with_context(|| format!("序列化并行子工具 `{tool_name}` 参数失败"))?;
-        let call = FunctionCall {
-            call_id: format!("{call_id}::{}", index + 1),
-            name: tool_name.clone(),
-            arguments,
-        };
-        let display = describe_function_call(&call);
-        planned.push(PlannedParallelTool {
-            action: parallel_tool_action(tool_name.as_str(), display.command_preview.as_str())
-                .to_string(),
-            brief: if display.brief.trim().is_empty() {
-                default_tool_brief(tool_name.as_str())
-            } else {
-                display.brief
-            },
-            input: display.command_preview,
-            tool_name,
-            call,
-        });
-    }
-
-    let mut handles = Vec::with_capacity(planned.len());
-    for plan in planned.iter().cloned() {
-        let runtime_ctx = runtime_ctx_owned.clone();
-        handles.push(thread::spawn(move || {
-            set_tool_persona(persona);
-            let execution = execute_function_call(&plan.call, runtime_ctx.as_ref());
-            (plan, execution)
-        }));
-    }
-
-    let mut preview_items = Vec::with_capacity(handles.len());
-    let mut model_sections = Vec::with_capacity(handles.len());
-    let mut extra_output_items = Vec::new();
-    let mut had_failure = false;
-
-    for handle in handles {
-        let (plan, execution) = handle
-            .join()
-            .map_err(|_| anyhow!("multi_tool_use.parallel 子任务线程异常退出"))?;
-        let model_output = extract_primary_tool_output_text(&execution.output_items)
-            .unwrap_or_else(|| execution.output_preview.clone());
-        extra_output_items.extend(collect_parallel_extra_output_items(&execution.output_items));
-        let failed = execution.action_label.trim().eq_ignore_ascii_case("failed")
-            || model_output.contains(" failed:");
-        if failed {
-            had_failure = true;
-        }
-        preview_items.push(ParallelToolPreviewItem {
-            tool_name: plan.tool_name.clone(),
-            action: plan.action.clone(),
-            brief: plan.brief.clone(),
-            input: plan.input.clone(),
-            output: Some(execution.output_preview.clone()),
-            status: failed.then(|| "failed".to_string()),
-        });
-        model_sections.push(format!(
-            "[{}] {} · {}\nTool: {}\nInput:\n{}\nOutput:\n{}",
-            preview_items.len(),
-            plan.action,
-            plan.brief,
-            plan.tool_name,
-            plan.input,
-            model_output
-        ));
-    }
-
-    let model_output = format!(
-        "Parallel explore\nBrief: {}\nItems: {}\n\n{}",
-        brief,
-        preview_items.len(),
-        model_sections.join("\n\n")
-    );
-    Ok(ExecCommandExecution {
-        brief: brief.clone(),
-        kind_label: "Explore".to_string(),
-        action_label: if had_failure {
-            "Completed".to_string()
-        } else {
-            "Done".to_string()
-        },
-        model_output,
-        command_preview,
-        output_preview: build_parallel_preview_payload_text(&ParallelToolPreviewPayload {
-            brief,
-            items: preview_items,
-        }),
-        exit_code: Some(if had_failure { 1 } else { 0 }),
-        extra_output_items,
-        history_entry_id: None,
-        archived_output: None,
     })
 }
 
@@ -2705,36 +5660,9 @@ fn move_finished_background_command(snapshot: BackgroundCommandSnapshot) {
     }
 }
 
-fn running_background_output_group_keys(family: ExecCommandFamily) -> HashSet<String> {
-    let registry = BACKGROUND_COMMAND_REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let Ok(guard) = registry.lock() else {
-        return HashSet::new();
-    };
-    guard
-        .values()
-        .filter_map(|shared| {
-            let Ok(state) = shared.lock() else {
-                return None;
-            };
-            (classify_exec_command_family(state.cmd.as_str()) == family)
-                .then_some(format!("background-{}", state.job_id))
-        })
-        .collect()
-}
-
-fn prune_command_output_dir_for_family(family: ExecCommandFamily) -> Result<()> {
-    let protected = running_background_output_group_keys(family);
-    let _ = prune_output_dir_groups(
-        command_output_dir_for_family(family).as_path(),
-        OUTPUT_DIR_RETENTION_MAX_ENTRIES,
-        OUTPUT_DIR_RETENTION_PRUNE_COUNT,
-        &protected,
-    )?;
-    Ok(())
-}
-
 fn background_snapshot_from_shared(state: &BackgroundCommandShared) -> BackgroundCommandSnapshot {
     BackgroundCommandSnapshot {
+        persona: state.persona,
         job_id: state.job_id,
         brief: state.brief.clone(),
         cmd: state.cmd.clone(),
@@ -2750,38 +5678,6 @@ fn background_snapshot_from_shared(state: &BackgroundCommandShared) -> Backgroun
         output_lines: state.output_lines,
         output_tail: state.output_tail.clone(),
     }
-}
-
-fn background_command_paths_for_family(
-    job_id: u64,
-    family: ExecCommandFamily,
-) -> (PathBuf, PathBuf) {
-    let dir = command_output_dir_for_family(family);
-    (
-        dir.join(format!("background-{job_id}.log")),
-        dir.join(format!("background-{job_id}.status")),
-    )
-}
-
-fn write_background_command_status_file(
-    path: &Path,
-    phase: &str,
-    snapshot: &BackgroundCommandSnapshot,
-) {
-    let lines = [
-        format!("phase:{phase}"),
-        format!("job_id:{}", snapshot.job_id),
-        format!("running:{}", snapshot.running),
-        format!("timed_out:{}", snapshot.timed_out),
-        format!("exit_code:{}", snapshot.exit_code.unwrap_or(-1)),
-        format!("pid:{}", snapshot.pid.unwrap_or(0)),
-        format!("elapsed_ms:{}", snapshot.started_at.elapsed().as_millis()),
-        format!("output_bytes:{}", snapshot.output_bytes),
-        format!("output_lines:{}", snapshot.output_lines),
-        format!("log:{}", snapshot.saved_path),
-    ]
-    .join("\n");
-    let _ = fs::write(path, lines);
 }
 
 fn update_background_command_output(shared: &Arc<Mutex<BackgroundCommandShared>>, bytes: &[u8]) {
@@ -2861,7 +5757,6 @@ fn path_str(path: &Path) -> String {
 fn spawn_background_command_reader<R: Read + Send + 'static>(
     mut reader: R,
     shared: Arc<Mutex<BackgroundCommandShared>>,
-    file: Arc<Mutex<fs::File>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut buffer = [0u8; 8192];
@@ -2870,10 +5765,6 @@ fn spawn_background_command_reader<R: Read + Send + 'static>(
                 Ok(0) => break,
                 Ok(read) => {
                     let bytes = &buffer[..read];
-                    if let Ok(mut guard) = file.lock() {
-                        let _ = guard.write_all(bytes);
-                        let _ = guard.flush();
-                    }
                     update_background_command_output(&shared, bytes);
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -2890,6 +5781,57 @@ fn read_background_command_capture(shared: &Arc<Mutex<BackgroundCommandShared>>)
         .unwrap_or_default()
 }
 
+fn background_command_archive_pending_label() -> String {
+    "toolmemory:pending".to_string()
+}
+
+fn background_command_runtime_label() -> String {
+    "memory:runtime".to_string()
+}
+
+fn background_command_archive_entry_label(entry_id: u64) -> String {
+    format!("toolmemory:{entry_id}")
+}
+
+fn persist_background_command_toolmemory(
+    snapshot: &BackgroundCommandSnapshot,
+    archived_output: &str,
+) -> Option<u64> {
+    let entry_id = crate::memory::reserve_toolmemory_entry_id().ok();
+    let output_preview = build_head_tail_preview(
+        archived_output,
+        COMMAND_OUTPUT_PREVIEW_MAX_LINES.min(64),
+        COMMAND_OUTPUT_PREVIEW_MAX_CHARS.min(8_000),
+    );
+    let output_preview = if output_preview.trim().is_empty() {
+        format_background_command_report("Background Command Done", snapshot)
+    } else {
+        output_preview
+    };
+    let tool = crate::provider::ToolCallDone {
+        call_id: format!("background-command-{}", snapshot.job_id),
+        name: "command".to_string(),
+        brief: snapshot.brief.clone(),
+        kind_label: "Command".to_string(),
+        action_label: if snapshot.timed_out {
+            "Timeout".to_string()
+        } else {
+            "Ran".to_string()
+        },
+        command_preview: snapshot.cmd.clone(),
+        output_preview,
+        exit_code: snapshot.exit_code,
+        toolmemory_entry_id: entry_id,
+        archived_output: Some(archived_output.to_string()),
+        meta: None,
+        replay_call_item_json: None,
+        replay_output_item_jsons: Vec::new(),
+    };
+    crate::memory::append_tool_event_with_context_entry_ids(None, &tool, &[])
+        .ok()
+        .and(entry_id)
+}
+
 fn format_background_command_preview(snapshot: &BackgroundCommandSnapshot) -> String {
     let elapsed = snapshot.started_at.elapsed().as_secs();
     let state = if snapshot.running {
@@ -2903,8 +5845,8 @@ fn format_background_command_preview(snapshot: &BackgroundCommandSnapshot) -> St
         "{state} · #{} · {}s · {} bytes · {} lines",
         snapshot.job_id, elapsed, snapshot.output_bytes, snapshot.output_lines
     )];
-    lines.push(format!("log:{}", snapshot.saved_path));
-    lines.push(format!("status_file:{}", snapshot.status_path));
+    lines.push(format!("archive:{}", snapshot.saved_path));
+    lines.push("realtime:memory-only".to_string());
     if snapshot.running {
         lines.push(format!("notice:{}", running_wait_notice_zh()));
     }
@@ -2928,8 +5870,8 @@ fn format_background_command_start_model_output(snapshot: &BackgroundCommandSnap
         format!("Brief: {}", snapshot.brief),
         format!("Command: {}", snapshot.cmd),
         format!("Workdir: {}", snapshot.workdir),
-        format!("Log: {}", snapshot.saved_path),
-        format!("Status File: {}", snapshot.status_path),
+        format!("Archive: {}", snapshot.saved_path),
+        "Realtime: memory-only".to_string(),
     ];
     append_running_wait_guidance(&mut lines);
     lines.join("\n")
@@ -2963,8 +5905,8 @@ fn format_background_command_report(title: &str, snapshot: &BackgroundCommandSna
         "cmd:{}",
         truncate_with_ellipsis(clean_cmd(snapshot.cmd.as_str()).as_str(), 320)
     ));
-    lines.push(format!("log:{}", snapshot.saved_path));
-    lines.push(format!("status_file:{}", snapshot.status_path));
+    lines.push(format!("archive:{}", snapshot.saved_path));
+    lines.push("realtime:memory-only".to_string());
     lines.push(format!(
         "stats:{} bytes | {} lines",
         snapshot.output_bytes, snapshot.output_lines
@@ -3089,6 +6031,7 @@ fn finalize_background_command_state(
         return background_snapshot_from_shared(&state);
     }
     BackgroundCommandSnapshot {
+        persona: current_tool_persona(),
         job_id: 0,
         brief: String::new(),
         cmd: String::new(),
@@ -3134,6 +6077,7 @@ fn spawn_background_command_runtime(
                             .lock()
                             .map(|state| background_snapshot_from_shared(&state))
                             .unwrap_or_else(|_| BackgroundCommandSnapshot {
+                                persona: current_tool_persona(),
                                 job_id: 0,
                                 brief: String::new(),
                                 cmd: String::new(),
@@ -3149,11 +6093,6 @@ fn spawn_background_command_runtime(
                                 output_lines: 0,
                                 output_tail: String::new(),
                             });
-                        write_background_command_status_file(
-                            Path::new(snapshot.status_path.as_str()),
-                            "running",
-                            &snapshot,
-                        );
                         emit_background_command_event(BackgroundCommandEvent::Progress {
                             tool_text: format_background_command_report(
                                 "Background Command Progress",
@@ -3170,17 +6109,15 @@ fn spawn_background_command_runtime(
         };
         let _ = stdout_handle.join();
         let _ = stderr_handle.join();
-        let snapshot = finalize_background_command_state(&shared, exit_code, timed_out);
-        write_background_command_status_file(
-            Path::new(snapshot.status_path.as_str()),
-            if timed_out { "timeout" } else { "done" },
-            &snapshot,
-        );
+        let mut snapshot = finalize_background_command_state(&shared, exit_code, timed_out);
+        let archived_output = read_background_command_capture(&shared);
+        if let Some(entry_id) =
+            persist_background_command_toolmemory(&snapshot, archived_output.as_str())
+        {
+            snapshot.saved_path = background_command_archive_entry_label(entry_id);
+        }
         remove_running_background_command(snapshot.job_id);
         move_finished_background_command(snapshot.clone());
-        let _ = prune_command_output_dir_for_family(classify_exec_command_family(
-            snapshot.cmd.as_str(),
-        ));
         emit_background_command_event(BackgroundCommandEvent::Done {
             tool_text: format_background_command_report("Background Command Done", &snapshot),
             snapshot,
@@ -3188,50 +6125,151 @@ fn spawn_background_command_runtime(
     });
 }
 
-fn execute_exec_command(call_id: &str, arguments: &str) -> Result<ExecCommandExecution> {
-    let args: ExecCommandArgs =
-        serde_json::from_str(arguments).context("解析 exec_command 参数失败")?;
+fn execute_command(arguments: &str) -> Result<ExecCommandExecution> {
+    let args: CommandArgs = serde_json::from_str(arguments).context("解析 command 参数失败")?;
     confirm_dangerous_command_if_needed(args.cmd.as_str())?;
-    if args.tty {
-        let workdir = resolve_workdir(args.workdir.as_deref())?;
-        let shell = resolve_shell(args.shell.as_deref());
-        let login = args.login.unwrap_or(true);
-        let brief = resolve_exec_command_brief(args.brief.as_deref(), args.cmd.as_str());
-        let mode = classify_tty_mode(args.cmd.as_str());
-        let timeout_secs = match (mode, args.timeout_secs) {
-            (_, Some(value)) => Some(value),
-            (terminal::TerminalMode::Interactive, None) => Some(0),
-            (terminal::TerminalMode::Background, None) => None,
-        };
-        let report_interval_secs = args
-            .report_interval_secs
-            .or(Some(runtime_terminal_audit_interval_secs()));
-        let output = terminal::exec_background_command(terminal::ExecRequest {
-            call_id: Some(call_id.to_string()),
-            cmd: args.cmd.clone(),
-            brief: brief.clone(),
-            workdir,
-            shell,
-            login,
-            yield_time_ms: args.yield_time_ms,
-            timeout_secs,
-            report_interval_secs,
-            mode,
-            owner: terminal::TerminalOwner::AiTool,
-        })?;
-        return Ok(ExecCommandExecution {
-            brief,
-            kind_label: "TERMINAL".to_string(),
-            action_label: "启动成功".to_string(),
-            model_output: output.model_output,
-            command_preview: output.command_preview,
-            output_preview: output.output_preview,
-            exit_code: output.exit_code,
-            extra_output_items: Vec::new(),
-            history_entry_id: None,
-            archived_output: None,
-        });
+    execute_command_core(prepare_command_args_for_target(args)?)
+}
+
+fn prepare_command_args_for_target(mut args: CommandArgs) -> Result<CommandArgs> {
+    match args.target {
+        CommandTarget::Local => Ok(args),
+        CommandTarget::Ssh => {
+            let remote_cmd = args.cmd.clone();
+            if args
+                .brief
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                args.brief = Some(resolve_exec_command_brief(None, remote_cmd.as_str()));
+            }
+            let spec = build_server_ssh_command(
+                Some(args.cmd.as_str()),
+                args.server_id.as_deref(),
+                args.server_name.as_deref(),
+            )?;
+            args.cmd = spec.run_cmd;
+            args.display_cmd = Some(spec.display_cmd);
+            args.env_overrides = spec.env_overrides;
+            args.target = CommandTarget::Local;
+            Ok(args)
+        }
     }
+}
+
+fn server_ssh_askpass_helper_path() -> PathBuf {
+    crate::app_config_root()
+        .join("runtime")
+        .join(SERVER_SSH_ASKPASS_SCRIPT)
+}
+
+fn ensure_server_ssh_askpass_helper() -> Result<PathBuf> {
+    let path = server_ssh_askpass_helper_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建 server askpass 目录失败：{}", parent.display()))?;
+    }
+    let script = format!("#!/bin/sh\nprintf '%s\\n' \"${{{SERVER_SSH_ASKPASS_PASSWORD_ENV}}}\"\n");
+    let should_write = fs::read_to_string(&path)
+        .map(|current| current != script)
+        .unwrap_or(true);
+    if should_write {
+        fs::write(&path, script)
+            .with_context(|| format!("写入 server askpass helper 失败：{}", path.display()))?;
+    }
+    let mut permissions = fs::metadata(&path)
+        .with_context(|| format!("读取 server askpass helper 权限失败：{}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions)
+        .with_context(|| format!("设置 server askpass helper 权限失败：{}", path.display()))?;
+    Ok(path)
+}
+
+fn build_server_ssh_command(
+    remote_cmd: Option<&str>,
+    server_id: Option<&str>,
+    server_name: Option<&str>,
+) -> Result<SshCommandSpec> {
+    if !matches!(current_tool_persona(), crate::PersonaKind::Server) {
+        return Err(anyhow!("SSH target 只允许 Server · 御 使用"));
+    }
+    let settings = crate::settings::resolve_server_ssh_settings_for_persona(
+        crate::PersonaKind::Server,
+        server_id,
+        server_name,
+    )?;
+    let host = settings.host.trim();
+    let user = settings.user.trim();
+    if host.is_empty() {
+        return Err(anyhow!(
+            "Server SSH host 未配置，请先在御的 Settings 中填写 host"
+        ));
+    }
+    if user.is_empty() {
+        return Err(anyhow!(
+            "Server SSH user 未配置，请先在御的 Settings 中填写 user"
+        ));
+    }
+    if !command_binary_available("ssh") {
+        return Err(anyhow!("本机未找到 ssh，请先安装 openssh"));
+    }
+    let password = settings.password.clone();
+    let password_configured = !password.trim().is_empty();
+    let mut parts = vec![
+        "ssh".to_string(),
+        "-p".to_string(),
+        shell_quote(settings.port.to_string().as_str()),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+        "-o".to_string(),
+        "ServerAliveInterval=30".to_string(),
+    ];
+    let key_path = normalize_ssh_key_path(settings.key_path.as_str());
+    if !key_path.is_empty() {
+        if !Path::new(key_path.as_str()).exists() {
+            return Err(anyhow!("Server SSH key_path 不存在：{key_path}"));
+        }
+        parts.push("-i".to_string());
+        parts.push(shell_quote(key_path.as_str()));
+    }
+    if password_configured {
+        parts.push("-o".to_string());
+        parts.push("NumberOfPasswordPrompts=1".to_string());
+    }
+    parts.push("--".to_string());
+    parts.push(shell_quote(format!("{user}@{host}").as_str()));
+    let remote_cmd = remote_cmd.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(remote_cmd) = remote_cmd {
+        parts.push(shell_quote(remote_cmd));
+    }
+
+    let mut env_overrides = Vec::new();
+    if password_configured {
+        let askpass_path = ensure_server_ssh_askpass_helper()?;
+        env_overrides.push((
+            "SSH_ASKPASS".to_string(),
+            askpass_path.to_string_lossy().to_string(),
+        ));
+        env_overrides.push(("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()));
+        env_overrides.push(("DISPLAY".to_string(), ":0".to_string()));
+        env_overrides.push((SERVER_SSH_ASKPASS_PASSWORD_ENV.to_string(), password));
+        if command_binary_available("setsid") {
+            parts.insert(0, "-w".to_string());
+            parts.insert(0, "setsid".to_string());
+        }
+    }
+    let remote_suffix = remote_cmd
+        .map(|cmd| format!(" -- {cmd}"))
+        .unwrap_or_default();
+    Ok(SshCommandSpec {
+        run_cmd: parts.join(" "),
+        display_cmd: format!("ssh {user}@{host}{remote_suffix}"),
+        env_overrides,
+    })
+}
+
+fn execute_command_core(args: CommandArgs) -> Result<ExecCommandExecution> {
     let started = Instant::now();
     let chunk_id = make_chunk_id();
     let job_id = NEXT_BACKGROUND_COMMAND_ID
@@ -3240,12 +6278,14 @@ fn execute_exec_command(call_id: &str, arguments: &str) -> Result<ExecCommandExe
     let workdir = resolve_workdir(args.workdir.as_deref())?;
     let shell = resolve_shell(args.shell.as_deref());
     let login = args.login.unwrap_or(true);
-    let brief = resolve_exec_command_brief(args.brief.as_deref(), args.cmd.as_str());
+    let run_cmd = args.cmd.clone();
+    let display_cmd = args.display_cmd.clone().unwrap_or_else(|| run_cmd.clone());
+    let brief = resolve_exec_command_brief(args.brief.as_deref(), display_cmd.as_str());
     let output_budget =
         resolve_command_output_budget(args.output_level, &runtime_tool_output_settings())?;
-    let command_family = classify_exec_command_family(args.cmd.as_str());
-    prepare_command_output_dir_for_family(command_family)?;
-    let (saved_path, status_path) = background_command_paths_for_family(job_id, command_family);
+    let command_family = classify_exec_command_family(run_cmd.as_str());
+    let saved_path = background_command_archive_pending_label();
+    let status_path = background_command_runtime_label();
 
     let mut command = Command::new(&shell);
     command.current_dir(&workdir);
@@ -3254,9 +6294,12 @@ fn execute_exec_command(call_id: &str, arguments: &str) -> Result<ExecCommandExe
     }
     command
         .arg("-c")
-        .arg(args.cmd.as_str())
+        .arg(run_cmd.as_str())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (key, value) in &args.env_overrides {
+        command.env(key, value);
+    }
 
     let mut child = command
         .spawn()
@@ -3264,16 +6307,14 @@ fn execute_exec_command(call_id: &str, arguments: &str) -> Result<ExecCommandExe
     let stdout = child.stdout.take().context("读取 stdout 管道失败")?;
     let stderr = child.stderr.take().context("读取 stderr 管道失败")?;
     let pid = Some(child.id());
-    let file = Arc::new(Mutex::new(fs::File::create(&saved_path).with_context(
-        || format!("创建后台命令日志失败：{}", saved_path.display()),
-    )?));
     let shared = Arc::new(Mutex::new(BackgroundCommandShared {
+        persona: current_tool_persona(),
         job_id,
         brief: brief.clone(),
-        cmd: args.cmd.clone(),
+        cmd: display_cmd.clone(),
         workdir: path_str(&workdir),
-        saved_path: saved_path.to_string_lossy().to_string(),
-        status_path: status_path.to_string_lossy().to_string(),
+        saved_path: saved_path.clone(),
+        status_path: status_path.clone(),
         started_at: started,
         pid,
         running: true,
@@ -3288,12 +6329,13 @@ fn execute_exec_command(call_id: &str, arguments: &str) -> Result<ExecCommandExe
         .lock()
         .map(|state| background_snapshot_from_shared(&state))
         .unwrap_or_else(|_| BackgroundCommandSnapshot {
+            persona: current_tool_persona(),
             job_id,
             brief: brief.clone(),
-            cmd: args.cmd.clone(),
+            cmd: display_cmd.clone(),
             workdir: path_str(&workdir),
-            saved_path: saved_path.to_string_lossy().to_string(),
-            status_path: status_path.to_string_lossy().to_string(),
+            saved_path: saved_path.clone(),
+            status_path: status_path.clone(),
             started_at: started,
             pid,
             running: true,
@@ -3303,13 +6345,13 @@ fn execute_exec_command(call_id: &str, arguments: &str) -> Result<ExecCommandExe
             output_lines: 0,
             output_tail: String::new(),
         });
-    write_background_command_status_file(status_path.as_path(), "starting", &initial_snapshot);
-
-    let stdout_handle = spawn_background_command_reader(stdout, shared.clone(), file.clone());
-    let stderr_handle = spawn_background_command_reader(stderr, shared.clone(), file.clone());
+    let stdout_handle = spawn_background_command_reader(stdout, shared.clone());
+    let stderr_handle = spawn_background_command_reader(stderr, shared.clone());
     let timeout_secs = args
         .timeout_secs
         .unwrap_or(COMMAND_BACKGROUND_DEFAULT_TIMEOUT_SECS);
+    let _compat_yield_time_ms = args.yield_time_ms;
+    let promote_after = Duration::from_secs(COMMAND_BACKGROUND_PROMOTE_SECS);
 
     loop {
         if let Some(status) = child
@@ -3319,20 +6361,14 @@ fn execute_exec_command(call_id: &str, arguments: &str) -> Result<ExecCommandExe
             let _ = stdout_handle.join();
             let _ = stderr_handle.join();
             let exit_code = status.code().unwrap_or(-1);
-            let snapshot = finalize_background_command_state(&shared, Some(exit_code), false);
-            write_background_command_status_file(status_path.as_path(), "done", &snapshot);
-            let mut merged = read_background_command_capture(&shared);
-            if merged.trim().is_empty()
-                && let Ok(text) = fs::read_to_string(&saved_path)
-            {
-                merged = text;
-            }
+            let _ = finalize_background_command_state(&shared, Some(exit_code), false);
+            let merged = read_background_command_capture(&shared);
             let original_token_count = approximate_token_count(merged.as_str());
-            let history_entry_id = crate::memory::reserve_historytool_entry_id().ok();
+            let toolmemory_entry_id = crate::memory::reserve_toolmemory_entry_id().ok();
             let output_summary = summarize_command_output(
                 merged.as_str(),
                 args.max_output_tokens,
-                history_entry_id,
+                toolmemory_entry_id,
                 &output_budget,
                 command_family,
             )?;
@@ -3341,7 +6377,7 @@ fn execute_exec_command(call_id: &str, arguments: &str) -> Result<ExecCommandExe
                 "{} {}{}",
                 shell.display(),
                 if login { "-l -c " } else { "-c " },
-                shell_quote(args.cmd.as_str())
+                shell_quote(display_cmd.as_str())
             );
             let model_output = [
                 format!("Command: {shell_command_preview}"),
@@ -3359,9 +6395,9 @@ fn execute_exec_command(call_id: &str, arguments: &str) -> Result<ExecCommandExe
                     .as_ref()
                     .map(|reason| format!("Output archive reason: {reason}"))
                     .unwrap_or_else(|| "Output archive reason: (not archived)".to_string()),
-                history_entry_id
-                    .map(|entry_id| format!("HistoryTools entry_id: {entry_id}"))
-                    .unwrap_or_else(|| "HistoryTools entry_id: (pending)".to_string()),
+                toolmemory_entry_id
+                    .map(|entry_id| format!("ToolMemory entry_id: {entry_id}"))
+                    .unwrap_or_else(|| "ToolMemory entry_id: (pending)".to_string()),
                 "Output preview:".to_string(),
                 output_summary.model_preview,
             ]
@@ -3371,16 +6407,16 @@ fn execute_exec_command(call_id: &str, arguments: &str) -> Result<ExecCommandExe
                 kind_label: "Command".to_string(),
                 action_label: "Ran".to_string(),
                 model_output,
-                command_preview: args.cmd,
+                command_preview: display_cmd,
                 output_preview: output_summary.ui_preview,
                 exit_code: Some(exit_code),
                 extra_output_items: Vec::new(),
-                history_entry_id,
-                archived_output: Some(merged),
+                toolmemory_entry_id,
+                archived_output: output_summary.save_reason.as_ref().map(|_| merged),
             });
         }
 
-        if started.elapsed().as_secs() >= COMMAND_BACKGROUND_PROMOTE_SECS {
+        if started.elapsed() >= promote_after {
             break;
         }
         thread::sleep(Duration::from_millis(COMMAND_BACKGROUND_WAIT_POLL_MS));
@@ -3390,9 +6426,7 @@ fn execute_exec_command(call_id: &str, arguments: &str) -> Result<ExecCommandExe
         .lock()
         .map(|state| background_snapshot_from_shared(&state))
         .unwrap_or(initial_snapshot);
-    write_background_command_status_file(status_path.as_path(), "running", &snapshot);
     insert_running_background_command(shared.clone());
-    let _ = call_id;
     emit_background_command_event(BackgroundCommandEvent::Ready {
         snapshot: snapshot.clone(),
     });
@@ -3403,13 +6437,2882 @@ fn execute_exec_command(call_id: &str, arguments: &str) -> Result<ExecCommandExe
         kind_label: "Command".to_string(),
         action_label: "Run".to_string(),
         model_output: format_background_command_start_model_output(&snapshot),
-        command_preview: args.cmd,
+        command_preview: display_cmd,
         output_preview: format_background_command_preview(&snapshot),
         exit_code: None,
         extra_output_items: Vec::new(),
-        history_entry_id: None,
+        toolmemory_entry_id: None,
         archived_output: None,
     })
+}
+
+fn execute_legacy_exec_pty(call_id: &str, args: ExecCommandArgs) -> Result<ExecCommandExecution> {
+    let workdir = resolve_workdir(args.workdir.as_deref())?;
+    let shell = resolve_shell(args.shell.as_deref());
+    let login = args.login.unwrap_or(true);
+    let brief = resolve_exec_command_brief(args.brief.as_deref(), args.cmd.as_str());
+    let mode = classify_tty_mode(args.cmd.as_str());
+    let timeout_secs = match (mode, args.timeout_secs) {
+        (_, Some(value)) => Some(value),
+        (terminal::TerminalMode::Interactive, None) => Some(0),
+        (terminal::TerminalMode::Background, None) => None,
+    };
+    let report_interval_secs = args
+        .report_interval_secs
+        .or(Some(runtime_terminal_audit_interval_secs()));
+    let output = terminal::exec_background_command(terminal::ExecRequest {
+        call_id: Some(call_id.to_string()),
+        name: None,
+        cmd: args.cmd.clone(),
+        display_cmd: None,
+        env_overrides: Vec::new(),
+        brief: brief.clone(),
+        workdir,
+        shell,
+        login,
+        yield_time_ms: args.yield_time_ms,
+        timeout_secs,
+        report_interval_secs,
+        mode,
+        owner: terminal::TerminalOwner::AiTool,
+        auto_report_events: true,
+        persona: current_tool_persona(),
+    })?;
+    Ok(ExecCommandExecution {
+        brief,
+        kind_label: "TERMINAL".to_string(),
+        action_label: "启动成功".to_string(),
+        model_output: output.model_output,
+        command_preview: output.command_preview,
+        output_preview: output.output_preview,
+        exit_code: output.exit_code,
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    })
+}
+
+fn execute_exec_command(call_id: &str, arguments: &str) -> Result<ExecCommandExecution> {
+    let args: ExecCommandArgs =
+        serde_json::from_str(arguments).context("解析 exec_command 参数失败")?;
+    confirm_dangerous_command_if_needed(args.cmd.as_str())?;
+    if args.tty {
+        return execute_legacy_exec_pty(call_id, args);
+    }
+    execute_command_core(CommandArgs {
+        cmd: args.cmd,
+        target: CommandTarget::Local,
+        server_id: None,
+        server_name: None,
+        brief: args.brief,
+        workdir: args.workdir,
+        shell: args.shell,
+        login: args.login,
+        yield_time_ms: args.yield_time_ms,
+        output_level: args.output_level,
+        max_output_tokens: args.max_output_tokens,
+        timeout_secs: args.timeout_secs,
+        display_cmd: None,
+        env_overrides: Vec::new(),
+    })
+}
+
+fn execute_pty_run(call_id: &str, arguments: &str) -> Result<ExecCommandExecution> {
+    let args: PtyRunArgs = serde_json::from_str(arguments).context("解析 pty_run 参数失败")?;
+    confirm_dangerous_command_if_needed(args.cmd.as_str())?;
+    let args = prepare_pty_run_args_for_target(args)?;
+    let workdir = resolve_workdir(args.workdir.as_deref())?;
+    let shell = resolve_shell(args.shell.as_deref());
+    let login = args.login.unwrap_or(true);
+    let display_cmd = args.display_cmd.clone().unwrap_or_else(|| args.cmd.clone());
+    let brief = resolve_exec_command_brief(args.brief.as_deref(), display_cmd.as_str());
+    let output = terminal::exec_background_command(terminal::ExecRequest {
+        call_id: Some(call_id.to_string()),
+        name: args
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        cmd: args.cmd.clone(),
+        display_cmd: Some(display_cmd),
+        env_overrides: args.env_overrides,
+        brief: brief.clone(),
+        workdir,
+        shell,
+        login,
+        yield_time_ms: args.yield_time_ms,
+        timeout_secs: args.timeout_secs,
+        report_interval_secs: None,
+        mode: classify_tty_mode(args.cmd.as_str()),
+        owner: terminal::TerminalOwner::AiTool,
+        auto_report_events: false,
+        persona: current_tool_persona(),
+    })?;
+    Ok(ExecCommandExecution {
+        brief,
+        kind_label: "TERMINAL".to_string(),
+        action_label: "启动成功".to_string(),
+        model_output: output.model_output,
+        command_preview: output.command_preview,
+        output_preview: output.output_preview,
+        exit_code: output.exit_code,
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    })
+}
+
+fn prepare_pty_run_args_for_target(mut args: PtyRunArgs) -> Result<PtyRunArgs> {
+    match args.target {
+        CommandTarget::Local => Ok(args),
+        CommandTarget::Ssh => {
+            let remote_cmd = args.cmd.trim().to_string();
+            let spec = build_server_ssh_command(
+                (!remote_cmd.is_empty()).then_some(remote_cmd.as_str()),
+                args.server_id.as_deref(),
+                args.server_name.as_deref(),
+            )?;
+            if args
+                .name
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                args.name = Some("server".to_string());
+            }
+            if args
+                .brief
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                args.brief = Some("连接远程服务器".to_string());
+            }
+            args.cmd = spec.run_cmd;
+            args.display_cmd = Some(spec.display_cmd);
+            args.env_overrides = spec.env_overrides;
+            args.target = CommandTarget::Local;
+            Ok(args)
+        }
+    }
+}
+
+fn server_manage_action_key(action: &str) -> String {
+    match action.trim().to_ascii_lowercase().as_str() {
+        "" | "status" | "list" => "status".to_string(),
+        "upsert" | "save" | "add" | "update" | "register" => "upsert".to_string(),
+        "delete" | "remove" | "del" | "rm" | "drop" => "delete".to_string(),
+        "select" | "switch" | "use" | "activate" | "set_active" => "select".to_string(),
+        "test" | "check" | "ping" => "test".to_string(),
+        "connect" | "open" => "connect".to_string(),
+        "disconnect" | "close" | "stop" => "disconnect".to_string(),
+        "dispatch" | "run" | "broadcast" | "send" => "dispatch".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn server_manage_action_label(action: &str) -> &'static str {
+    match action {
+        "status" => "Status",
+        "upsert" => "Upsert",
+        "delete" => "Delete",
+        "select" => "Select",
+        "test" => "Test",
+        "connect" => "Connect",
+        "disconnect" => "Disconnect",
+        "dispatch" => "Dispatch",
+        _ => "Manage",
+    }
+}
+
+fn resolve_server_manage_brief(raw: Option<&str>, action: &str) -> String {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| match action {
+            "status" => "查看服务器注册表".to_string(),
+            "upsert" => "保存或更新服务器".to_string(),
+            "delete" => "删除服务器".to_string(),
+            "select" => "切换当前服务器".to_string(),
+            "test" => "测试服务器连接".to_string(),
+            "connect" => "建立服务器连接准备".to_string(),
+            "disconnect" => "中断服务器连接准备".to_string(),
+            "dispatch" => "并发分发服务器指令".to_string(),
+            _ => "管理服务器注册表".to_string(),
+        })
+}
+
+fn server_manage_lookup_index_by_key(
+    registry: &crate::settings::ServerRegistrySettings,
+    key: &str,
+) -> Option<usize> {
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    registry
+        .servers
+        .iter()
+        .enumerate()
+        .find_map(|(index, server)| {
+            (server.id.eq_ignore_ascii_case(key)
+                || server.name.eq_ignore_ascii_case(key)
+                || server.host.eq_ignore_ascii_case(key))
+            .then_some(index)
+        })
+}
+
+fn server_manage_trimmed_selector(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn server_manage_collect_selectors(args: &ServerManageArgs) -> Vec<String> {
+    let mut selectors = Vec::new();
+    let mut seen = HashSet::new();
+    for selector in &args.server_ids {
+        let selector = selector.trim();
+        let normalized = selector.to_ascii_lowercase();
+        if normalized.is_empty() || !seen.insert(normalized) {
+            continue;
+        }
+        selectors.push(selector.to_string());
+    }
+    for selector in [
+        server_manage_trimmed_selector(args.server_id.as_deref()),
+        server_manage_trimmed_selector(args.server_name.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let normalized = selector.trim().to_ascii_lowercase();
+        if normalized.is_empty() || !seen.insert(normalized) {
+            continue;
+        }
+        selectors.push(selector);
+    }
+    selectors
+}
+
+fn server_manage_default_server_settings() -> crate::settings::ServerSshSettings {
+    crate::settings::ServerSshSettings {
+        id: String::new(),
+        name: String::new(),
+        host: String::new(),
+        port: 22,
+        user: "root".to_string(),
+        password: String::new(),
+        key_path: String::new(),
+        enabled: true,
+    }
+}
+
+fn server_manage_build_upsert_server(
+    args: &ServerManageArgs,
+) -> Result<crate::settings::ServerSshSettings> {
+    let registry = crate::settings::load_server_registry_for_persona(crate::PersonaKind::Server);
+    let selector = server_manage_trimmed_selector(args.server_id.as_deref())
+        .or_else(|| server_manage_trimmed_selector(args.server_name.as_deref()));
+    let existing = selector
+        .as_deref()
+        .and_then(|key| server_manage_lookup_index_by_key(&registry, key))
+        .map(|index| registry.servers[index].clone());
+    let mut server = existing.unwrap_or_else(server_manage_default_server_settings);
+    if let Some(name) = args
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        server.name = name.to_string();
+    }
+    if let Some(host) = args
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        server.host = host.to_string();
+    }
+    if let Some(port) = args.port {
+        server.port = port;
+    }
+    if let Some(user) = args
+        .user
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        server.user = user.to_string();
+    }
+    if let Some(password) = args
+        .password
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        server.password = password.to_string();
+    }
+    if let Some(key_path) = args
+        .key_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        server.key_path = key_path.to_string();
+    }
+    if let Some(enabled) = args.enabled {
+        server.enabled = enabled;
+    }
+    if server.id.trim().is_empty() {
+        if let Some(selector) = args
+            .server_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            server.id = selector.to_string();
+        }
+    }
+    crate::settings::upsert_server_registry_entry_for_persona(crate::PersonaKind::Server, server)
+}
+
+#[derive(Debug, Clone)]
+struct ServerManageDispatchJob {
+    selector: Option<String>,
+    display_label: String,
+    brief: String,
+    cmd: String,
+    workdir: Option<String>,
+    shell: Option<String>,
+    login: Option<bool>,
+    yield_time_ms: Option<u64>,
+    timeout_secs: Option<u64>,
+    output_level: CommandOutputLevel,
+    max_output_tokens: Option<usize>,
+}
+
+fn server_manage_collect_dispatch_jobs(
+    args: &ServerManageArgs,
+    fixed_cmd: Option<&str>,
+) -> Result<Vec<ServerManageDispatchJob>> {
+    let mut jobs = Vec::new();
+    if !args.items.is_empty() {
+        for (index, item) in args.items.iter().enumerate() {
+            let cmd = fixed_cmd.unwrap_or(item.cmd.as_str()).trim();
+            if cmd.is_empty() {
+                return Err(anyhow!(
+                    "server_manage dispatch 第 {} 项缺少 cmd",
+                    index + 1
+                ));
+            }
+            let selector = server_manage_trimmed_selector(item.server_id.as_deref())
+                .or_else(|| server_manage_trimmed_selector(item.server_name.as_deref()))
+                .or_else(|| {
+                    args.server_ids
+                        .get(index)
+                        .and_then(|value| server_manage_trimmed_selector(Some(value.as_str())))
+                })
+                .or_else(|| server_manage_trimmed_selector(args.server_id.as_deref()))
+                .or_else(|| server_manage_trimmed_selector(args.server_name.as_deref()));
+            jobs.push(ServerManageDispatchJob {
+                display_label: selector
+                    .as_deref()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("active#{}", index.saturating_add(1))),
+                selector,
+                brief: resolve_exec_command_brief(
+                    item.brief.as_deref().or(args.brief.as_deref()),
+                    cmd,
+                ),
+                cmd: cmd.to_string(),
+                workdir: item.workdir.clone().or_else(|| args.workdir.clone()),
+                shell: item.shell.clone().or_else(|| args.shell.clone()),
+                login: item.login.or(args.login),
+                yield_time_ms: item.yield_time_ms.or(args.yield_time_ms),
+                timeout_secs: item.timeout_secs.or(args.timeout_secs),
+                output_level: item.output_level,
+                max_output_tokens: item.max_output_tokens.or(args.max_output_tokens),
+            });
+        }
+        return Ok(jobs);
+    }
+    let cmd = fixed_cmd
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            args.cmd
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .ok_or_else(|| anyhow!("server_manage dispatch 缺少 cmd"))?;
+    if !args.server_ids.is_empty() {
+        let mut seen = HashSet::new();
+        for selector in &args.server_ids {
+            let selector = selector.trim();
+            if selector.is_empty() {
+                continue;
+            }
+            let normalized = selector.to_ascii_lowercase();
+            if !seen.insert(normalized) {
+                continue;
+            }
+            jobs.push(ServerManageDispatchJob {
+                display_label: selector.to_string(),
+                selector: Some(selector.to_string()),
+                brief: resolve_exec_command_brief(args.brief.as_deref(), cmd),
+                cmd: cmd.to_string(),
+                workdir: args.workdir.clone(),
+                shell: args.shell.clone(),
+                login: args.login,
+                yield_time_ms: args.yield_time_ms,
+                timeout_secs: args.timeout_secs,
+                output_level: args.output_level,
+                max_output_tokens: args.max_output_tokens,
+            });
+        }
+    } else {
+        let selector = server_manage_trimmed_selector(args.server_id.as_deref())
+            .or_else(|| server_manage_trimmed_selector(args.server_name.as_deref()));
+        jobs.push(ServerManageDispatchJob {
+            display_label: selector
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| "active".to_string()),
+            selector,
+            brief: resolve_exec_command_brief(args.brief.as_deref(), cmd),
+            cmd: cmd.to_string(),
+            workdir: args.workdir.clone(),
+            shell: args.shell.clone(),
+            login: args.login,
+            yield_time_ms: args.yield_time_ms,
+            timeout_secs: args.timeout_secs,
+            output_level: args.output_level,
+            max_output_tokens: args.max_output_tokens,
+        });
+    }
+    Ok(jobs)
+}
+
+fn format_indented_block(text: &str, indent: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    text.lines()
+        .map(|line| format!("{indent}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[derive(Debug, Clone)]
+struct ServerSplitCreatePlan {
+    suffix: &'static str,
+    id: String,
+    label: String,
+    task: Option<String>,
+    server_id: Option<String>,
+    server_name: Option<String>,
+    brief: Option<String>,
+}
+
+fn server_split_action_key(action: &str) -> String {
+    match action.trim().to_ascii_lowercase().as_str() {
+        "" | "list" | "status" => "list".to_string(),
+        "split" | "create" | "add" | "fork" => "split".to_string(),
+        "split_batch" | "create_batch" | "batch" | "batch_split" | "batch_create" => {
+            "split_batch".to_string()
+        }
+        "send" | "communicate" | "message" | "dispatch" | "talk" => "send".to_string(),
+        "close" | "remove" | "delete" | "disable" | "stop" => "close".to_string(),
+        "close_batch" | "batch_close" | "remove_batch" => "close_batch".to_string(),
+        "close_all" | "remove_all" | "disable_all" => "close_all".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn server_split_action_label(action: &str) -> &'static str {
+    match action {
+        "list" => "List",
+        "split" => "Split",
+        "split_batch" => "Batch",
+        "send" => "Communicate",
+        "close" => "Close",
+        "close_batch" => "Close",
+        "close_all" => "Close All",
+        _ => "Run",
+    }
+}
+
+fn resolve_server_split_brief(raw: Option<&str>, action: &str) -> String {
+    normalize_brief(raw).unwrap_or_else(|| match action {
+        "list" => "查看御网络".to_string(),
+        "split" => "分裂一个御".to_string(),
+        "split_batch" => "批量分裂御".to_string(),
+        "send" => "联络分裂御".to_string(),
+        "close" => "关闭分裂御".to_string(),
+        "close_batch" => "批量关闭分裂御".to_string(),
+        "close_all" => "关闭全部分裂御".to_string(),
+        _ => "管理御网络".to_string(),
+    })
+}
+
+fn server_split_trimmed(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn server_split_suffix_from_selector(raw: &str) -> Option<&'static str> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let lower = value.replace('-', "_").to_ascii_lowercase();
+    let mut candidates = vec![value.to_string(), lower.clone()];
+    if let Some(tail) = lower.strip_prefix(crate::roles::SERVER_SPLIT_ID_PREFIX) {
+        candidates.push(tail.to_string());
+    }
+    if let Some(tail) = value.strip_prefix("御") {
+        candidates.push(tail.trim().to_string());
+    }
+    for candidate in candidates {
+        for suffix in SERVER_SPLIT_SUFFIXES {
+            if candidate.eq_ignore_ascii_case(suffix) {
+                return Some(suffix);
+            }
+        }
+    }
+    None
+}
+
+fn server_split_id_for_suffix(suffix: &str) -> String {
+    format!(
+        "{}{}",
+        crate::roles::SERVER_SPLIT_ID_PREFIX,
+        suffix.to_ascii_lowercase()
+    )
+}
+
+fn server_split_context_dir_for_suffix(suffix: &str) -> String {
+    format!(
+        "{}{}",
+        crate::roles::SERVER_SPLIT_CONTEXT_PREFIX,
+        suffix.to_ascii_lowercase()
+    )
+}
+
+fn server_split_default_label(suffix: &str) -> String {
+    format!("御{suffix}")
+}
+
+fn server_split_normalize_label(label: Option<&str>, suffix: &str) -> String {
+    label
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.eq_ignore_ascii_case(suffix) {
+                server_split_default_label(suffix)
+            } else {
+                value.to_string()
+            }
+        })
+        .unwrap_or_else(|| server_split_default_label(suffix))
+}
+
+fn server_split_role_matches_selector(
+    role: &crate::roles::DynamicRoleSpec,
+    selector: &str,
+) -> bool {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return false;
+    }
+    let contract = role.contract();
+    if role.id.eq_ignore_ascii_case(selector)
+        || contract
+            .identity
+            .display_name
+            .eq_ignore_ascii_case(selector)
+        || contract
+            .identity
+            .header_badge
+            .eq_ignore_ascii_case(selector)
+        || contract.identity.tab_label.eq_ignore_ascii_case(selector)
+        || contract.identity.glyph.as_deref() == Some(selector)
+    {
+        return true;
+    }
+    server_split_suffix_from_selector(selector).is_some_and(|suffix| {
+        role.id == server_split_id_for_suffix(suffix)
+            || contract
+                .identity
+                .header_badge
+                .eq_ignore_ascii_case(server_split_default_label(suffix).as_str())
+    })
+}
+
+fn server_split_role_by_selector(selector: &str) -> Option<crate::roles::DynamicRoleSpec> {
+    crate::roles::server_split_role_specs()
+        .into_iter()
+        .find(|role| server_split_role_matches_selector(role, selector))
+}
+
+fn server_split_collect_selectors(args: &ServerSplitArgs) -> Vec<String> {
+    let mut selectors = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_selector = |value: Option<&str>| {
+        let Some(selector) = server_split_trimmed(value) else {
+            return;
+        };
+        let key = selector.to_ascii_lowercase();
+        if seen.insert(key) {
+            selectors.push(selector);
+        }
+    };
+    push_selector(args.split_id.as_deref());
+    push_selector(args.target.as_deref());
+    push_selector(args.label.as_deref());
+    for value in &args.split_ids {
+        push_selector(Some(value.as_str()));
+    }
+    for value in &args.targets {
+        push_selector(Some(value.as_str()));
+    }
+    for value in &args.labels {
+        push_selector(Some(value.as_str()));
+    }
+    for item in &args.items {
+        push_selector(item.split_id.as_deref());
+        push_selector(item.label.as_deref());
+    }
+    selectors
+}
+
+fn build_server_split_input_preview(args: &ServerSplitArgs) -> String {
+    let action = server_split_action_key(args.action.as_str());
+    let mut lines = vec![format!("action={action}")];
+    if let Some(count) = args.count {
+        lines.push(format!("count={count}"));
+    }
+    let selectors = server_split_collect_selectors(args);
+    if !selectors.is_empty() {
+        lines.push(format!("target={}", selectors.join(",")));
+    }
+    if args.all {
+        lines.push("target=all".to_string());
+    }
+    if let Some(message) = args
+        .message
+        .as_deref()
+        .or(args.task.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(truncate_with_ellipsis(message, 240));
+    }
+    lines.join("\n")
+}
+
+fn server_split_role_prompt(label: &str, role_id: &str) -> String {
+    format!(
+        "你是 Server · 御网络中的分裂御：{}（role_id: {}）。\n\
+你继承 Server · 御 的服务器管理、SSH、防御、日志排查和远程运维职责，但拥有独立上下文、独立运行态和独立工具投影。\n\
+你与本体御、其它分裂御、Matrix、Coding 可以通过 persona_manage/server_split 互相通信；收到派送任务后直接作为该分裂御执行，不要把同一任务回派给自己。\n\
+御网络最多 10 个分裂角色，关闭只表示禁用入口并保留上下文；进行中的排查、连接、日志观察和结论应优先收口并回报。\n\
+多服务器任务中，明确记录自己负责的 server_id/server_name、执行过的检查、风险和下一步建议。",
+        label, role_id
+    )
+}
+
+fn server_split_assignment_message(
+    task: Option<&str>,
+    server_id: Option<&str>,
+    server_name: Option<&str>,
+) -> Option<String> {
+    let task = task.map(str::trim).filter(|value| !value.is_empty());
+    let server_id = server_id.map(str::trim).filter(|value| !value.is_empty());
+    let server_name = server_name.map(str::trim).filter(|value| !value.is_empty());
+    if task.is_none() && server_id.is_none() && server_name.is_none() {
+        return None;
+    }
+    let mut lines = vec!["[server_split assignment]".to_string()];
+    if let Some(task) = task {
+        lines.push(format!("task: {task}"));
+    } else {
+        lines.push(
+            "task: 接手该服务器的观察、排障、防御或管理协作；先做最小验证再推进。".to_string(),
+        );
+    }
+    if let Some(server_id) = server_id {
+        lines.push(format!("server_id: {server_id}"));
+    }
+    if let Some(server_name) = server_name {
+        lines.push(format!("server_name: {server_name}"));
+    }
+    lines.push(
+        "hint: 可用 server_manage status/test/select/dispatch 或 command target=ssh / pty_run target=ssh；必要时向本体御、Matrix 或 Coding 回报。"
+            .to_string(),
+    );
+    Some(lines.join("\n"))
+}
+
+fn server_split_queue_message(
+    role: &crate::roles::DynamicRoleSpec,
+    message: String,
+    brief: Option<String>,
+    priority: Option<String>,
+) -> Result<ExecCommandExecution> {
+    if !role.enabled {
+        anyhow::bail!("分裂御 {} 当前已关闭，不能继续派送消息", role.id);
+    }
+    execute_dynamic_role_persona_manage(
+        current_tool_persona(),
+        &PersonaManageArgs {
+            action: "send".to_string(),
+            persona: role.id.clone(),
+            message: Some(message),
+            brief,
+            reason: Some("server_split communication".to_string()),
+            include_recent: None,
+            priority,
+        },
+        role.clone(),
+    )
+}
+
+fn server_split_active_count(roles: &[crate::roles::DynamicRoleSpec]) -> usize {
+    roles.iter().filter(|role| role.enabled).count()
+}
+
+fn server_split_pick_next_suffix(
+    enabled_ids: &HashSet<String>,
+    selected_ids: &HashSet<String>,
+) -> Result<&'static str> {
+    for suffix in SERVER_SPLIT_SUFFIXES {
+        let id = server_split_id_for_suffix(suffix);
+        if !enabled_ids.contains(&id) && !selected_ids.contains(&id) {
+            return Ok(suffix);
+        }
+    }
+    anyhow::bail!(
+        "御网络最多同时启用 {} 个分裂御",
+        crate::roles::SERVER_SPLIT_ROLE_LIMIT
+    )
+}
+
+fn server_split_create_items(
+    args: &ServerSplitArgs,
+    action: &str,
+) -> Result<Vec<ServerSplitItemArgs>> {
+    if !args.items.is_empty() {
+        return Ok(args.items.clone());
+    }
+    let inferred = args
+        .labels
+        .len()
+        .max(args.tasks.len())
+        .max(args.server_ids.len());
+    let count = args
+        .count
+        .unwrap_or_else(|| if inferred > 0 { inferred } else { 1 });
+    if count == 0 {
+        anyhow::bail!("server_split {action} 的 count 必须大于 0");
+    }
+    if count > crate::roles::SERVER_SPLIT_ROLE_LIMIT {
+        anyhow::bail!(
+            "server_split 一次最多请求 {} 个分裂御",
+            crate::roles::SERVER_SPLIT_ROLE_LIMIT
+        );
+    }
+    let mut items = Vec::new();
+    for index in 0..count {
+        items.push(ServerSplitItemArgs {
+            split_id: if index == 0 {
+                args.split_id.clone().or_else(|| args.target.clone())
+            } else {
+                None
+            },
+            label: args
+                .labels
+                .get(index)
+                .cloned()
+                .or_else(|| (index == 0).then(|| args.label.clone()).flatten()),
+            task: args
+                .tasks
+                .get(index)
+                .cloned()
+                .or_else(|| (index == 0).then(|| args.task.clone()).flatten()),
+            message: (index == 0).then(|| args.message.clone()).flatten(),
+            server_id: args
+                .server_ids
+                .get(index)
+                .cloned()
+                .or_else(|| (index == 0).then(|| args.server_id.clone()).flatten()),
+            server_name: (index == 0).then(|| args.server_name.clone()).flatten(),
+            brief: (index == 0).then(|| args.brief.clone()).flatten(),
+        });
+    }
+    Ok(items)
+}
+
+fn server_split_build_create_plans(
+    args: &ServerSplitArgs,
+    action: &str,
+) -> Result<Vec<ServerSplitCreatePlan>> {
+    let existing_roles = crate::roles::server_split_role_specs();
+    let enabled_ids = existing_roles
+        .iter()
+        .filter(|role| role.enabled)
+        .map(|role| role.id.clone())
+        .collect::<HashSet<_>>();
+    let mut selected_ids = HashSet::new();
+    let mut plans = Vec::new();
+    for item in server_split_create_items(args, action)? {
+        let selector = item
+            .split_id
+            .as_deref()
+            .or(item.label.as_deref())
+            .and_then(|value| server_split_trimmed(Some(value)));
+        let suffix = selector
+            .as_deref()
+            .and_then(server_split_suffix_from_selector)
+            .map(Ok)
+            .unwrap_or_else(|| server_split_pick_next_suffix(&enabled_ids, &selected_ids))?;
+        let id = server_split_id_for_suffix(suffix);
+        if !selected_ids.insert(id.clone()) {
+            anyhow::bail!("本次 server_split 重复选择了同一个分裂御：{id}");
+        }
+        let label =
+            server_split_normalize_label(item.label.as_deref().or(selector.as_deref()), suffix);
+        plans.push(ServerSplitCreatePlan {
+            suffix,
+            id,
+            label,
+            task: item.message.or(item.task),
+            server_id: item.server_id,
+            server_name: item.server_name,
+            brief: item.brief,
+        });
+    }
+    let active_before = server_split_active_count(existing_roles.as_slice());
+    let new_enable_count = plans
+        .iter()
+        .filter(|plan| !enabled_ids.contains(&plan.id))
+        .count();
+    if active_before.saturating_add(new_enable_count) > crate::roles::SERVER_SPLIT_ROLE_LIMIT {
+        anyhow::bail!(
+            "御网络最多同时启用 {} 个分裂御；当前 active={}，本次新增启用={}",
+            crate::roles::SERVER_SPLIT_ROLE_LIMIT,
+            active_before,
+            new_enable_count
+        );
+    }
+    Ok(plans)
+}
+
+fn server_split_list_output() -> String {
+    let roles = crate::roles::server_split_role_specs();
+    let active = server_split_active_count(roles.as_slice());
+    let mut lines = vec![
+        "御网络:".to_string(),
+        format!("limit: {}", crate::roles::SERVER_SPLIT_ROLE_LIMIT),
+        format!("total_slots: {}", roles.len()),
+        format!("active: {active}"),
+        "continuity: close 只禁用入口，保留 context/memory；不会删除分裂御运行态产物。".to_string(),
+        "columns: id · label · state · base · context · tools".to_string(),
+    ];
+    if roles.is_empty() {
+        lines.push("- (empty)".to_string());
+        return lines.join("\n");
+    }
+    for role in roles {
+        let contract = role.contract();
+        lines.push(format!(
+            "- {} · {} · {} · {} · context/{} · {}",
+            role.id,
+            contract.identity.header_badge,
+            if role.enabled { "active" } else { "closed" },
+            contract.capability.base_persona.slug(),
+            contract.storage.context_dir,
+            if contract.capability.default_tools.is_empty() {
+                "(none)".to_string()
+            } else {
+                contract.capability.default_tools.join(",")
+            }
+        ));
+    }
+    lines.join("\n")
+}
+
+fn server_split_list_execution(brief: String) -> ExecCommandExecution {
+    let output = server_split_list_output();
+    ExecCommandExecution {
+        brief,
+        kind_label: "Server".to_string(),
+        action_label: "List".to_string(),
+        model_output: output.clone(),
+        command_preview: "server_split list".to_string(),
+        output_preview: output,
+        exit_code: Some(0),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    }
+}
+
+fn execute_server_split_create(
+    args: &ServerSplitArgs,
+    action: &str,
+    brief: String,
+) -> Result<ExecCommandExecution> {
+    let before_roles = crate::roles::server_split_role_specs();
+    let was_enabled = before_roles
+        .iter()
+        .map(|role| (role.id.clone(), role.enabled))
+        .collect::<HashMap<_, _>>();
+    let default_tools = default_role_tool_ids_for_persona(crate::PersonaKind::Server);
+    let plans = server_split_build_create_plans(args, action)?;
+    let mut lines = vec![
+        "server_split:ok".to_string(),
+        format!("action:{}", action.to_ascii_uppercase()),
+    ];
+    let mut queued = Vec::new();
+    for plan in plans {
+        let context_dir = server_split_context_dir_for_suffix(plan.suffix);
+        let prompt = server_split_role_prompt(plan.label.as_str(), plan.id.as_str());
+        let (role, created) = crate::roles::upsert_server_split_role(
+            plan.id.as_str(),
+            plan.label.as_str(),
+            plan.label.as_str(),
+            context_dir.as_str(),
+            default_tools.as_slice(),
+            prompt.as_str(),
+        )?;
+        let state = if created {
+            "created"
+        } else if was_enabled.get(&role.id).copied().unwrap_or(false) {
+            "already_active"
+        } else {
+            "reopened"
+        };
+        let contract = role.contract();
+        lines.push(format!(
+            "- {} · {} · {} · context/{} · tools:{}",
+            role.id,
+            contract.identity.header_badge,
+            state,
+            contract.storage.context_dir,
+            contract.capability.default_tools.join(",")
+        ));
+        if let Some(message) = server_split_assignment_message(
+            plan.task.as_deref(),
+            plan.server_id.as_deref(),
+            plan.server_name.as_deref(),
+        ) {
+            let send = server_split_queue_message(
+                &role,
+                message,
+                plan.brief
+                    .clone()
+                    .or_else(|| Some(format!("指派 {}", contract.identity.header_badge))),
+                args.priority.clone(),
+            )?;
+            queued.push(format!(
+                "{} -> {}",
+                contract.identity.header_badge, send.command_preview
+            ));
+        }
+    }
+    if !queued.is_empty() {
+        lines.push("queued_assignments:".to_string());
+        lines.extend(queued.into_iter().map(|item| format!("- {item}")));
+    }
+    lines.push(String::new());
+    lines.push(server_split_list_output());
+    let output = lines.join("\n");
+    Ok(ExecCommandExecution {
+        brief,
+        kind_label: "Server".to_string(),
+        action_label: server_split_action_label(action).to_string(),
+        model_output: output.clone(),
+        command_preview: format!("server_split {action}"),
+        output_preview: output,
+        exit_code: Some(0),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    })
+}
+
+fn execute_server_split_send(
+    args: &ServerSplitArgs,
+    brief: String,
+) -> Result<ExecCommandExecution> {
+    let message = args
+        .message
+        .as_deref()
+        .or(args.task.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("server_split communicate 需要 message 或 task"))?;
+    let roles = crate::roles::server_split_role_specs();
+    let targets = if args.all {
+        roles
+            .into_iter()
+            .filter(|role| role.enabled)
+            .collect::<Vec<_>>()
+    } else {
+        let selectors = server_split_collect_selectors(args);
+        if selectors.is_empty() {
+            anyhow::bail!(
+                "server_split communicate 需要 split_id / split_ids / target / label，或 all=true"
+            );
+        }
+        let mut targets = Vec::new();
+        let mut seen = HashSet::new();
+        for selector in selectors {
+            let role = server_split_role_by_selector(selector.as_str())
+                .ok_or_else(|| anyhow!("未找到分裂御：{selector}"))?;
+            if !role.enabled {
+                anyhow::bail!("分裂御 {} 当前已关闭，不能通信", role.id);
+            }
+            if seen.insert(role.id.clone()) {
+                targets.push(role);
+            }
+        }
+        targets
+    };
+    if targets.is_empty() {
+        anyhow::bail!("server_split communicate 没有 active 分裂御");
+    }
+    let mut lines = vec![
+        "server_split:ok".to_string(),
+        "action:SEND".to_string(),
+        format!("targets:{}", targets.len()),
+    ];
+    for role in targets {
+        let contract = role.contract();
+        let send = server_split_queue_message(
+            &role,
+            message.clone(),
+            args.brief
+                .clone()
+                .or_else(|| Some(format!("联络 {}", contract.identity.header_badge))),
+            args.priority.clone(),
+        )?;
+        lines.push(format!(
+            "- {} · {} · {}",
+            role.id, contract.identity.header_badge, send.command_preview
+        ));
+    }
+    let output = lines.join("\n");
+    Ok(ExecCommandExecution {
+        brief,
+        kind_label: "Server".to_string(),
+        action_label: "Communicate".to_string(),
+        model_output: output.clone(),
+        command_preview: "server_split send".to_string(),
+        output_preview: output,
+        exit_code: Some(0),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    })
+}
+
+fn execute_server_split_close(
+    args: &ServerSplitArgs,
+    action: &str,
+    brief: String,
+) -> Result<ExecCommandExecution> {
+    let all = args.all || action == "close_all";
+    let targets = if all {
+        crate::roles::server_split_role_specs()
+            .into_iter()
+            .filter(|role| role.enabled)
+            .collect::<Vec<_>>()
+    } else {
+        let selectors = server_split_collect_selectors(args);
+        if selectors.is_empty() {
+            anyhow::bail!(
+                "server_split close 需要 split_id / split_ids / target / label，或 action=close_all"
+            );
+        }
+        let mut targets = Vec::new();
+        let mut seen = HashSet::new();
+        for selector in selectors {
+            let role = server_split_role_by_selector(selector.as_str())
+                .ok_or_else(|| anyhow!("未找到分裂御：{selector}"))?;
+            if seen.insert(role.id.clone()) {
+                targets.push(role);
+            }
+        }
+        targets
+    };
+    if targets.is_empty() {
+        return Ok(ExecCommandExecution {
+            brief,
+            kind_label: "Server".to_string(),
+            action_label: server_split_action_label(action).to_string(),
+            model_output: "server_split close: no active split roles".to_string(),
+            command_preview: format!("server_split {action}"),
+            output_preview: "没有需要关闭的 active 分裂御。".to_string(),
+            exit_code: Some(0),
+            extra_output_items: Vec::new(),
+            toolmemory_entry_id: None,
+            archived_output: None,
+        });
+    }
+    let ids = targets
+        .iter()
+        .map(|role| role.id.clone())
+        .collect::<Vec<_>>();
+    let updated = crate::roles::set_server_split_roles_enabled(ids.as_slice(), false)?;
+    let mut lines = vec![
+        "server_split:ok".to_string(),
+        format!("action:{}", action.to_ascii_uppercase()),
+        "continuity: disabled only; context/memory preserved; no role directory deletion."
+            .to_string(),
+    ];
+    for role in updated {
+        let contract = role.contract();
+        lines.push(format!(
+            "- {} · {} · closed · context/{}",
+            role.id, contract.identity.header_badge, contract.storage.context_dir
+        ));
+    }
+    lines.push(String::new());
+    lines.push(server_split_list_output());
+    let output = lines.join("\n");
+    Ok(ExecCommandExecution {
+        brief,
+        kind_label: "Server".to_string(),
+        action_label: server_split_action_label(action).to_string(),
+        model_output: output.clone(),
+        command_preview: format!("server_split {action}"),
+        output_preview: output,
+        exit_code: Some(0),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    })
+}
+
+fn execute_server_split(arguments: &str) -> Result<ExecCommandExecution> {
+    if !matches!(current_tool_persona(), crate::PersonaKind::Server) {
+        return Err(anyhow!(
+            "server_split 只允许 Server · 御 和御网络分裂角色使用"
+        ));
+    }
+    let args: ServerSplitArgs =
+        serde_json::from_str(arguments).context("解析 server_split 参数失败")?;
+    let action = server_split_action_key(args.action.as_str());
+    let brief = resolve_server_split_brief(args.brief.as_deref(), action.as_str());
+    match action.as_str() {
+        "list" => Ok(server_split_list_execution(brief)),
+        "split" | "split_batch" => execute_server_split_create(&args, action.as_str(), brief),
+        "send" => execute_server_split_send(&args, brief),
+        "close" | "close_batch" | "close_all" => {
+            execute_server_split_close(&args, action.as_str(), brief)
+        }
+        other => Err(anyhow!(
+            "server_split action 仅支持 list / split / split_batch / send / close / close_batch / close_all，收到：{other}"
+        )),
+    }
+}
+
+fn execute_server_manage_dispatch_jobs(
+    brief: String,
+    action_label: &str,
+    jobs: Vec<ServerManageDispatchJob>,
+) -> Result<ExecCommandExecution> {
+    if jobs.is_empty() {
+        return Err(anyhow!("server_manage dispatch 没有可执行的服务器"));
+    }
+    let mut handles = Vec::new();
+    for job in jobs {
+        handles.push(thread::spawn(move || {
+            set_tool_persona(crate::PersonaKind::Server);
+            let selector = job.selector.clone();
+            let spec = build_server_ssh_command(Some(job.cmd.as_str()), selector.as_deref(), None)?;
+            let mut execution = execute_command_core(CommandArgs {
+                cmd: spec.run_cmd,
+                target: CommandTarget::Local,
+                server_id: None,
+                server_name: None,
+                brief: Some(job.brief.clone()),
+                workdir: job.workdir.clone(),
+                shell: job.shell.clone(),
+                login: job.login,
+                yield_time_ms: job.yield_time_ms,
+                output_level: job.output_level,
+                max_output_tokens: job.max_output_tokens,
+                timeout_secs: job.timeout_secs,
+                display_cmd: Some(spec.display_cmd),
+                env_overrides: spec.env_overrides,
+            })?;
+            execution.brief = job.brief.clone();
+            execution.kind_label = "Server".to_string();
+            execution.action_label = "Dispatched".to_string();
+            Ok::<_, anyhow::Error>((job.display_label, execution))
+        }));
+    }
+
+    let mut job_outputs = Vec::new();
+    let mut extra_output_items = Vec::new();
+    let mut all_ok = true;
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok((label, execution))) => {
+                let success = execution.exit_code.unwrap_or(1) == 0;
+                if !success {
+                    all_ok = false;
+                }
+                if !execution.extra_output_items.is_empty() {
+                    extra_output_items.extend(execution.extra_output_items.clone());
+                }
+                let mut block = vec![
+                    format!("[{label}] {}", if success { "ok" } else { "failed" }),
+                    format!("brief: {}", execution.brief),
+                    format!("command: {}", execution.command_preview),
+                    format!("exit_code: {}", execution.exit_code.unwrap_or(-1)),
+                ];
+                if let Some(toolmemory_entry_id) = execution.toolmemory_entry_id {
+                    block.push(format!("toolmemory_entry_id: {toolmemory_entry_id}"));
+                }
+                block.push("output:".to_string());
+                let body = format_indented_block(execution.output_preview.as_str(), "  ");
+                if !body.is_empty() {
+                    block.push(body);
+                }
+                job_outputs.push(block.join("\n"));
+            }
+            Ok(Err(error)) => {
+                all_ok = false;
+                job_outputs.push(format!("[job] error: {error:#}"));
+            }
+            Err(_) => {
+                all_ok = false;
+                job_outputs.push("[job] error: dispatch thread panicked".to_string());
+            }
+        }
+    }
+
+    let output = [
+        format!("Server dispatch jobs: {}", job_outputs.len()),
+        if all_ok {
+            "overall: ok".to_string()
+        } else {
+            "overall: failed".to_string()
+        },
+        String::new(),
+        job_outputs.join("\n\n"),
+    ]
+    .join("\n");
+
+    Ok(ExecCommandExecution {
+        brief,
+        kind_label: "Server".to_string(),
+        action_label: action_label.to_string(),
+        model_output: output.clone(),
+        command_preview: format!("server_manage dispatch x{}", job_outputs.len()),
+        output_preview: output,
+        exit_code: if all_ok { Some(0) } else { Some(1) },
+        extra_output_items,
+        toolmemory_entry_id: None,
+        archived_output: None,
+    })
+}
+
+fn execute_server_manage(arguments: &str) -> Result<ExecCommandExecution> {
+    if !matches!(current_tool_persona(), crate::PersonaKind::Server) {
+        return Err(anyhow!("server_manage 只允许 Server · 御 使用"));
+    }
+    let args: ServerManageArgs =
+        serde_json::from_str(arguments).context("解析 server_manage 参数失败")?;
+    let action = server_manage_action_key(args.action.as_str());
+    let brief = resolve_server_manage_brief(args.brief.as_deref(), action.as_str());
+    match action.as_str() {
+        "status" => Ok(server_manage_status_execution(brief)),
+        "upsert" => {
+            let server = server_manage_build_upsert_server(&args)?;
+            let registry =
+                crate::settings::load_server_registry_for_persona(crate::PersonaKind::Server);
+            let mut lines = vec![
+                "Server upsert ok".to_string(),
+                format!(
+                    "saved: id={} name={} host={} port={} user={} password={} key_path={} enabled={}",
+                    if server.id.is_empty() {
+                        "(empty)"
+                    } else {
+                        server.id.as_str()
+                    },
+                    if server.name.is_empty() {
+                        "(empty)"
+                    } else {
+                        server.name.as_str()
+                    },
+                    if server.host.is_empty() {
+                        "(empty)"
+                    } else {
+                        server.host.as_str()
+                    },
+                    server.port,
+                    if server.user.is_empty() {
+                        "(empty)"
+                    } else {
+                        server.user.as_str()
+                    },
+                    if server.password.is_empty() {
+                        "(empty)"
+                    } else {
+                        server.password.as_str()
+                    },
+                    if server.key_path.is_empty() {
+                        "(empty)"
+                    } else {
+                        server.key_path.as_str()
+                    },
+                    if server.enabled { "yes" } else { "no" }
+                ),
+                String::new(),
+                crate::settings::server_registry_summary_for_persona(crate::PersonaKind::Server),
+            ];
+            if registry.servers.is_empty() {
+                lines.push("registry: empty".to_string());
+            }
+            let output = lines.join("\n");
+            Ok(ExecCommandExecution {
+                brief,
+                kind_label: "Server".to_string(),
+                action_label: "Upsert".to_string(),
+                model_output: output.clone(),
+                command_preview: "server_manage upsert".to_string(),
+                output_preview: output,
+                exit_code: Some(0),
+                extra_output_items: Vec::new(),
+                toolmemory_entry_id: None,
+                archived_output: None,
+            })
+        }
+        "delete" => {
+            let mut selectors = server_manage_collect_selectors(&args);
+            if selectors.is_empty() {
+                return Err(anyhow!(
+                    "server_manage delete 需要 server_id / server_name / server_ids"
+                ));
+            }
+            let mut removed = Vec::new();
+            let mut missing = Vec::new();
+            for selector in selectors.drain(..) {
+                match crate::settings::delete_server_registry_entry_for_persona(
+                    crate::PersonaKind::Server,
+                    selector.as_str(),
+                ) {
+                    Ok(Some(server)) => removed.push(server),
+                    Ok(None) => missing.push(selector),
+                    Err(error) => return Err(error),
+                }
+            }
+            let mut lines = vec!["Server delete done".to_string()];
+            if removed.is_empty() {
+                lines.push("removed: 0".to_string());
+            } else {
+                lines.push(format!("removed: {}", removed.len()));
+                for server in removed {
+                    lines.push(format!(
+                        "- id={} name={} host={} port={} user={}",
+                        if server.id.is_empty() {
+                            "(empty)"
+                        } else {
+                            server.id.as_str()
+                        },
+                        if server.name.is_empty() {
+                            "(empty)"
+                        } else {
+                            server.name.as_str()
+                        },
+                        if server.host.is_empty() {
+                            "(empty)"
+                        } else {
+                            server.host.as_str()
+                        },
+                        server.port,
+                        if server.user.is_empty() {
+                            "(empty)"
+                        } else {
+                            server.user.as_str()
+                        }
+                    ));
+                }
+            }
+            if !missing.is_empty() {
+                lines.push(format!("missing: {}", missing.join(", ")));
+            }
+            lines.push(String::new());
+            lines.push(crate::settings::server_registry_summary_for_persona(
+                crate::PersonaKind::Server,
+            ));
+            let output = lines.join("\n");
+            Ok(ExecCommandExecution {
+                brief,
+                kind_label: "Server".to_string(),
+                action_label: "Delete".to_string(),
+                model_output: output.clone(),
+                command_preview: "server_manage delete".to_string(),
+                output_preview: output,
+                exit_code: if missing.is_empty() { Some(0) } else { Some(1) },
+                extra_output_items: Vec::new(),
+                toolmemory_entry_id: None,
+                archived_output: None,
+            })
+        }
+        "select" => {
+            let selectors = server_manage_collect_selectors(&args);
+            let Some(selector) = selectors.first() else {
+                return Err(anyhow!(
+                    "server_manage select 需要 server_id / server_name / server_ids"
+                ));
+            };
+            let selected = crate::settings::select_server_registry_entry_for_persona(
+                crate::PersonaKind::Server,
+                selector.as_str(),
+            )?;
+            let mut lines = vec!["Server select done".to_string()];
+            if let Some(server) = selected {
+                lines.push(format!(
+                    "active: id={} name={} host={} port={} user={}",
+                    if server.id.is_empty() {
+                        "(empty)"
+                    } else {
+                        server.id.as_str()
+                    },
+                    if server.name.is_empty() {
+                        "(empty)"
+                    } else {
+                        server.name.as_str()
+                    },
+                    if server.host.is_empty() {
+                        "(empty)"
+                    } else {
+                        server.host.as_str()
+                    },
+                    server.port,
+                    if server.user.is_empty() {
+                        "(empty)"
+                    } else {
+                        server.user.as_str()
+                    }
+                ));
+                lines.push(crate::settings::server_registry_summary_for_persona(
+                    crate::PersonaKind::Server,
+                ));
+                let output = lines.join("\n");
+                Ok(ExecCommandExecution {
+                    brief,
+                    kind_label: "Server".to_string(),
+                    action_label: "Select".to_string(),
+                    model_output: output.clone(),
+                    command_preview: "server_manage select".to_string(),
+                    output_preview: output,
+                    exit_code: Some(0),
+                    extra_output_items: Vec::new(),
+                    toolmemory_entry_id: None,
+                    archived_output: None,
+                })
+            } else {
+                lines.push(format!("missing: {selector}"));
+                lines.push(crate::settings::server_registry_summary_for_persona(
+                    crate::PersonaKind::Server,
+                ));
+                let output = lines.join("\n");
+                Ok(ExecCommandExecution {
+                    brief,
+                    kind_label: "Server".to_string(),
+                    action_label: "Select".to_string(),
+                    model_output: output.clone(),
+                    command_preview: "server_manage select".to_string(),
+                    output_preview: output,
+                    exit_code: Some(1),
+                    extra_output_items: Vec::new(),
+                    toolmemory_entry_id: None,
+                    archived_output: None,
+                })
+            }
+        }
+        "test" | "connect" => {
+            let jobs =
+                server_manage_collect_dispatch_jobs(&args, Some("printf projectying-server-ok"))?;
+            let execution = execute_server_manage_dispatch_jobs(
+                brief,
+                if action == "connect" {
+                    "Connected"
+                } else {
+                    "Tested"
+                },
+                jobs,
+            )?;
+            if action == "connect"
+                && execution.exit_code == Some(0)
+                && let Some(selector) = server_manage_collect_selectors(&args).first()
+            {
+                let _ = crate::settings::select_server_registry_entry_for_persona(
+                    crate::PersonaKind::Server,
+                    selector.as_str(),
+                );
+            }
+            Ok(execution)
+        }
+        "dispatch" => execute_server_manage_dispatch_jobs(
+            brief,
+            "Dispatched",
+            server_manage_collect_dispatch_jobs(&args, None)?,
+        ),
+        "disconnect" => {
+            let kill_result =
+                resolve_pty_session_selector(None, None, Some("server"), "server_manage")
+                    .and_then(terminal::kill_session_tool);
+            let (model_output, output_preview, exit_code) = match kill_result {
+                Ok(reply) => (
+                    format!("Server PTY disconnected\n{}", reply.model_output),
+                    reply.output_preview,
+                    reply.exit_code.or(Some(0)),
+                ),
+                Err(_) => (
+                    "Server SSH 单次 command 不保持常驻连接；当前未找到 name=server 的交互式 SSH 会话需要关闭。".to_string(),
+                    "没有常驻连接；未找到 name=server 的交互式 SSH 会话。".to_string(),
+                    Some(0),
+                ),
+            };
+            Ok(ExecCommandExecution {
+                brief,
+                kind_label: "Server".to_string(),
+                action_label: "Disconnected".to_string(),
+                model_output,
+                command_preview: "server_manage disconnect".to_string(),
+                output_preview,
+                exit_code,
+                extra_output_items: Vec::new(),
+                toolmemory_entry_id: None,
+                archived_output: None,
+            })
+        }
+        _ => Err(anyhow!(
+            "server_manage action 仅支持 status / upsert / delete / select / test / connect / disconnect / dispatch"
+        )),
+    }
+}
+
+fn server_manage_status_execution(brief: String) -> ExecCommandExecution {
+    let registry = crate::settings::load_server_registry_for_persona(crate::PersonaKind::Server);
+    let active = crate::settings::load_server_ssh_settings_for_persona(crate::PersonaKind::Server);
+    let key_path = normalize_ssh_key_path(active.key_path.as_str());
+    let password_configured = !active.password.trim().is_empty();
+    let auth = match (password_configured, key_path.trim().is_empty()) {
+        (true, false) => "password+key",
+        (true, true) => "password",
+        (false, false) => "key",
+        (false, true) => "none",
+    };
+    let password_login = if password_configured {
+        "password+builtin_askpass"
+    } else if key_path.is_empty() {
+        "none"
+    } else {
+        "key"
+    };
+    let mut lines = vec![
+        "Server registry".to_string(),
+        crate::settings::server_registry_summary_for_persona(crate::PersonaKind::Server),
+        format!("registry_count: {}", registry.servers.len()),
+        format!(
+            "configured:{}",
+            !active.host.trim().is_empty() && !active.user.trim().is_empty() && auth != "none"
+        ),
+        format!(
+            "active_host:{}",
+            if active.host.trim().is_empty() {
+                "(empty)"
+            } else {
+                active.host.as_str()
+            }
+        ),
+        format!("active_port:{}", active.port),
+        format!(
+            "active_user:{}",
+            if active.user.trim().is_empty() {
+                "(empty)"
+            } else {
+                active.user.as_str()
+            }
+        ),
+        format!("active_auth:{auth}"),
+        format!("active_password_login:{password_login}"),
+        format!(
+            "ssh:{}",
+            if command_binary_available("ssh") {
+                "available"
+            } else {
+                "missing"
+            }
+        ),
+    ];
+    if !command_binary_available("ssh") {
+        lines.push("hint: install openssh before connect/test".to_string());
+    } else if active.password.trim().is_empty() && key_path.is_empty() {
+        lines.push("hint: configure password or key_path before connect/test".to_string());
+    } else {
+        lines.push("hint: password login uses builtin askpass helper".to_string());
+    }
+    if !key_path.is_empty() {
+        lines.push(format!(
+            "active_key_path:{} ({})",
+            key_path,
+            if Path::new(key_path.as_str()).exists() {
+                "exists"
+            } else {
+                "missing"
+            }
+        ));
+    }
+    lines.push(
+        "usage: command target=ssh / pty_run target=ssh can select server_id or server_name; server_manage handles registry upsert / delete / select / dispatch.".to_string(),
+    );
+    let output = lines.join("\n");
+    ExecCommandExecution {
+        brief,
+        kind_label: "Server".to_string(),
+        action_label: "Status".to_string(),
+        model_output: output.clone(),
+        command_preview: "server_manage status".to_string(),
+        output_preview: output,
+        exit_code: Some(0),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    }
+}
+
+fn execute_pty_input(arguments: &str) -> Result<ExecCommandExecution> {
+    let args: PtyInputArgs = serde_json::from_str(arguments).context("解析 pty_input 参数失败")?;
+    if let Some(command) = extract_submitted_stdin_command(args.chars.as_str()) {
+        confirm_dangerous_command_if_needed(command.as_str())?;
+    }
+    let session_id =
+        resolve_pty_session_selector(args.session_id, args.pid, args.name.as_deref(), "pty_input")?;
+    let output = terminal::input_session(terminal::InputRequest {
+        session_id,
+        chars: args.chars.clone(),
+        yield_time_ms: args.yield_time_ms,
+    })?;
+    Ok(ExecCommandExecution {
+        brief: default_tool_brief("pty_input"),
+        kind_label: "TERMINAL".to_string(),
+        action_label: pty_input_action_label(args.chars.as_str(), false),
+        model_output: output.model_output,
+        command_preview: output.command_preview,
+        output_preview: output.output_preview,
+        exit_code: output.exit_code,
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    })
+}
+
+fn execute_pty_wait(arguments: &str) -> Result<ExecCommandExecution> {
+    let args: PtyWaitArgs = serde_json::from_str(arguments).context("解析 pty_wait 参数失败")?;
+    let session_id =
+        resolve_pty_session_selector(args.session_id, args.pid, args.name.as_deref(), "pty_wait")?;
+    let output = terminal::wait_session(terminal::WaitRequest {
+        session_id,
+        timeout_secs: args.timeout_secs,
+    })?;
+    Ok(ExecCommandExecution {
+        brief: default_tool_brief("pty_wait"),
+        kind_label: "TERMINAL".to_string(),
+        action_label: if output.exit_code.is_some() {
+            "等待完成".to_string()
+        } else {
+            "已登记等待".to_string()
+        },
+        model_output: output.model_output,
+        command_preview: output.command_preview,
+        output_preview: output.output_preview,
+        exit_code: output.exit_code,
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    })
+}
+
+fn browser_manager() -> &'static Mutex<BrowserManager> {
+    BROWSER_MANAGER.get_or_init(|| Mutex::new(BrowserManager::default()))
+}
+
+fn agentbrowser_bridge_roots() -> Vec<AgentBrowserBridge> {
+    let mut roots = Vec::new();
+    for candidate in [
+        "/storage/emulated/0/Android/media/io.projectying.agentbrowser",
+        "/sdcard/Android/media/io.projectying.agentbrowser",
+    ] {
+        let root = PathBuf::from(candidate).join(AGENTBROWSER_BRIDGE_DIR_NAME);
+        if roots
+            .iter()
+            .any(|existing: &AgentBrowserBridge| existing.root == root)
+        {
+            continue;
+        }
+        roots.push(AgentBrowserBridge {
+            state_file: root.join(AGENTBROWSER_STATE_FILE),
+            command_file: root.join(AGENTBROWSER_COMMAND_FILE),
+            signal_file: root.join(AGENTBROWSER_SIGNAL_FILE),
+            action_result_file: root.join(AGENTBROWSER_ACTION_RESULT_FILE),
+            root,
+        });
+    }
+    roots
+}
+
+fn resolve_agentbrowser_bridge() -> Result<AgentBrowserBridge> {
+    for bridge in agentbrowser_bridge_roots() {
+        if bridge.root.exists() || fs::create_dir_all(&bridge.root).is_ok() {
+            return Ok(bridge);
+        }
+    }
+    anyhow::bail!("找不到 ProjectYing Browser 桥目录，请先启动手机上的浏览器 APP")
+}
+
+fn browser_action_uses_agentbrowser(action: &str) -> bool {
+    action.starts_with("app_")
+}
+
+fn read_json_file(path: &Path) -> Result<Value> {
+    let raw = fs::read_to_string(path).with_context(|| format!("读取失败：{}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("解析 JSON 失败：{}", path.display()))
+}
+
+fn append_jsonl_line(path: &Path, value: &Value) -> Result<()> {
+    crate::ensure_parent_dir_shared(
+        path,
+        "browser bridge 缺少父目录",
+        "创建 browser bridge 目录失败",
+    )?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("打开 browser bridge 命令文件失败：{}", path.display()))?;
+    file.write_all(serde_json::to_string(value)?.as_bytes())
+        .with_context(|| format!("写入 browser bridge 命令失败：{}", path.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("写入 browser bridge 换行失败：{}", path.display()))?;
+    Ok(())
+}
+
+fn summarize_agentbrowser_state(state: &Value, max_tabs: usize) -> String {
+    let mut lines = Vec::new();
+    lines.push("APP · ProjectYing Browser".to_string());
+    if let Some(reason) = state.get("reason").and_then(Value::as_str) {
+        lines.push(format!("reason: {reason}"));
+    }
+    if let Some(updated_at) = state.get("updated_at").and_then(Value::as_u64) {
+        lines.push(format!("updated_at: {updated_at}"));
+    }
+    lines.push(format!(
+        "tab_count: {}",
+        state.get("tab_count").and_then(Value::as_u64).unwrap_or(0)
+    ));
+    lines.push(format!(
+        "active_tab_index: {}",
+        state
+            .get("active_tab_index")
+            .and_then(Value::as_i64)
+            .unwrap_or(-1)
+    ));
+    if let Some(active_tab_id) = state.get("active_tab_id").and_then(Value::as_str) {
+        lines.push(format!("active_tab_id: {active_tab_id}"));
+    }
+    if let Some(control) = state.get("ai_control_mode").and_then(Value::as_bool) {
+        lines.push(format!("ai_control_mode: {control}"));
+    }
+    if let Some(reason) = state.get("ai_control_reason").and_then(Value::as_str)
+        && !reason.trim().is_empty()
+    {
+        lines.push(format!(
+            "ai_control_reason: {}",
+            truncate_chars(reason.trim(), 120)
+        ));
+    }
+    if let Some(mode) = state.get("user_agent_mode").and_then(Value::as_str) {
+        lines.push(format!("user_agent_mode: {mode}"));
+    }
+    if let Some(tabs) = state.get("tabs").and_then(Value::as_array) {
+        lines.push("tabs:".to_string());
+        for tab in tabs.iter().take(max_tabs) {
+            let index = tab.get("index").and_then(Value::as_u64).unwrap_or(0);
+            let id = tab.get("id").and_then(Value::as_str).unwrap_or("?");
+            let title = truncate_chars(
+                tab.get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim(),
+                56,
+            );
+            let url = truncate_chars(
+                tab.get("url").and_then(Value::as_str).unwrap_or("").trim(),
+                96,
+            );
+            let active = tab.get("active").and_then(Value::as_bool).unwrap_or(false);
+            lines.push(format!(
+                "- [{}] {}{}",
+                index,
+                if active { "*" } else { "" },
+                id
+            ));
+            if !title.is_empty() {
+                lines.push(format!("  title: {title}"));
+            }
+            if !url.is_empty() {
+                lines.push(format!("  url: {url}"));
+            }
+        }
+    }
+    clamp_report_text(lines.join("\n"))
+}
+
+fn summarize_agentbrowser_signal(signal: &Value, max_items: usize) -> String {
+    let mut lines = vec!["SNAPSHOT · Browser Page".to_string()];
+    if let Some(created_at) = signal.get("created_at").and_then(Value::as_u64) {
+        lines.push(format!("created_at: {created_at}"));
+    }
+    if let Some(source) = signal.get("source").and_then(Value::as_str) {
+        lines.push(format!("source: {source}"));
+    }
+    if let Some(tab) = signal.get("tab") {
+        let title = tab
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let url = tab.get("url").and_then(Value::as_str).unwrap_or("").trim();
+        if !title.is_empty() {
+            lines.push(format!("title: {}", truncate_chars(title, 80)));
+        }
+        if !url.is_empty() {
+            lines.push(format!("url: {}", truncate_chars(url, 120)));
+        }
+    }
+    if let Some(page) = signal.get("page") {
+        if let Some(text) = page
+            .get("text_excerpt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            lines.push("text_excerpt:".to_string());
+            lines.push(truncate_chars(text, 1600));
+        }
+        if let Some(links) = page.get("links").and_then(Value::as_array)
+            && !links.is_empty()
+        {
+            lines.push("links:".to_string());
+            for item in links.iter().take(max_items) {
+                let text = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let href = item
+                    .get("href")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if text.is_empty() && href.is_empty() {
+                    continue;
+                }
+                lines.push(format!(
+                    "- {}{}{}",
+                    if text.is_empty() { "(empty)" } else { text },
+                    if text.is_empty() || href.is_empty() {
+                        ""
+                    } else {
+                        " -> "
+                    },
+                    href
+                ));
+            }
+        }
+        if let Some(controls) = page.get("controls").and_then(Value::as_array)
+            && !controls.is_empty()
+        {
+            lines.push("controls:".to_string());
+            for item in controls.iter().take(max_items) {
+                let tag = item.get("tag").and_then(Value::as_str).unwrap_or("").trim();
+                let input_type = item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let label = item
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                lines.push(format!(
+                    "- {}{}{}{}",
+                    if tag.is_empty() { "control" } else { tag },
+                    if input_type.is_empty() { "" } else { " / " },
+                    input_type,
+                    if label.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" / {label}")
+                    }
+                ));
+            }
+        }
+    }
+    clamp_report_text(lines.join("\n"))
+}
+
+fn summarize_agentbrowser_action_result(result: &Value) -> String {
+    let mut lines = vec!["ACTION · Browser App".to_string()];
+    if let Some(action) = result.get("action").and_then(Value::as_str) {
+        lines.push(format!("action: {action}"));
+    }
+    if let Some(command_id) = result.get("command_id").and_then(Value::as_str)
+        && !command_id.trim().is_empty()
+    {
+        lines.push(format!("command_id: {command_id}"));
+    }
+    if let Some(created_at) = result.get("created_at").and_then(Value::as_u64) {
+        lines.push(format!("created_at: {created_at}"));
+    }
+    if let Some(tab) = result.get("tab") {
+        let title = tab
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let url = tab.get("url").and_then(Value::as_str).unwrap_or("").trim();
+        if !title.is_empty() {
+            lines.push(format!("tab_title: {}", truncate_chars(title, 72)));
+        }
+        if !url.is_empty() {
+            lines.push(format!("tab_url: {}", truncate_chars(url, 120)));
+        }
+    }
+    if let Some(inner) = result.get("result") {
+        if let Some(ok) = inner.get("ok").and_then(Value::as_bool) {
+            lines.push(format!("ok: {ok}"));
+        }
+        if let Some(error) = inner.get("error").and_then(Value::as_str)
+            && !error.trim().is_empty()
+        {
+            lines.push(format!("error: {error}"));
+        }
+        if let Some(url) = inner.get("url").and_then(Value::as_str)
+            && !url.trim().is_empty()
+        {
+            lines.push(format!("url: {}", truncate_chars(url.trim(), 120)));
+        }
+        if let Some(title) = inner.get("title").and_then(Value::as_str)
+            && !title.trim().is_empty()
+        {
+            lines.push(format!("title: {}", truncate_chars(title.trim(), 80)));
+        }
+        if let Some(target) = inner.get("target") {
+            let tag = target
+                .get("tag")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let text = target
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let label = target
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let name = target
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let placeholder = target
+                .get("placeholder")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let href = target
+                .get("href")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let value = target
+                .get("value")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if !tag.is_empty() {
+                lines.push(format!("target_tag: {tag}"));
+            }
+            if !text.is_empty() {
+                lines.push(format!("target_text: {}", truncate_chars(text, 96)));
+            }
+            if !label.is_empty() {
+                lines.push(format!("target_label: {}", truncate_chars(label, 96)));
+            }
+            if !name.is_empty() {
+                lines.push(format!("target_name: {name}"));
+            }
+            if !placeholder.is_empty() {
+                lines.push(format!(
+                    "target_placeholder: {}",
+                    truncate_chars(placeholder, 96)
+                ));
+            }
+            if !href.is_empty() {
+                lines.push(format!("target_href: {}", truncate_chars(href, 120)));
+            }
+            if !value.is_empty() {
+                lines.push(format!("target_value: {}", truncate_chars(value, 120)));
+            }
+        }
+        if let Some(value) = inner.get("value").and_then(Value::as_str)
+            && !value.trim().is_empty()
+        {
+            lines.push(format!(
+                "written_value: {}",
+                truncate_chars(value.trim(), 120)
+            ));
+        }
+    }
+    clamp_report_text(lines.join("\n"))
+}
+
+fn wait_for_agentbrowser_action_result(
+    path: &Path,
+    command_id: &str,
+    timeout_ms: u64,
+) -> Result<Value> {
+    let started = Instant::now();
+    loop {
+        if path.exists()
+            && let Ok(value) = read_json_file(path)
+            && value
+                .get("command_id")
+                .and_then(Value::as_str)
+                .is_some_and(|current| current == command_id)
+        {
+            return Ok(value);
+        }
+        if started.elapsed() >= Duration::from_millis(timeout_ms) {
+            anyhow::bail!("等待浏览器动作结果超时");
+        }
+        thread::sleep(Duration::from_millis(120));
+    }
+}
+
+fn execute_agentbrowser_action(
+    args: &BrowserArgs,
+    action: &str,
+    max_items: usize,
+) -> Result<ExecCommandExecution> {
+    let bridge = resolve_agentbrowser_bridge()?;
+    if action == "app_status" {
+        let state = read_json_file(&bridge.state_file)
+            .with_context(|| format!("读取浏览器状态失败：{}", bridge.state_file.display()))?;
+        let output = summarize_agentbrowser_state(&state, max_items);
+        return Ok(ExecCommandExecution {
+            brief: resolve_browser_brief(args.brief.as_deref(), args),
+            kind_label: "BROWSER".to_string(),
+            action_label: browser_action_label(args).to_string(),
+            model_output: output.clone(),
+            command_preview: build_browser_input_preview(args),
+            output_preview: output,
+            exit_code: None,
+            extra_output_items: Vec::new(),
+            toolmemory_entry_id: None,
+            archived_output: None,
+        });
+    }
+
+    let command = match action {
+        "app_open" => json!({
+            "action": "open",
+            "url": args.url.as_deref().map(str::trim).filter(|value| !value.is_empty()).ok_or_else(|| anyhow!("browser.app_open 需要 url"))?,
+            "background": args.background.unwrap_or(false),
+        }),
+        "app_open_many" => {
+            let urls = args
+                .urls
+                .iter()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if urls.is_empty() {
+                anyhow::bail!("browser.app_open_many 需要 urls");
+            }
+            json!({
+                "action": "open_many",
+                "urls": urls,
+                "background": args.background.unwrap_or(true),
+            })
+        }
+        "app_switch" => build_agentbrowser_targeted_command("switch", args)?,
+        "app_close" => build_agentbrowser_targeted_command("close", args)?,
+        "app_reload" => build_agentbrowser_targeted_command("reload", args)?,
+        "app_back" => build_agentbrowser_targeted_command("back", args)?,
+        "app_forward" => build_agentbrowser_targeted_command("forward", args)?,
+        "app_snapshot" => build_agentbrowser_targeted_command("snapshot", args)?,
+        "app_click" => build_agentbrowser_targeted_command("click", args)?,
+        "app_fill" => build_agentbrowser_targeted_command("fill", args)?,
+        "app_submit" => build_agentbrowser_targeted_command("submit", args)?,
+        "app_request_human" => {
+            let mut command = build_agentbrowser_targeted_command("request_human", args)?;
+            if let Some(object) = command.as_object_mut() {
+                object.insert(
+                    "reason".to_string(),
+                    Value::String("需要人工接管浏览器".to_string()),
+                );
+            }
+            command
+        }
+        "app_set_ua" => json!({
+            "action": "set_ua",
+            "mode": args.mode.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or("android"),
+        }),
+        _ => anyhow::bail!("未知的 browser app action：{action}"),
+    };
+    let command_id = format!("browser_app_{}", crate::unix_timestamp_millis_shared());
+    let mut command = command;
+    if let Some(object) = command.as_object_mut() {
+        object.insert("command_id".to_string(), Value::String(command_id.clone()));
+    }
+    append_jsonl_line(&bridge.command_file, &command)?;
+
+    let output = if action == "app_snapshot" {
+        thread::sleep(Duration::from_millis(2200));
+        let signal = read_json_file(&bridge.signal_file)
+            .with_context(|| format!("读取浏览器快照失败：{}", bridge.signal_file.display()))?;
+        summarize_agentbrowser_signal(&signal, max_items)
+    } else if matches!(action, "app_click" | "app_fill" | "app_submit") {
+        let result = wait_for_agentbrowser_action_result(
+            &bridge.action_result_file,
+            command_id.as_str(),
+            4_500,
+        )?;
+        summarize_agentbrowser_action_result(&result)
+    } else {
+        thread::sleep(Duration::from_millis(280));
+        let state = read_json_file(&bridge.state_file).unwrap_or_else(|_| {
+            json!({
+                "reason": "command_enqueued",
+                "tab_count": 0,
+            })
+        });
+        summarize_agentbrowser_state(&state, max_items)
+    };
+    Ok(ExecCommandExecution {
+        brief: resolve_browser_brief(args.brief.as_deref(), args),
+        kind_label: "BROWSER".to_string(),
+        action_label: browser_action_label(args).to_string(),
+        model_output: output.clone(),
+        command_preview: build_browser_input_preview(args),
+        output_preview: output,
+        exit_code: None,
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    })
+}
+
+fn build_agentbrowser_targeted_command(action: &str, args: &BrowserArgs) -> Result<Value> {
+    let mut object = serde_json::Map::new();
+    object.insert("action".to_string(), Value::String(action.to_string()));
+    if let Some(tab_id) = args
+        .tab_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert("tab_id".to_string(), Value::String(tab_id.to_string()));
+    }
+    if let Some(tab_index) = args.tab_index {
+        object.insert(
+            "tab_index".to_string(),
+            Value::Number(serde_json::Number::from(tab_index)),
+        );
+    }
+    if let Some(selector) = args
+        .selector
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert("selector".to_string(), Value::String(selector.to_string()));
+    }
+    if let Some(match_text) = args
+        .match_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert(
+            "match_text".to_string(),
+            Value::String(match_text.to_string()),
+        );
+    }
+    if let Some(href_contains) = args
+        .href_contains
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert(
+            "href_contains".to_string(),
+            Value::String(href_contains.to_string()),
+        );
+    }
+    if let Some(field_name) = args
+        .field_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert(
+            "field_name".to_string(),
+            Value::String(field_name.to_string()),
+        );
+    }
+    if let Some(placeholder) = args
+        .placeholder
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert(
+            "placeholder".to_string(),
+            Value::String(placeholder.to_string()),
+        );
+    }
+    if let Some(value) = args
+        .value
+        .as_deref()
+        .map(str::trim)
+        .filter(|_| action == "fill")
+    {
+        object.insert("value".to_string(), Value::String(value.to_string()));
+    }
+    if let Some(element_index) = args.element_index {
+        object.insert(
+            "element_index".to_string(),
+            Value::Number(serde_json::Number::from(element_index)),
+        );
+    }
+    if object.len() == 1 && action != "snapshot" && action != "request_human" {
+        anyhow::bail!("browser.{action} 需要 tab_id 或 tab_index");
+    }
+    if action == "fill"
+        && !object.contains_key("selector")
+        && !object.contains_key("match_text")
+        && !object.contains_key("field_name")
+        && !object.contains_key("placeholder")
+        && !object.contains_key("element_index")
+    {
+        anyhow::bail!(
+            "browser.app_fill 需要 selector / match_text / field_name / placeholder / element_index 之一"
+        );
+    }
+    if action == "fill" && !object.contains_key("value") {
+        anyhow::bail!("browser.app_fill 需要 value");
+    }
+    Ok(Value::Object(object))
+}
+
+fn sanitize_browser_max_items(value: usize) -> usize {
+    value.clamp(1, 20)
+}
+
+fn browser_requested_selectors(args: &BrowserArgs) -> Vec<String> {
+    let mut selectors = Vec::new();
+    if let Some(selector) = args
+        .selector
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        selectors.push(selector.to_string());
+    }
+    for selector in &args.selectors {
+        let selector = selector.trim();
+        if selector.is_empty() || selectors.iter().any(|existing| existing == selector) {
+            continue;
+        }
+        selectors.push(selector.to_string());
+    }
+    selectors
+}
+
+fn browser_default_max_items(args: &BrowserArgs) -> usize {
+    sanitize_browser_max_items(args.max_items.unwrap_or(8))
+}
+
+fn build_browser_client(user_agent: &str) -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .cookie_store(true)
+        .user_agent(user_agent)
+        .timeout(Duration::from_secs(20))
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .context("创建 browser 会话失败")
+}
+
+fn next_browser_session_id(manager: &mut BrowserManager) -> String {
+    manager.next_id = manager.next_id.saturating_add(1);
+    format!("br{}", manager.next_id)
+}
+
+fn browser_session_label(session: &BrowserSession) -> String {
+    format!("{} ({})", session.id, session.name)
+}
+
+fn browser_session_snapshot(
+    session_id: &str,
+) -> Result<(reqwest::blocking::Client, Option<String>, String)> {
+    let manager = browser_manager()
+        .lock()
+        .map_err(|_| anyhow!("browser 会话管理器锁定失败"))?;
+    let session = manager
+        .sessions
+        .get(session_id)
+        .ok_or_else(|| anyhow!("找不到 browser session_id `{session_id}`"))?;
+    Ok((
+        session.client.clone(),
+        session.last_page.as_ref().map(|page| page.url.clone()),
+        browser_session_label(session),
+    ))
+}
+
+fn resolve_browser_url(raw: Option<&str>, base: Option<&str>, action: &str) -> Result<Url> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        anyhow::bail!("browser.{action} 需要 url");
+    };
+    if let Ok(url) = Url::parse(raw) {
+        return Ok(url);
+    }
+    let Some(base) = base else {
+        anyhow::bail!("browser.{action} 需要绝对 url，或先让该 session 打开一个基准页面");
+    };
+    Url::parse(base)
+        .with_context(|| format!("browser 基准页面 URL 无效：{base}"))?
+        .join(raw)
+        .with_context(|| format!("browser 无法基于 `{base}` 拼接相对 URL `{raw}`"))
+}
+
+fn browser_apply_headers(
+    mut req: reqwest::blocking::RequestBuilder,
+    headers: &BTreeMap<String, String>,
+) -> Result<reqwest::blocking::RequestBuilder> {
+    if headers.is_empty() {
+        return Ok(req);
+    }
+    let mut header_map = HeaderMap::new();
+    for (key, value) in headers {
+        let name = HeaderName::from_bytes(key.trim().as_bytes())
+            .with_context(|| format!("无效的 browser header 名称：{key}"))?;
+        let value = HeaderValue::from_str(value.trim())
+            .with_context(|| format!("无效的 browser header 值：{key}"))?;
+        header_map.insert(name, value);
+    }
+    req = req.headers(header_map);
+    Ok(req)
+}
+
+fn browser_method(raw: Option<&str>, default: &str) -> Result<Method> {
+    Method::from_bytes(
+        raw.map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(default)
+            .to_ascii_uppercase()
+            .as_bytes(),
+    )
+    .with_context(|| format!("不支持的 browser method：{}", raw.unwrap_or(default).trim()))
+}
+
+fn browser_selector(raw: &str) -> Result<Selector> {
+    Selector::parse(raw).map_err(|err| anyhow!("无效的 CSS selector `{raw}`: {err}"))
+}
+
+fn normalize_browser_text(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn browser_is_probably_html(content_type: Option<&str>, body: &str) -> bool {
+    if content_type.is_some_and(|value| {
+        let lower = value.to_ascii_lowercase();
+        lower.contains("html") || lower.contains("xml")
+    }) {
+        return true;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("<html") || lower.contains("<body") || lower.contains("<a ")
+}
+
+fn browser_collect_links(document: &Html, max_items: usize) -> Vec<BrowserLinkSnapshot> {
+    let selector = Selector::parse("a[href]").expect("valid a[href] selector");
+    document
+        .select(&selector)
+        .filter_map(|node| {
+            let href = node.value().attr("href")?.trim();
+            if href.is_empty() {
+                return None;
+            }
+            let text = normalize_browser_text(&node.text().collect::<Vec<_>>().join(" "));
+            Some(BrowserLinkSnapshot {
+                href: truncate_chars(href, 240),
+                text: truncate_chars(text.trim(), 120),
+            })
+        })
+        .take(max_items)
+        .collect()
+}
+
+fn browser_collect_form_fields(form: scraper::ElementRef<'_>, max_items: usize) -> Vec<String> {
+    let selector = Selector::parse("input[name], textarea[name], select[name], button[name]")
+        .expect("valid field selector");
+    form.select(&selector)
+        .filter_map(|node| node.value().attr("name"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| truncate_chars(value, 64))
+        .take(max_items)
+        .collect()
+}
+
+fn browser_collect_forms(document: &Html, max_items: usize) -> Vec<BrowserFormSnapshot> {
+    let selector = Selector::parse("form").expect("valid form selector");
+    document
+        .select(&selector)
+        .map(|form| BrowserFormSnapshot {
+            method: form
+                .value()
+                .attr("method")
+                .unwrap_or("GET")
+                .to_ascii_uppercase(),
+            action: truncate_chars(form.value().attr("action").unwrap_or("(same page)"), 160),
+            fields: browser_collect_form_fields(form, 8),
+        })
+        .take(max_items)
+        .collect()
+}
+
+fn browser_extract_page_text(document: &Html) -> String {
+    let selector = Selector::parse("body").expect("valid body selector");
+    let body_text = document
+        .select(&selector)
+        .flat_map(|node| node.text())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let normalized = normalize_browser_text(body_text.as_str());
+    if normalized.trim().is_empty() {
+        normalize_browser_text(&document.root_element().text().collect::<Vec<_>>().join(" "))
+    } else {
+        normalized
+    }
+}
+
+fn browser_fetch_page(
+    client: &reqwest::blocking::Client,
+    method: Method,
+    url: Url,
+    headers: &BTreeMap<String, String>,
+    form: &BTreeMap<String, String>,
+    max_items: usize,
+) -> Result<BrowserPageSnapshot> {
+    let mut req = client.request(method, url.clone());
+    req = browser_apply_headers(req, headers)?;
+    if !form.is_empty() {
+        req = req.form(form);
+    }
+    let resp = req
+        .send()
+        .with_context(|| format!("browser 请求失败：{url}"))?;
+    let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let fetched_url = resp.url().to_string();
+    let body = resp
+        .text()
+        .with_context(|| format!("读取 browser 响应失败：{url}"))?;
+    let stored_body = truncate_chars(body.as_str(), 600_000);
+    let (title, text_excerpt, links, forms) =
+        if browser_is_probably_html(content_type.as_deref(), stored_body.as_str()) {
+            let document = Html::parse_document(stored_body.as_str());
+            let title_selector = Selector::parse("title").expect("valid title selector");
+            let title = document
+                .select(&title_selector)
+                .next()
+                .map(|node| normalize_browser_text(&node.text().collect::<Vec<_>>().join(" ")))
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| truncate_chars(value.as_str(), 160));
+            let text_excerpt = truncate_chars(browser_extract_page_text(&document).trim(), 2000);
+            let links = browser_collect_links(&document, max_items);
+            let forms = browser_collect_forms(&document, max_items);
+            (title, text_excerpt, links, forms)
+        } else {
+            (
+                None,
+                truncate_chars(normalize_browser_text(stored_body.as_str()).trim(), 2000),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+    Ok(BrowserPageSnapshot {
+        url: fetched_url,
+        status,
+        fetched_at: crate::unix_timestamp_secs_shared(),
+        title,
+        content_type,
+        body: stored_body,
+        text_excerpt,
+        links,
+        forms,
+    })
+}
+
+fn build_browser_page_preview(
+    session_label: &str,
+    page: &BrowserPageSnapshot,
+    max_items: usize,
+) -> String {
+    let headline = page
+        .title
+        .as_deref()
+        .map(|title| format!("PAGE · {title} · {}", page.status))
+        .unwrap_or_else(|| format!("PAGE · {} · {}", page.url, page.status));
+    let mut lines = vec![
+        headline,
+        format!("session: {session_label}"),
+        format!("url: {}", page.url),
+    ];
+    if let Some(content_type) = page.content_type.as_deref() {
+        lines.push(format!("content_type: {content_type}"));
+    }
+    lines.push(format!("fetched_at: {}", page.fetched_at));
+    if !page.text_excerpt.trim().is_empty() {
+        lines.push(format!(
+            "summary: {}",
+            truncate_chars(page.text_excerpt.trim(), 320)
+        ));
+    }
+    if !page.links.is_empty() {
+        lines.push(format!("links[{}]:", page.links.len()));
+        lines.extend(
+            page.links
+                .iter()
+                .take(max_items)
+                .enumerate()
+                .map(|(index, link)| {
+                    let text = if link.text.trim().is_empty() {
+                        "(no text)"
+                    } else {
+                        link.text.as_str()
+                    };
+                    format!("  {}. {} -> {}", index + 1, text, link.href)
+                }),
+        );
+    }
+    if !page.forms.is_empty() {
+        lines.push(format!("forms[{}]:", page.forms.len()));
+        lines.extend(
+            page.forms
+                .iter()
+                .take(max_items)
+                .enumerate()
+                .map(|(index, form)| {
+                    let fields = if form.fields.is_empty() {
+                        "(no named fields)".to_string()
+                    } else {
+                        form.fields.join(", ")
+                    };
+                    format!(
+                        "  {}. {} {} · fields: {}",
+                        index + 1,
+                        form.method,
+                        form.action,
+                        truncate_chars(fields.as_str(), 120)
+                    )
+                }),
+        );
+    }
+    clamp_report_text(lines.join("\n"))
+}
+
+fn build_browser_selector_preview(
+    session_label: &str,
+    page: &BrowserPageSnapshot,
+    selectors: &[String],
+    max_items: usize,
+) -> Result<String> {
+    let document = Html::parse_document(page.body.as_str());
+    let headline = page
+        .title
+        .as_deref()
+        .map(|title| format!("READ · {title} · {} selector(s)", selectors.len()))
+        .unwrap_or_else(|| format!("READ · {} selector(s)", selectors.len()));
+    let mut lines = vec![
+        headline,
+        format!("session: {session_label}"),
+        format!("url: {}", page.url),
+    ];
+    for selector_text in selectors {
+        let selector = browser_selector(selector_text.as_str())?;
+        lines.push(format!("selector: {selector_text}"));
+        let matches = document
+            .select(&selector)
+            .take(max_items)
+            .map(|node| {
+                let text = normalize_browser_text(&node.text().collect::<Vec<_>>().join(" "));
+                let href = node
+                    .value()
+                    .attr("href")
+                    .or_else(|| node.value().attr("src"))
+                    .map(|value| format!(" -> {}", truncate_chars(value, 160)))
+                    .unwrap_or_default();
+                format!("  - {}{}", truncate_chars(text.trim(), 220), href)
+            })
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            lines.push("  - (no matches)".to_string());
+        } else {
+            lines.extend(matches);
+        }
+    }
+    Ok(clamp_report_text(lines.join("\n")))
+}
+
+fn execute_browser(arguments: &str) -> Result<ExecCommandExecution> {
+    let args: BrowserArgs = serde_json::from_str(arguments).context("解析 browser 参数失败")?;
+    let action = browser_action_key(&args);
+    let max_items = browser_default_max_items(&args);
+    if browser_action_uses_agentbrowser(action.as_str()) {
+        return execute_agentbrowser_action(&args, action.as_str(), max_items);
+    }
+    match action.as_str() {
+        "create" => {
+            let mut manager = browser_manager()
+                .lock()
+                .map_err(|_| anyhow!("browser 会话管理器锁定失败"))?;
+            let id = next_browser_session_id(&mut manager);
+            let name = args
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(id.as_str())
+                .to_string();
+            let user_agent = format!("ProjectYingBrowser/1.0 ({id})");
+            let session = BrowserSession {
+                id: id.clone(),
+                name: name.clone(),
+                created_at: crate::unix_timestamp_secs_shared(),
+                updated_at: crate::unix_timestamp_secs_shared(),
+                user_agent: user_agent.clone(),
+                client: build_browser_client(user_agent.as_str())?,
+                last_page: None,
+            };
+            manager.sessions.insert(id.clone(), session);
+            let output = clamp_report_text(format!(
+                "Session created\nsession_id: {id}\nname: {name}\nuser_agent: {user_agent}"
+            ));
+            Ok(ExecCommandExecution {
+                brief: resolve_browser_brief(args.brief.as_deref(), &args),
+                kind_label: "BROWSER".to_string(),
+                action_label: "Created".to_string(),
+                model_output: output.clone(),
+                command_preview: build_browser_input_preview(&args),
+                output_preview: output,
+                exit_code: None,
+                extra_output_items: Vec::new(),
+                toolmemory_entry_id: None,
+                archived_output: None,
+            })
+        }
+        "list" => {
+            let manager = browser_manager()
+                .lock()
+                .map_err(|_| anyhow!("browser 会话管理器锁定失败"))?;
+            let mut lines = vec![format!("Browser sessions: {}", manager.sessions.len())];
+            for (index, session) in manager.sessions.values().take(max_items).enumerate() {
+                let last_page = session
+                    .last_page
+                    .as_ref()
+                    .map(|page| truncate_chars(page.url.as_str(), 80))
+                    .unwrap_or_else(|| "(no page yet)".to_string());
+                lines.push(format!(
+                    "{}. {} · created={} · updated={}",
+                    index + 1,
+                    browser_session_label(session),
+                    session.created_at,
+                    session.updated_at
+                ));
+                lines.push(format!("   last_page: {last_page}"));
+                lines.push(format!(
+                    "   ua: {}",
+                    truncate_chars(session.user_agent.as_str(), 80)
+                ));
+            }
+            let output = clamp_report_text(lines.join("\n"));
+            Ok(ExecCommandExecution {
+                brief: resolve_browser_brief(args.brief.as_deref(), &args),
+                kind_label: "BROWSER".to_string(),
+                action_label: "List".to_string(),
+                model_output: output.clone(),
+                command_preview: build_browser_input_preview(&args),
+                output_preview: output,
+                exit_code: None,
+                extra_output_items: Vec::new(),
+                toolmemory_entry_id: None,
+                archived_output: None,
+            })
+        }
+        "open" | "submit" => {
+            let session_id = args
+                .session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("browser.{action} 需要 session_id"))?;
+            let (client, base_url, session_label) = browser_session_snapshot(session_id)?;
+            let url =
+                resolve_browser_url(args.url.as_deref(), base_url.as_deref(), action.as_str())?;
+            let method = browser_method(
+                args.method.as_deref(),
+                if action == "submit" { "POST" } else { "GET" },
+            )?;
+            let page =
+                browser_fetch_page(&client, method, url, &args.headers, &args.form, max_items)?;
+            {
+                let mut manager = browser_manager()
+                    .lock()
+                    .map_err(|_| anyhow!("browser 会话管理器锁定失败"))?;
+                let session = manager
+                    .sessions
+                    .get_mut(session_id)
+                    .ok_or_else(|| anyhow!("找不到 browser session_id `{session_id}`"))?;
+                session.updated_at = crate::unix_timestamp_secs_shared();
+                session.last_page = Some(page.clone());
+            }
+            let output = build_browser_page_preview(session_label.as_str(), &page, max_items);
+            Ok(ExecCommandExecution {
+                brief: resolve_browser_brief(args.brief.as_deref(), &args),
+                kind_label: "BROWSER".to_string(),
+                action_label: if action == "submit" {
+                    "Submitted".to_string()
+                } else {
+                    "Opened".to_string()
+                },
+                model_output: output.clone(),
+                command_preview: build_browser_input_preview(&args),
+                output_preview: output,
+                exit_code: None,
+                extra_output_items: Vec::new(),
+                toolmemory_entry_id: None,
+                archived_output: None,
+            })
+        }
+        "read" => {
+            let session_id = args
+                .session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("browser.read 需要 session_id"))?;
+            let manager = browser_manager()
+                .lock()
+                .map_err(|_| anyhow!("browser 会话管理器锁定失败"))?;
+            let session = manager
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| anyhow!("找不到 browser session_id `{session_id}`"))?;
+            let page = session
+                .last_page
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| anyhow!("browser.read 前需要先 open 或 submit"))?;
+            let session_label = browser_session_label(session);
+            drop(manager);
+            let selectors = browser_requested_selectors(&args);
+            let output = if selectors.is_empty() {
+                build_browser_page_preview(session_label.as_str(), &page, max_items)
+            } else {
+                build_browser_selector_preview(
+                    session_label.as_str(),
+                    &page,
+                    selectors.as_slice(),
+                    max_items,
+                )?
+            };
+            Ok(ExecCommandExecution {
+                brief: resolve_browser_brief(args.brief.as_deref(), &args),
+                kind_label: "BROWSER".to_string(),
+                action_label: "Read".to_string(),
+                model_output: output.clone(),
+                command_preview: build_browser_input_preview(&args),
+                output_preview: output,
+                exit_code: None,
+                extra_output_items: Vec::new(),
+                toolmemory_entry_id: None,
+                archived_output: None,
+            })
+        }
+        "close" => {
+            let session_id = args
+                .session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("browser.close 需要 session_id"))?;
+            let mut manager = browser_manager()
+                .lock()
+                .map_err(|_| anyhow!("browser 会话管理器锁定失败"))?;
+            let session = manager
+                .sessions
+                .remove(session_id)
+                .ok_or_else(|| anyhow!("找不到 browser session_id `{session_id}`"))?;
+            let output = clamp_report_text(format!(
+                "Session closed\nsession_id: {}\nname: {}",
+                session.id, session.name
+            ));
+            Ok(ExecCommandExecution {
+                brief: resolve_browser_brief(args.brief.as_deref(), &args),
+                kind_label: "BROWSER".to_string(),
+                action_label: "Closed".to_string(),
+                model_output: output.clone(),
+                command_preview: build_browser_input_preview(&args),
+                output_preview: output,
+                exit_code: None,
+                extra_output_items: Vec::new(),
+                toolmemory_entry_id: None,
+                archived_output: None,
+            })
+        }
+        _ => anyhow::bail!("browser 不支持 action `{action}`"),
+    }
 }
 
 fn execute_view_image(arguments: &str) -> Result<ExecCommandExecution> {
@@ -3538,7 +9441,7 @@ fn execute_view_image(arguments: &str) -> Result<ExecCommandExecution> {
             &prepared,
             data_url,
         )],
-        history_entry_id: None,
+        toolmemory_entry_id: None,
         archived_output: None,
     })
 }
@@ -3580,22 +9483,30 @@ fn execute_apply_patch(arguments: &str) -> Result<ExecCommandExecution> {
         output_preview,
         exit_code: Some(0),
         extra_output_items: Vec::new(),
-        history_entry_id: None,
+        toolmemory_entry_id: None,
         archived_output: None,
     })
 }
 
 fn execute_update_plan(arguments: &str) -> Result<ExecCommandExecution> {
     let args = parse_update_plan_arguments(arguments)?;
-    if crate::context::current_mode()? != crate::context::ContextMode::Focus {
-        let focus_summary = args
+    if args.mode != UpdatePlanMode::Decision
+        && crate::context::current_mode()? != crate::context::ContextMode::Focus
+    {
+        let active_step = args
             .steps
             .iter()
             .find(|step| matches!(step.status, UpdatePlanStatus::InProgress))
-            .map(|step| step.step.clone())
-            .or_else(|| args.explanation.clone())
-            .unwrap_or_else(|| derive_update_plan_brief(&args));
-        crate::context::mark_focus_required(focus_summary)?;
+            .or_else(|| {
+                args.steps
+                    .iter()
+                    .find(|step| matches!(step.status, UpdatePlanStatus::Pending))
+            });
+        if let Some(step) = active_step {
+            crate::context::mark_focus_required(step.step.clone())?;
+        } else {
+            crate::context::mark_focus_required("")?;
+        }
     }
     Ok(ExecCommandExecution {
         brief: derive_update_plan_brief(&args),
@@ -3606,37 +9517,703 @@ fn execute_update_plan(arguments: &str) -> Result<ExecCommandExecution> {
         output_preview: build_update_plan_output_preview(&args),
         exit_code: Some(0),
         extra_output_items: Vec::new(),
-        history_entry_id: None,
+        toolmemory_entry_id: None,
         archived_output: None,
     })
 }
 
 fn parse_context_manage_arguments(arguments: &str) -> Result<ContextManageArgs> {
-    serde_json::from_str(arguments).context("解析 context_manage 参数失败")
+    serde_json::from_str(arguments).or_else(|json_err| {
+        parse_context_manage_arguments_loose(arguments)
+            .with_context(|| format!("解析 context_manage 参数失败：{json_err}"))
+    })
 }
 
-fn parse_task_mode_arguments(arguments: &str) -> Result<TaskModeArgs> {
-    serde_json::from_str(arguments).context("解析 task_mode 参数失败")
+fn parse_context_compact_arguments(arguments: &str) -> Result<ContextCompactArgs> {
+    serde_json::from_str(arguments).or_else(|json_err| {
+        parse_context_compact_arguments_loose(arguments)
+            .with_context(|| format!("解析 context_compact 参数失败：{json_err}"))
+    })
 }
 
-fn task_mode_action_key(args: &TaskModeArgs) -> String {
-    match args.action.trim().to_ascii_lowercase().as_str() {
-        "enter" | "task_enter" | "focus_enter" => "task_enter".to_string(),
-        "exit" | "task_exit" | "focus_exit" => "task_exit".to_string(),
-        other => other.to_string(),
+fn parse_context_summary_arguments(arguments: &str) -> Result<ContextSummaryArgs> {
+    serde_json::from_str(arguments).or_else(|json_err| {
+        parse_context_summary_arguments_loose(arguments)
+            .with_context(|| format!("解析 context_summary 参数失败：{json_err}"))
+    })
+}
+
+fn parse_context_vision_arguments(arguments: &str) -> Result<ContextVisionArgs> {
+    serde_json::from_str(arguments).or_else(|json_err| {
+        parse_context_vision_arguments_loose(arguments)
+            .with_context(|| format!("解析 context_vision 参数失败：{json_err}"))
+    })
+}
+
+fn parse_focus_mode_arguments(arguments: &str) -> Result<FocusModeArgs> {
+    serde_json::from_str(arguments).or_else(|json_err| {
+        parse_focus_mode_arguments_loose(arguments)
+            .with_context(|| format!("解析 focus_mode 参数失败：{json_err}"))
+    })
+}
+
+#[derive(Debug, Default)]
+struct LooseArgumentFields {
+    fields: BTreeMap<String, Vec<String>>,
+}
+
+impl LooseArgumentFields {
+    fn parse(
+        arguments: &str,
+        canonical_key: impl Fn(&str) -> Option<&'static str>,
+    ) -> Result<Self> {
+        let mut fields = BTreeMap::<String, Vec<String>>::new();
+        let mut active_key: Option<String> = None;
+
+        for raw_line in arguments.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let maybe_pair = line.split_once(':').or_else(|| line.split_once('='));
+            if let Some((raw_key, raw_value)) = maybe_pair
+                && let Some(key) = canonical_key(raw_key)
+            {
+                let key = key.to_string();
+                fields
+                    .entry(key.clone())
+                    .or_default()
+                    .push(raw_value.trim().to_string());
+                active_key = Some(key);
+                continue;
+            }
+
+            if let Some(key) = active_key.as_deref()
+                && let Some(values) = fields.get_mut(key)
+                && let Some(last) = values.last_mut()
+            {
+                if !last.is_empty() {
+                    last.push('\n');
+                }
+                last.push_str(line);
+            }
+        }
+
+        if fields.is_empty() {
+            anyhow::bail!("未找到可恢复的 key/value 工具参数");
+        }
+
+        Ok(Self { fields })
+    }
+
+    fn take_text(&mut self, key: &str) -> Option<String> {
+        self.fields.remove(key).and_then(|values| {
+            let value = values
+                .into_iter()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if value.is_empty() { None } else { Some(value) }
+        })
+    }
+
+    fn take_text_values(&mut self, key: &str) -> Vec<String> {
+        self.fields.remove(key).map_or_else(Vec::new, |values| {
+            values
+                .into_iter()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect()
+        })
+    }
+
+    fn take_u64(&mut self, key: &str) -> Result<Option<u64>> {
+        let Some(raw) = self.take_text(key) else {
+            return Ok(None);
+        };
+        let value = parse_loose_u64_value(raw.trim(), key)?;
+        Ok(Some(value))
+    }
+
+    fn take_usize(&mut self, key: &str) -> Result<Option<usize>> {
+        let Some(raw) = self.take_text(key) else {
+            return Ok(None);
+        };
+        let value = raw
+            .trim()
+            .parse::<usize>()
+            .with_context(|| format!("不支持的 {key}：{raw}"))?;
+        Ok(Some(value))
+    }
+
+    fn take_bool(&mut self, key: &str) -> Result<Option<bool>> {
+        let Some(raw) = self.take_text(key) else {
+            return Ok(None);
+        };
+        let value = match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "y" | "1" | "on" => true,
+            "false" | "no" | "n" | "0" | "off" => false,
+            _ => anyhow::bail!("不支持的 {key}：{raw}"),
+        };
+        Ok(Some(value))
+    }
+
+    fn take_string_list(&mut self, key: &str) -> Result<Vec<String>> {
+        let Some(values) = self.fields.remove(key) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for raw in values {
+            out.extend(parse_loose_string_list(raw.as_str(), key)?);
+        }
+        Ok(out)
+    }
+
+    fn take_u64_list(&mut self, key: &str) -> Result<Vec<u64>> {
+        let Some(values) = self.fields.remove(key) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for raw in values {
+            out.extend(parse_loose_u64_list(raw.as_str(), key)?);
+        }
+        Ok(out)
+    }
+
+    fn take_deserialized<T: DeserializeOwned>(&mut self, key: &str) -> Result<Option<T>> {
+        let Some(raw) = self.take_text(key) else {
+            return Ok(None);
+        };
+        let trimmed = raw.trim();
+        let value = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            serde_json::from_str(trimmed).with_context(|| format!("不支持的 {key}：{raw}"))?
+        } else {
+            serde_json::from_value(json!(trimmed))
+                .with_context(|| format!("不支持的 {key}：{raw}"))?
+        };
+        Ok(Some(value))
     }
 }
 
-fn task_mode_to_context_manage_args(args: TaskModeArgs) -> ContextManageArgs {
+fn normalize_loose_key(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn parse_loose_string_list(raw: &str, key: &str) -> Result<Vec<String>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    if raw.starts_with('[') {
+        let parsed: Vec<Value> =
+            serde_json::from_str(raw).with_context(|| format!("解析 {key} 数组失败"))?;
+        return Ok(parsed
+            .into_iter()
+            .filter_map(|value| match value {
+                Value::String(text) => Some(text),
+                Value::Number(number) => Some(number.to_string()),
+                Value::Bool(value) => Some(value.to_string()),
+                _ => None,
+            })
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect());
+    }
+    Ok(raw
+        .split(|ch: char| ch == ',' || ch == '|' || ch == ';' || ch.is_whitespace())
+        .map(|part| part.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|part| !part.is_empty())
+        .collect())
+}
+
+fn parse_loose_u64_list(raw: &str, key: &str) -> Result<Vec<u64>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    if raw.starts_with('[') {
+        let parsed: Vec<u64> =
+            serde_json::from_str(raw).with_context(|| format!("解析 {key} 数组失败"))?;
+        return Ok(parsed);
+    }
+    raw.split(|ch: char| ch == ',' || ch == '|' || ch == ';' || ch.is_whitespace())
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| parse_loose_u64_value(part, key))
+        .collect()
+}
+
+fn parse_loose_u64_value(raw: &str, key: &str) -> Result<u64> {
+    let trimmed = raw.trim();
+    let candidate = trimmed
+        .strip_prefix('e')
+        .or_else(|| trimmed.strip_prefix('E'))
+        .or_else(|| trimmed.strip_prefix('#'))
+        .filter(|rest| !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()))
+        .unwrap_or(trimmed);
+    if key.contains("threshold") || key.contains("limit") {
+        let lowered = candidate.to_ascii_lowercase();
+        let (number, scale) = if let Some(number) = lowered.strip_suffix("kb") {
+            (number.trim(), 1_000f64)
+        } else if let Some(number) = lowered.strip_suffix('k') {
+            (number.trim(), 1_000f64)
+        } else if let Some(number) = lowered.strip_suffix("mb") {
+            (number.trim(), 1_000f64)
+        } else if let Some(number) = lowered.strip_suffix('m') {
+            (number.trim(), 1_000f64)
+        } else {
+            (candidate, 0.0)
+        };
+        if scale > 0.0 {
+            let value = number
+                .parse::<f64>()
+                .with_context(|| format!("不支持的 {key}：{raw}"))?;
+            return Ok((value * scale).round().max(0.0) as u64);
+        }
+    }
+    candidate
+        .parse::<u64>()
+        .with_context(|| format!("不支持的 {key}：{raw}"))
+}
+
+fn parse_context_visibility_percent_text(raw: &str) -> Result<u8> {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
+    if trimmed.is_empty() {
+        anyhow::bail!("context_percent 不能为空");
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    let alias = match lowered.as_str() {
+        "tiny" | "zero" | "minimal" | "none" | "off" => Some(0),
+        "small" | "low" => Some(40),
+        "medium" | "normal" | "mid" => Some(67),
+        "full" | "high" | "all" | "max" => Some(100),
+        _ => None,
+    };
+    if let Some(percent) = alias {
+        return Ok(percent);
+    }
+    let numeric = lowered.trim_end_matches('%');
+    let value = numeric
+        .parse::<u16>()
+        .with_context(|| format!("不支持的 context_percent：{raw}"))?;
+    Ok(value.min(100) as u8)
+}
+
+fn parse_context_visibility_percent_value(value: &Value) -> Result<u8> {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .map(|value| value.min(100) as u8)
+            .ok_or_else(|| anyhow!("不支持的 context_percent：{value}")),
+        Value::String(text) => parse_context_visibility_percent_text(text),
+        _ => anyhow::bail!("不支持的 context_percent：{value}"),
+    }
+}
+
+fn context_arg_key(raw: &str) -> Option<&'static str> {
+    match normalize_loose_key(raw).as_str() {
+        "action" => Some("action"),
+        "target" => Some("target"),
+        "persona" | "targetpersona" => Some("persona"),
+        "scope" => Some("scope"),
+        "section" => Some("section"),
+        "role" => Some("role"),
+        "kind" => Some("kind"),
+        "roundid" => Some("round_id"),
+        "entryids" => Some("entry_ids"),
+        "entrystartid" => Some("entry_start_id"),
+        "entryendid" => Some("entry_end_id"),
+        "itemids" => Some("item_ids"),
+        "itemstartid" => Some("item_start_id"),
+        "itemendid" => Some("item_end_id"),
+        "brief" => Some("brief"),
+        "text" => Some("text"),
+        "task" => Some("task"),
+        "usergoal" | "goal" => Some("user_goal"),
+        "reason" => Some("reason"),
+        "plana" => Some("plan_a"),
+        "planb" => Some("plan_b"),
+        "fallback" => Some("fallback"),
+        "planc" => Some("plan_c"),
+        "expectedresult" | "expected" => Some("expected_result"),
+        "exitcondition" | "exit" => Some("exit_condition"),
+        "summary" => Some("summary"),
+        "completed" => Some("completed"),
+        "implemented" => Some("implemented"),
+        "steps" => Some("steps"),
+        "keyinfo" => Some("key_info"),
+        "result" => Some("result"),
+        "exitreason" => Some("exit_reason"),
+        "fastmemorytext" => Some("fastmemory_text"),
+        "content" => Some("text"),
+        _ => None,
+    }
+}
+
+fn parse_context_manage_arguments_loose(arguments: &str) -> Result<ContextManageArgs> {
+    let mut fields = LooseArgumentFields::parse(arguments, context_arg_key)?;
+    let action = fields
+        .take_text("action")
+        .ok_or_else(|| anyhow!("context_manage 行式参数缺少 action"))?;
+    Ok(ContextManageArgs {
+        action,
+        target: fields.take_text("target"),
+        persona: fields.take_text("persona"),
+        scope: fields.take_text("scope"),
+        section: fields.take_text("section"),
+        role: fields.take_text("role"),
+        kind: fields.take_text("kind"),
+        round_id: fields.take_u64("round_id")?,
+        entry_ids: fields.take_u64_list("entry_ids")?,
+        entry_start_id: fields.take_u64("entry_start_id")?,
+        entry_end_id: fields.take_u64("entry_end_id")?,
+        item_ids: fields.take_u64_list("item_ids")?,
+        item_start_id: fields.take_u64("item_start_id")?,
+        item_end_id: fields.take_u64("item_end_id")?,
+        brief: fields.take_text("brief"),
+        text: fields.take_text("text"),
+        task: fields.take_text("task"),
+        user_goal: fields.take_text("user_goal"),
+        reason: fields.take_text("reason"),
+        plan_a: fields.take_text("plan_a"),
+        plan_b: fields.take_text("plan_b"),
+        fallback: fields.take_text("fallback"),
+        plan_c: fields.take_text("plan_c"),
+        expected_result: fields.take_text("expected_result"),
+        exit_condition: fields.take_text("exit_condition"),
+        summary: fields.take_text("summary"),
+        completed: fields.take_text("completed"),
+        implemented: fields.take_text("implemented"),
+        steps: fields.take_text("steps"),
+        key_info: fields.take_text("key_info"),
+        result: fields.take_text("result"),
+        exit_reason: fields.take_text("exit_reason"),
+        fastmemory_text: fields.take_text("fastmemory_text"),
+    })
+}
+
+fn context_summary_arg_key(raw: &str) -> Option<&'static str> {
+    match normalize_loose_key(raw).as_str() {
+        "action" => Some("action"),
+        "persona" | "targetpersona" => Some("persona"),
+        "entries" => Some("entries"),
+        "entryid" => Some("entry_id"),
+        "entryids" | "ids" => Some("entry_ids"),
+        "text" | "content" | "summary" => Some("text"),
+        "reason" => Some("reason"),
+        "brief" => Some("brief"),
+        _ => None,
+    }
+}
+
+fn parse_context_summary_entries_loose(
+    fields: &mut LooseArgumentFields,
+) -> Result<Vec<ContextSummaryEntryArgs>> {
+    let mut entries = Vec::new();
+
+    if let Some(raw_entries) = fields.take_text("entries") {
+        let trimmed = raw_entries.trim();
+        if !trimmed.is_empty() {
+            if trimmed.starts_with('[') {
+                entries.extend(
+                    serde_json::from_str::<Vec<ContextSummaryEntryArgs>>(trimmed).with_context(
+                        || format!("解析 context_summary.entries 失败：{raw_entries}"),
+                    )?,
+                );
+            } else if trimmed.starts_with('{') {
+                entries.push(
+                    serde_json::from_str::<ContextSummaryEntryArgs>(trimmed).with_context(
+                        || format!("解析 context_summary.entries 失败：{raw_entries}"),
+                    )?,
+                );
+            } else {
+                entries.extend(
+                    parse_loose_u64_list(trimmed, "context_summary.entries")?
+                        .into_iter()
+                        .map(|entry_id| ContextSummaryEntryArgs {
+                            entry_id,
+                            text: None,
+                        }),
+                );
+            }
+        }
+    }
+
+    let mut entry_ids = fields.take_u64_list("entry_ids")?;
+    entry_ids.extend(fields.take_u64_list("entry_id")?);
+    let mut entry_texts = fields.take_text_values("text");
+    entry_texts.extend(fields.take_text_values("content"));
+
+    if !entry_ids.is_empty() {
+        if entry_texts.is_empty() {
+            entries.extend(
+                entry_ids
+                    .into_iter()
+                    .map(|entry_id| ContextSummaryEntryArgs {
+                        entry_id,
+                        text: None,
+                    }),
+            );
+        } else if entry_texts.len() == 1 {
+            let text = entry_texts[0].clone();
+            entries.extend(
+                entry_ids
+                    .into_iter()
+                    .map(|entry_id| ContextSummaryEntryArgs {
+                        entry_id,
+                        text: Some(text.clone()),
+                    }),
+            );
+        } else {
+            entries.extend(entry_ids.into_iter().enumerate().map(|(index, entry_id)| {
+                ContextSummaryEntryArgs {
+                    entry_id,
+                    text: entry_texts
+                        .get(index)
+                        .cloned()
+                        .or_else(|| entry_texts.last().cloned()),
+                }
+            }));
+        }
+    }
+
+    if entries.is_empty() {
+        anyhow::bail!("context_summary 行式参数缺少 entries / entry_ids");
+    }
+    Ok(entries)
+}
+
+fn parse_context_summary_arguments_loose(arguments: &str) -> Result<ContextSummaryArgs> {
+    let mut fields = LooseArgumentFields::parse(arguments, context_summary_arg_key)?;
+    let action = fields
+        .take_text("action")
+        .ok_or_else(|| anyhow!("context_summary 行式参数缺少 action"))?;
+    let entries = parse_context_summary_entries_loose(&mut fields)?;
+    Ok(ContextSummaryArgs {
+        action,
+        persona: fields.take_text("persona"),
+        entries,
+        reason: fields.take_text("reason"),
+        brief: fields.take_text("brief"),
+    })
+}
+
+fn context_compact_arg_key(raw: &str) -> Option<&'static str> {
+    match normalize_loose_key(raw).as_str() {
+        "mode" => Some("mode"),
+        "persona" | "targetpersona" => Some("persona"),
+        "text" => Some("text"),
+        "reason" => Some("reason"),
+        "brief" => Some("brief"),
+        "reporttomatrix" => Some("report_to_matrix"),
+        _ => None,
+    }
+}
+
+fn parse_context_compact_arguments_loose(arguments: &str) -> Result<ContextCompactArgs> {
+    let mut fields = LooseArgumentFields::parse(arguments, context_compact_arg_key)?;
+    let mode = fields
+        .take_text("mode")
+        .ok_or_else(|| anyhow!("context_compact 行式参数缺少 mode"))?;
+    Ok(ContextCompactArgs {
+        mode,
+        persona: fields.take_text("persona"),
+        text: fields.take_text("text"),
+        reason: fields.take_text("reason"),
+        brief: fields.take_text("brief"),
+        report_to_matrix: fields.take_bool("report_to_matrix")?,
+    })
+}
+
+fn context_vision_arg_key(raw: &str) -> Option<&'static str> {
+    match normalize_loose_key(raw).as_str() {
+        "contextpercent" | "percent" | "contextvisibility" | "visibility"
+        | "nextcontextpercent" => Some("context_percent"),
+        "mode" => Some("mode"),
+        "persona" | "targetpersona" => Some("persona"),
+        "reason" => Some("reason"),
+        "brief" => Some("brief"),
+        _ => None,
+    }
+}
+
+fn parse_context_vision_arguments_loose(arguments: &str) -> Result<ContextVisionArgs> {
+    let mut fields = LooseArgumentFields::parse(arguments, context_vision_arg_key)?;
+    Ok(ContextVisionArgs {
+        context_percent: fields.take_text("context_percent").map(Value::String),
+        mode: fields.take_text("mode"),
+        persona: fields.take_text("persona"),
+        reason: fields.take_text("reason"),
+        brief: fields.take_text("brief"),
+    })
+}
+
+fn extract_context_visibility_hint(arguments: &str) -> Option<u8> {
+    if let Ok(value) = serde_json::from_str::<Value>(arguments)
+        && let Some(object) = value.as_object()
+    {
+        for key in [
+            "context_percent",
+            "context_visibility",
+            "next_context_percent",
+            "percent",
+        ] {
+            if let Some(value) = object.get(key)
+                && let Ok(percent) = parse_context_visibility_percent_value(value)
+            {
+                return Some(percent);
+            }
+        }
+        if let Some(value) = object.get("mode")
+            && let Ok(percent) = parse_context_visibility_percent_value(value)
+        {
+            return Some(percent);
+        }
+    }
+    let Ok(mut fields) = LooseArgumentFields::parse(arguments, context_vision_arg_key) else {
+        return None;
+    };
+    fields
+        .take_text("context_percent")
+        .or_else(|| fields.take_text("mode"))
+        .and_then(|raw| parse_context_visibility_percent_text(raw.as_str()).ok())
+}
+
+fn tool_manage_arg_key(raw: &str) -> Option<&'static str> {
+    match normalize_loose_key(raw).as_str() {
+        "action" => Some("action"),
+        "toolids" => Some("tool_ids"),
+        "ids" | "targets" | "names" => Some("tool_ids"),
+        "roleids" => Some("role_ids"),
+        "roles" | "rolenames" => Some("role_ids"),
+        "manifest" => Some("manifest"),
+        "schema" | "toolschema" | "toolcontract" => Some("schema"),
+        "role" => Some("role"),
+        "contextgovernance" => Some("context_governance"),
+        "mode" | "contextgovernancemode" => Some("mode"),
+        "contextsoftlimit" | "contextsoftlimitkb" | "contextsoftlimitm" | "contextmanagelimit" => {
+            Some("manage_threshold_kb")
+        }
+        "managethresholdkb" => Some("manage_threshold_kb"),
+        "contexthardlimit" | "contexthardlimitkb" | "contexthardlimitm" | "contextcompactlimit" => {
+            Some("compact_threshold_kb")
+        }
+        "compactthresholdkb" => Some("compact_threshold_kb"),
+        "reporttomatrix" => Some("report_to_matrix"),
+        "providerbody" | "apibody" => Some("provider_body"),
+        "providerindex" => Some("provider_index"),
+        "model" => Some("model"),
+        "defaulttooloutputlevel" => Some("default_tool_output_level"),
+        "tooloutputsmallkb" => Some("tool_output_small_kb"),
+        "tooloutputnormalkb" => Some("tool_output_normal_kb"),
+        "tooloutputlargekb" => Some("tool_output_large_kb"),
+        "nameen" => Some("name_en"),
+        "namezh" => Some("name_zh"),
+        "agentretentionlimit" => Some("agent_retention_limit"),
+        "permissionmode" => Some("permission_mode"),
+        "terminalauditintervalsecs" => Some("terminal_audit_interval_secs"),
+        "imagecompressionquality" => Some("image_compression_quality"),
+        "imageuploadmaxmb" => Some("image_upload_max_mb"),
+        "themepreset" => Some("theme_preset"),
+        "persona" | "targetpersona" => Some("persona"),
+        "brief" => Some("brief"),
+        "reason" => Some("reason"),
+        "plan" => Some("plan"),
+        _ => None,
+    }
+}
+
+fn parse_tool_manage_arguments_loose(arguments: &str) -> Result<ToolManageArgs> {
+    let mut fields = LooseArgumentFields::parse(arguments, tool_manage_arg_key)?;
+    let action = fields
+        .take_text("action")
+        .ok_or_else(|| anyhow!("tool_manage 行式参数缺少 action"))?;
+    Ok(ToolManageArgs {
+        action,
+        tool_ids: fields.take_string_list("tool_ids")?,
+        role_ids: fields.take_string_list("role_ids")?,
+        manifest: fields.take_deserialized("manifest")?,
+        schema: fields.take_deserialized("schema")?,
+        role: fields.take_deserialized("role")?,
+        context_governance: fields.take_deserialized("context_governance")?,
+        mode: fields.take_text("mode"),
+        manage_threshold_kb: fields.take_u64("manage_threshold_kb")?,
+        compact_threshold_kb: fields.take_u64("compact_threshold_kb")?,
+        report_to_matrix: fields.take_bool("report_to_matrix")?,
+        provider_body: fields.take_deserialized("provider_body")?,
+        provider_index: fields.take_usize("provider_index")?,
+        model: fields.take_text("model"),
+        default_tool_output_level: fields.take_deserialized("default_tool_output_level")?,
+        tool_output_small_kb: fields.take_usize("tool_output_small_kb")?,
+        tool_output_normal_kb: fields.take_usize("tool_output_normal_kb")?,
+        tool_output_large_kb: fields.take_usize("tool_output_large_kb")?,
+        name_en: fields.take_text("name_en"),
+        name_zh: fields.take_text("name_zh"),
+        agent_retention_limit: fields.take_usize("agent_retention_limit")?,
+        permission_mode: fields.take_deserialized("permission_mode")?,
+        terminal_audit_interval_secs: fields.take_u64("terminal_audit_interval_secs")?,
+        image_compression_quality: fields.take_deserialized("image_compression_quality")?,
+        image_upload_max_mb: fields.take_u64("image_upload_max_mb")?,
+        theme_preset: fields.take_deserialized("theme_preset")?,
+        persona: fields.take_text("persona"),
+        brief: fields.take_text("brief"),
+        reason: fields.take_text("reason"),
+        plan: fields.take_text("plan"),
+    })
+}
+
+fn parse_focus_mode_arguments_loose(arguments: &str) -> Result<FocusModeArgs> {
+    let mut fields = LooseArgumentFields::parse(arguments, context_arg_key)?;
+    let action = fields
+        .take_text("action")
+        .ok_or_else(|| anyhow!("focus_mode 行式参数缺少 action"))?;
+    Ok(FocusModeArgs {
+        action,
+        brief: fields.take_text("brief"),
+        task: fields.take_text("task"),
+        user_goal: fields.take_text("user_goal"),
+        reason: fields.take_text("reason"),
+        plan_a: fields.take_text("plan_a"),
+        plan_b: fields.take_text("plan_b"),
+        fallback: fields.take_text("fallback"),
+        plan_c: fields.take_text("plan_c"),
+        expected_result: fields.take_text("expected_result"),
+        exit_condition: fields.take_text("exit_condition"),
+        summary: fields.take_text("summary"),
+        completed: fields.take_text("completed"),
+        implemented: fields.take_text("implemented"),
+        steps: fields.take_text("steps"),
+        key_info: fields.take_text("key_info"),
+        result: fields.take_text("result"),
+        exit_reason: fields.take_text("exit_reason"),
+        fastmemory_text: fields.take_text("fastmemory_text"),
+    })
+}
+
+fn focus_mode_action_key(args: &FocusModeArgs) -> String {
+    crate::canonical_focus_mode_action(args.action.as_str())
+}
+
+fn focus_mode_to_context_manage_args(args: FocusModeArgs) -> ContextManageArgs {
     ContextManageArgs {
-        action: task_mode_action_key(&args),
+        action: focus_mode_action_key(&args),
         target: None,
+        persona: None,
+        scope: None,
         section: None,
         role: None,
         kind: None,
         round_id: None,
         entry_ids: Vec::new(),
+        entry_start_id: None,
+        entry_end_id: None,
         item_ids: Vec::new(),
+        item_start_id: None,
+        item_end_id: None,
         brief: args.brief,
         text: None,
         task: args.task,
@@ -3655,37 +10232,436 @@ fn task_mode_to_context_manage_args(args: TaskModeArgs) -> ContextManageArgs {
         key_info: args.key_info,
         result: args.result,
         exit_reason: args.exit_reason,
-        fastmemory_section: args.fastmemory_section,
         fastmemory_text: args.fastmemory_text,
     }
 }
 
-fn parse_toolbox_manage_arguments(arguments: &str) -> Result<ToolboxManageArgs> {
-    serde_json::from_str(arguments).context("解析 toolbox_manage 参数失败")
+fn parse_persona_manage_arguments(arguments: &str) -> Result<PersonaManageArgs> {
+    serde_json::from_str(arguments).or_else(|json_err| {
+        let mut fields =
+            LooseArgumentFields::parse(arguments, |raw| match normalize_loose_key(raw).as_str() {
+                "action" => Some("action"),
+                "persona" | "targetpersona" | "target" | "to" => Some("persona"),
+                "message" | "text" | "task" | "content" => Some("message"),
+                "brief" => Some("brief"),
+                "reason" => Some("reason"),
+                "includerecent" | "recent" => Some("include_recent"),
+                "priority" => Some("priority"),
+                _ => None,
+            })?;
+        let action = fields
+            .take_text("action")
+            .ok_or_else(|| anyhow!("persona_manage 行式参数缺少 action"))?;
+        Ok::<PersonaManageArgs, anyhow::Error>(PersonaManageArgs {
+            action,
+            persona: fields.take_text("persona").unwrap_or_default(),
+            message: fields.take_text("message"),
+            brief: fields.take_text("brief"),
+            reason: fields.take_text("reason"),
+            include_recent: fields.take_usize("include_recent")?,
+            priority: fields.take_text("priority"),
+        })
+        .with_context(|| format!("解析 persona_manage 参数失败：{json_err}"))
+    })
 }
 
-fn toolbox_manage_action_key(args: &ToolboxManageArgs) -> String {
-    args.action.trim().to_ascii_lowercase()
+fn parse_memory_add_arguments(arguments: &str) -> Result<MemoryAddArgs> {
+    serde_json::from_str(arguments).or_else(|json_err| {
+        let mut fields =
+            LooseArgumentFields::parse(arguments, |raw| match normalize_loose_key(raw).as_str() {
+                "target" => Some("target"),
+                "persona" | "targetpersona" => Some("persona"),
+                "brief" => Some("brief"),
+                "date" => Some("date"),
+                "kind" => Some("kind"),
+                "title" => Some("title"),
+                "keywords" | "keyword" => Some("keywords"),
+                "summary" => Some("summary"),
+                "content" | "text" => Some("content"),
+                "evidenceentryids" | "evidenceids" | "evidence" => Some("evidence_entry_ids"),
+                "entries" => Some("entries"),
+                "clearcontext" => Some("clear_context"),
+                _ => None,
+            })?;
+        let entries = if let Some(raw_entries) = fields.take_text("entries") {
+            let trimmed = raw_entries.trim();
+            if trimmed.starts_with('[') {
+                serde_json::from_str::<Vec<MemoryEntryArgs>>(trimmed)
+                    .with_context(|| format!("解析 memory_add.entries 失败：{raw_entries}"))?
+            } else if trimmed.starts_with('{') {
+                vec![
+                    serde_json::from_str::<MemoryEntryArgs>(trimmed)
+                        .with_context(|| format!("解析 memory_add.entries 失败：{raw_entries}"))?,
+                ]
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        Ok::<MemoryAddArgs, anyhow::Error>(MemoryAddArgs {
+            target: fields.take_text("target"),
+            persona: fields.take_text("persona"),
+            brief: fields.take_text("brief"),
+            date: fields.take_text("date"),
+            kind: fields.take_text("kind"),
+            title: fields.take_text("title"),
+            keywords: fields.take_string_list("keywords")?,
+            summary: fields.take_text("summary"),
+            content: fields.take_text("content"),
+            evidence_entry_ids: fields.take_u64_list("evidence_entry_ids")?,
+            entries,
+            clear_context: fields.take_bool("clear_context")?.unwrap_or(false),
+        })
+        .with_context(|| format!("解析 memory_add 参数失败：{json_err}"))
+    })
 }
 
-fn resolve_toolbox_manage_brief(raw: Option<&str>, args: &ToolboxManageArgs) -> String {
+fn parse_memory_check_arguments(arguments: &str) -> Result<MemoryCheckArgs> {
+    serde_json::from_str(arguments).or_else(|json_err| {
+        let mut fields =
+            LooseArgumentFields::parse(arguments, |raw| match normalize_loose_key(raw).as_str() {
+                "target" => Some("target"),
+                "persona" => Some("persona"),
+                "keywords" | "keyword" => Some("keywords"),
+                "scope" => Some("scope"),
+                "date" => Some("date"),
+                "startdate" => Some("start_date"),
+                "enddate" => Some("end_date"),
+                "toolref" => Some("tool_ref"),
+                "entryid" => Some("entry_id"),
+                "limit" => Some("limit"),
+                "brief" => Some("brief"),
+                _ => None,
+            })?;
+        let target = fields
+            .take_text("target")
+            .ok_or_else(|| anyhow!("memory_check 行式参数缺少 target"))?;
+        Ok::<MemoryCheckArgs, anyhow::Error>(MemoryCheckArgs {
+            target,
+            persona: fields.take_text("persona"),
+            keywords: fields.take_string_list("keywords")?,
+            scope: fields.take_text("scope"),
+            date: fields.take_text("date"),
+            start_date: fields.take_text("start_date"),
+            end_date: fields.take_text("end_date"),
+            tool_ref: fields.take_text("tool_ref"),
+            entry_id: fields.take_u64("entry_id")?,
+            limit: fields.take_usize("limit")?,
+            brief: fields.take_text("brief"),
+        })
+        .with_context(|| format!("解析 memory_check 参数失败：{json_err}"))
+    })
+}
+
+fn parse_memory_read_arguments(arguments: &str) -> Result<MemoryReadArgs> {
+    serde_json::from_str(arguments).or_else(|json_err| {
+        let mut fields =
+            LooseArgumentFields::parse(arguments, |raw| match normalize_loose_key(raw).as_str() {
+                "target" => Some("target"),
+                "persona" => Some("persona"),
+                "date" => Some("date"),
+                "toolref" => Some("tool_ref"),
+                "entryid" => Some("entry_id"),
+                "entryids" => Some("entry_ids"),
+                "entrystartid" => Some("entry_start_id"),
+                "entryendid" => Some("entry_end_id"),
+                "linestart" => Some("line_start"),
+                "lineend" => Some("line_end"),
+                "refid" => Some("ref_id"),
+                "path" => Some("path"),
+                "mode" => Some("mode"),
+                "taillines" => Some("tail_lines"),
+                "cursor" => Some("cursor"),
+                "maxbytes" => Some("max_bytes"),
+                "brief" => Some("brief"),
+                _ => None,
+            })?;
+        let target = fields
+            .take_text("target")
+            .ok_or_else(|| anyhow!("memory_read 行式参数缺少 target"))?;
+        Ok::<MemoryReadArgs, anyhow::Error>(MemoryReadArgs {
+            target,
+            persona: fields.take_text("persona"),
+            date: fields.take_text("date"),
+            tool_ref: fields.take_text("tool_ref"),
+            entry_id: fields.take_u64("entry_id")?,
+            entry_ids: fields.take_u64_list("entry_ids")?,
+            entry_start_id: fields.take_u64("entry_start_id")?,
+            entry_end_id: fields.take_u64("entry_end_id")?,
+            line_start: fields.take_usize("line_start")?,
+            line_end: fields.take_usize("line_end")?,
+            ref_id: fields.take_text("ref_id"),
+            path: fields.take_text("path"),
+            mode: fields.take_text("mode"),
+            tail_lines: fields.take_usize("tail_lines")?,
+            cursor: fields.take_text("cursor"),
+            max_bytes: fields.take_usize("max_bytes")?,
+            brief: fields.take_text("brief"),
+        })
+        .with_context(|| format!("解析 memory_read 参数失败：{json_err}"))
+    })
+}
+
+fn parse_tool_manage_arguments(arguments: &str) -> Result<ToolManageArgs> {
+    serde_json::from_str(arguments).or_else(|json_err| {
+        parse_tool_manage_arguments_loose(arguments)
+            .with_context(|| format!("解析 tool_manage 参数失败：{json_err}"))
+    })
+}
+
+fn tool_manage_action_key(args: &ToolManageArgs) -> String {
+    match args.action.trim().to_ascii_lowercase().as_str() {
+        "settings_set" | "settings_update" | "set_settings" | "update_settings" => {
+            "settings".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+fn resolve_tool_manage_brief(raw: Option<&str>, args: &ToolManageArgs) -> String {
     normalize_brief(raw).unwrap_or_else(|| {
-        let action = toolbox_manage_action_key(args);
+        let action = tool_manage_action_key(args);
         match action.as_str() {
-            "open" => "打开工具箱".to_string(),
-            "close" => "关闭工具箱".to_string(),
-            "pin" => "固定工具箱".to_string(),
+            "health" | "health_check" => "读取链路健康".to_string(),
+            "role_list" | "list_roles" => "查看动态角色".to_string(),
+            "role_reload" | "reload_roles" => "刷新动态角色".to_string(),
+            "role_create" | "create_role" => "新增动态角色".to_string(),
+            "role_copy" | "copy_role" | "role_clone" | "clone_role" | "persona_copy"
+            | "copy_persona" | "persona_clone" | "clone_persona" => "复制动态角色".to_string(),
+            "role_update" | "update_role" => "更新动态角色".to_string(),
+            "role_remove" | "remove_role" => "移除动态角色".to_string(),
+            "role_tool_add" | "add_role_tools" | "role_add_tools" => "给角色增加工具".to_string(),
+            "role_tool_remove" | "remove_role_tools" | "role_remove_tools" => {
+                "移除角色工具".to_string()
+            }
+            "schema_list" | "list_schema" => "查看内建 schema".to_string(),
+            "schema_get" | "read_schema" => "读取内建 schema".to_string(),
+            "schema_update" | "update_schema" | "schema_replace" => "更新内建 schema".to_string(),
+            "schema_reset" | "reset_schema" => "重置内建 schema".to_string(),
+            "context_governance"
+            | "context_governance_set"
+            | "set_context_governance"
+            | "governance_set" => "设置上下文治理".to_string(),
+            "create" => "新增外部工具".to_string(),
+            "update" => "更新外部工具".to_string(),
+            "remove" => "移除外部工具".to_string(),
+            "reload" => "刷新工具箱".to_string(),
+            "open" => "打开工具投影".to_string(),
+            "close" => "关闭工具投影".to_string(),
+            "pin" => "固定工具常驻".to_string(),
             "unpin" => "解除工具常驻".to_string(),
-            _ => "查看工具箱状态".to_string(),
+            "settings" => {
+                let provider_change = args.provider_index.is_some() || args.model.is_some();
+                let tool_budget_change = args.default_tool_output_level.is_some()
+                    || args.tool_output_small_kb.is_some()
+                    || args.tool_output_normal_kb.is_some()
+                    || args.tool_output_large_kb.is_some();
+                let system_change = args.name_en.is_some()
+                    || args.name_zh.is_some()
+                    || args.agent_retention_limit.is_some()
+                    || args.permission_mode.is_some()
+                    || args.terminal_audit_interval_secs.is_some()
+                    || args.image_compression_quality.is_some()
+                    || args.image_upload_max_mb.is_some()
+                    || args.theme_preset.is_some();
+                match (provider_change, tool_budget_change, system_change) {
+                    (true, false, false) => "切换角色模型".to_string(),
+                    (false, true, false) => "调整工具预算".to_string(),
+                    (false, false, true) => "调整系统体验参数".to_string(),
+                    _ => "统一治理设置".to_string(),
+                }
+            }
+            _ => "查看工具投影".to_string(),
         }
     })
 }
 
-fn build_toolbox_manage_input_preview(args: &ToolboxManageArgs) -> String {
-    let action = toolbox_manage_action_key(args);
+fn resolved_tool_manage_context_governance(
+    args: &ToolManageArgs,
+) -> Option<crate::roles::ContextGovernanceSpec> {
+    let mut spec = args.context_governance.clone().unwrap_or_default();
+    let mut has_update = args.context_governance.is_some();
+    if let Some(mode) = args.mode.as_deref() {
+        spec.mode = mode.trim().to_string();
+        has_update = true;
+    }
+    if let Some(threshold) = args.manage_threshold_kb {
+        spec.manage_threshold_kb = threshold;
+        has_update = true;
+    }
+    if let Some(threshold) = args.compact_threshold_kb {
+        spec.compact_threshold_kb = threshold;
+        has_update = true;
+    }
+    if let Some(report) = args.report_to_matrix {
+        spec.report_to_matrix = report;
+        has_update = true;
+    }
+    has_update.then_some(spec)
+}
+
+fn build_tool_manage_input_preview(args: &ToolManageArgs) -> String {
+    let action = tool_manage_action_key(args);
     let mut lines = vec![format!("action: {}", action.to_ascii_uppercase())];
+    if let Some(persona) = args
+        .persona
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("persona: {persona}"));
+    }
     if !args.tool_ids.is_empty() {
         lines.push(format!("tool_ids: {}", args.tool_ids.join(", ")));
+    }
+    if !args.role_ids.is_empty() {
+        lines.push(format!("role_ids: {}", args.role_ids.join(", ")));
+    }
+    if let Some(role) = args.role.as_ref() {
+        if let Some(id) = role.id.as_deref() {
+            lines.push(format!("role.id: {}", id.trim()));
+        }
+        if let Some(display_name) = role.display_name.as_deref() {
+            lines.push(format!("role.name: {}", display_name.trim()));
+        }
+        if let Some(copy_from) = role.copy_from.as_deref() {
+            lines.push(format!("role.copy_from: {}", copy_from.trim()));
+        }
+        if let Some(base_persona) = role.base_persona.as_deref() {
+            lines.push(format!("role.base: {}", base_persona.trim()));
+        }
+        if let Some(default_tools) = role.default_tools.as_ref() {
+            lines.push(format!("role.tools: {}", default_tools.join(", ")));
+        }
+        if let Some(managed_role_ids) = role.managed_role_ids.as_ref() {
+            lines.push(format!(
+                "role.managed_role_ids: {}",
+                managed_role_ids.join(", ")
+            ));
+        }
+        if let Some(governance) = role.context_governance.as_ref() {
+            lines.push(format!(
+                "role.context_governance: {} manage={}KB compact={}KB",
+                governance.mode, governance.manage_threshold_kb, governance.compact_threshold_kb
+            ));
+        }
+        if role.prompt.is_some() {
+            lines.push("role.prompt: set".to_string());
+        }
+    }
+    if let Some(governance) = resolved_tool_manage_context_governance(args) {
+        lines.push(format!(
+            "context_governance: {} manage={}KB compact={}KB report_to_matrix={}",
+            governance.mode,
+            governance.manage_threshold_kb,
+            governance.compact_threshold_kb,
+            governance.report_to_matrix
+        ));
+    }
+    if action == "settings" {
+        if let Some(body) = args.provider_body {
+            lines.push(format!(
+                "provider_body: {}",
+                match body {
+                    crate::ApiBodyKind::Official => "official",
+                    crate::ApiBodyKind::ThirdParty => "third_party",
+                }
+            ));
+        }
+        if let Some(index) = args.provider_index {
+            lines.push(format!("provider_index: {index}"));
+        }
+        if let Some(model) = args
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            lines.push(format!("model: {}", truncate_preview(model, 120)));
+        }
+        if let Some(level) = args.default_tool_output_level {
+            lines.push(format!("tool_output_default_level: {}", level.user_label()));
+        }
+        if let Some(value) = args.tool_output_small_kb {
+            lines.push(format!(
+                "tool_output_small_kb: {} KB",
+                sanitize_tool_output_kb(value)
+            ));
+        }
+        if let Some(value) = args.tool_output_normal_kb {
+            lines.push(format!(
+                "tool_output_normal_kb: {} KB",
+                sanitize_tool_output_kb(value)
+            ));
+        }
+        if let Some(value) = args.tool_output_large_kb {
+            lines.push(format!(
+                "tool_output_large_kb: {} KB",
+                sanitize_tool_output_kb(value)
+            ));
+        }
+        if let Some(name) = args
+            .name_en
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            lines.push(format!("name_en: {name}"));
+        }
+        if let Some(name) = args
+            .name_zh
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            lines.push(format!("name_zh: {name}"));
+        }
+        if let Some(limit) = args.agent_retention_limit {
+            lines.push(format!("agent_retention_limit: {limit}"));
+        }
+        if let Some(mode) = args.permission_mode {
+            lines.push(format!("permission_mode: {}", mode.label()));
+        }
+        if let Some(interval) = args.terminal_audit_interval_secs {
+            lines.push(format!("terminal_audit_interval_secs: {interval}"));
+        }
+        if let Some(quality) = args.image_compression_quality {
+            lines.push(format!("image_compression_quality: {}", quality.label()));
+        }
+        if let Some(upload) = args.image_upload_max_mb {
+            lines.push(format!(
+                "image_upload_max_mb: {} MB",
+                sanitize_view_image_upload_max_mb(upload)
+            ));
+        }
+        if let Some(theme) = args.theme_preset {
+            lines.push(format!("theme_preset: {}", theme.label()));
+        }
+    }
+    if let Some(manifest) = args.manifest.as_ref() {
+        lines.push(format!("manifest: {}", manifest.name.trim()));
+        lines.push(format!("program: {}", manifest.program.trim()));
+        if manifest.display.is_some() {
+            lines.push("ui: display".to_string());
+        }
+        if manifest.output_policy.is_some() {
+            lines.push("output_policy: set".to_string());
+        }
+        if manifest.scheduler.is_some() {
+            lines.push("scheduler: set".to_string());
+        }
+        if manifest.parameters.is_some() {
+            lines.push("schema: parameters".to_string());
+        }
+    }
+    if let Some(schema) = args.schema.as_ref()
+        && let Some(name) = schema.get("name").and_then(Value::as_str)
+    {
+        lines.push(format!("schema.name: {}", name.trim()));
+        if let Some(title) = schema.get("title").and_then(Value::as_str) {
+            lines.push(format!("schema.title: {}", title.trim()));
+        }
     }
     if let Some(reason) = normalize_brief(args.reason.as_deref()) {
         lines.push(format!("reason: {reason}"));
@@ -3696,24 +10672,829 @@ fn build_toolbox_manage_input_preview(args: &ToolboxManageArgs) -> String {
     lines.join("\n")
 }
 
+fn execute_tool_health_read(args: &ToolManageArgs) -> Result<Option<ExecCommandExecution>> {
+    let action = tool_manage_action_key(args);
+    if !matches!(action.as_str(), "health" | "health_check") {
+        return Ok(None);
+    }
+    let actor = current_tool_persona();
+    if !matches!(
+        actor,
+        crate::PersonaKind::Matrix | crate::PersonaKind::Advisor
+    ) {
+        anyhow::bail!("tool_manage health 只允许 Matrix · 萤 或 司 使用");
+    }
+    let health_path = crate::app_project_root().join("Aidebug/health.json");
+    let health_text = fs::read_to_string(health_path.as_path())
+        .with_context(|| format!("读取 Aidebug health 失败：{}", health_path.display()))?;
+    let health: Value = serde_json::from_str(health_text.as_str())
+        .with_context(|| format!("解析 Aidebug health 失败：{}", health_path.display()))?;
+    let mut lines = vec!["tool_manage:ok".to_string(), "action:HEALTH".to_string()];
+    if let Some(score) = health.get("overall_score").and_then(Value::as_u64) {
+        lines.push(format!("overall_score:{score}"));
+    }
+    if let Some(state) = health.get("overall_state").and_then(Value::as_str) {
+        lines.push(format!("overall_state:{state}"));
+    }
+    if let Some(ts_ms) = health.get("source_status_ts_ms").and_then(Value::as_u64) {
+        lines.push(format!("source_status_ts_ms:{ts_ms}"));
+    }
+    lines.push("chains:".to_string());
+    for chain in health
+        .get("chains")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let id = chain.get("id").and_then(Value::as_str).unwrap_or("unknown");
+        let state = chain
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN");
+        let score = chain.get("score").and_then(Value::as_u64).unwrap_or(0);
+        let hint = chain
+            .get("action_hint")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let evidence = chain
+            .get("evidence")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if hint.is_empty() {
+            lines.push(format!(
+                "- {id} state={state} score={score} evidence={evidence}"
+            ));
+        } else {
+            lines.push(format!(
+                "- {id} state={state} score={score} evidence={evidence} hint={hint}"
+            ));
+        }
+    }
+    let model_output = lines.join("\n");
+    Ok(Some(ExecCommandExecution {
+        brief: resolve_tool_manage_brief(args.brief.as_deref(), args),
+        kind_label: "ToolManage".to_string(),
+        action_label: "Health".to_string(),
+        model_output: model_output.clone(),
+        command_preview: build_tool_manage_input_preview(args),
+        output_preview: model_output,
+        exit_code: Some(0),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    }))
+}
+
+fn tool_manage_schema_target_names(args: &ToolManageArgs) -> Result<Vec<String>> {
+    let mut names = Vec::<String>::new();
+    for name in args.tool_ids.iter().filter_map(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then_some(codex_provider_tool_name(trimmed).to_string())
+    }) {
+        if !names.iter().any(|existing| existing == &name) {
+            names.push(name);
+        }
+    }
+    let schema_name = args
+        .schema
+        .as_ref()
+        .and_then(|schema| schema.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(codex_provider_tool_name)
+        .map(str::to_string);
+    if let Some(schema_name) = schema_name {
+        if !names.iter().any(|existing| existing == &schema_name) {
+            names.push(schema_name);
+        }
+    }
+    Ok(names)
+}
+
+fn find_shared_codex_tool_schema(tools: &Value, name: &str) -> Option<Value> {
+    let canonical_name = codex_provider_tool_name(name);
+    tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .map(codex_provider_tool_name)
+                == Some(canonical_name)
+        })
+        .cloned()
+}
+
+fn execute_schema_manage(args: &ToolManageArgs) -> Result<Option<ExecCommandExecution>> {
+    let action = tool_manage_action_key(args);
+    if !matches!(
+        action.as_str(),
+        "schema_list"
+            | "list_schema"
+            | "schema_get"
+            | "read_schema"
+            | "schema_update"
+            | "update_schema"
+            | "schema_replace"
+            | "schema_reset"
+            | "reset_schema"
+    ) {
+        return Ok(None);
+    }
+    let actor = current_tool_persona();
+    if !matches!(
+        actor,
+        crate::PersonaKind::Matrix | crate::PersonaKind::Advisor
+    ) {
+        anyhow::bail!("tool_manage schema 只允许 Matrix · 萤 或 司 使用");
+    }
+    let mut lines = vec![
+        "tool_manage:ok".to_string(),
+        format!("action:{}", action.to_ascii_uppercase()),
+        format!(
+            "override_file:{}",
+            display_path_for_ui(tool_schema_override_path().as_path())
+        ),
+    ];
+    let output_preview = match action.as_str() {
+        "schema_list" | "list_schema" => {
+            let tools = shared_codex_tools();
+            let overrides = load_shared_tool_schema_overrides();
+            let override_names = overrides
+                .tools
+                .iter()
+                .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                .map(codex_provider_tool_name)
+                .map(str::to_string)
+                .collect::<HashSet<_>>();
+            let selected_names = tool_manage_schema_target_names(args)?;
+            let items = tools.as_array().into_iter().flatten().filter_map(|tool| {
+                let name = tool.get("name").and_then(Value::as_str)?;
+                if !selected_names.is_empty()
+                    && !selected_names
+                        .iter()
+                        .any(|selected| selected == codex_provider_tool_name(name))
+                {
+                    return None;
+                }
+                let canonical = codex_provider_tool_name(name).to_string();
+                let status = if override_names.contains(&canonical) {
+                    "override"
+                } else {
+                    "default"
+                };
+                let description = tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                Some(format!(
+                    "- {} [{}] {}",
+                    canonical,
+                    status,
+                    truncate_preview(description, 120)
+                ))
+            });
+            lines.push(format!(
+                "tools:{}",
+                tools.as_array().map(|items| items.len()).unwrap_or(0)
+            ));
+            let mut collected = items.collect::<Vec<_>>();
+            if collected.is_empty() {
+                collected.push("- (none)".to_string());
+            }
+            lines.extend(collected);
+            lines.join("\n")
+        }
+        "schema_get" | "read_schema" => {
+            let selected_names = tool_manage_schema_target_names(args)?;
+            if selected_names.is_empty() {
+                anyhow::bail!("schema_get 需要 tool_ids 或 schema.name");
+            }
+            let tools = shared_codex_tools();
+            let selected = selected_names
+                .iter()
+                .map(|name| {
+                    find_shared_codex_tool_schema(&tools, name)
+                        .ok_or_else(|| anyhow!("不支持的内建 schema：{name}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            lines.push(format!("schemas:{}", selected.len()));
+            let pretty = serde_json::to_string_pretty(&json!({ "tools": selected }))?;
+            lines.push(pretty.clone());
+            pretty
+        }
+        "schema_update" | "update_schema" | "schema_replace" => {
+            let schema = args
+                .schema
+                .as_ref()
+                .ok_or_else(|| anyhow!("schema_update 需要 schema"))?;
+            let normalized = normalize_shared_tool_schema_value(schema)?;
+            let canonical_name = normalized
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("schema.name 不能为空"))?;
+            let selected_names = tool_manage_schema_target_names(args)?;
+            if !selected_names.is_empty()
+                && !selected_names.iter().all(|name| name == canonical_name)
+            {
+                anyhow::bail!("tool_ids 与 schema.name 不一致");
+            }
+            let mut store = load_shared_tool_schema_overrides();
+            store.tools.retain(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .map(codex_provider_tool_name)
+                    != Some(canonical_name)
+            });
+            store.tools.push(normalized.clone());
+            save_shared_tool_schema_overrides(&store)?;
+            lines.push(format!("schema:{}", canonical_name));
+            lines.push("reload:hot".to_string());
+            serde_json::to_string_pretty(&normalized)?
+        }
+        "schema_reset" | "reset_schema" => {
+            let selected_names = tool_manage_schema_target_names(args)?;
+            let mut store = load_shared_tool_schema_overrides();
+            if selected_names.is_empty() {
+                let removed = store.tools.len();
+                store.tools.clear();
+                save_shared_tool_schema_overrides(&store)?;
+                lines.push(format!("removed:{removed}"));
+                lines.push("all_schema_overrides_cleared".to_string());
+            } else {
+                let removed_names = selected_names
+                    .iter()
+                    .map(|name| codex_provider_tool_name(name).to_string())
+                    .collect::<HashSet<_>>();
+                let before = store.tools.len();
+                store.tools.retain(|tool| {
+                    tool.get("name")
+                        .and_then(Value::as_str)
+                        .map(codex_provider_tool_name)
+                        .map(|name| !removed_names.contains(name))
+                        .unwrap_or(true)
+                });
+                let removed = before.saturating_sub(store.tools.len());
+                save_shared_tool_schema_overrides(&store)?;
+                lines.push(format!("removed:{removed}"));
+                lines.push(format!("names:{}", selected_names.join(", ")));
+            }
+            "schema overrides reset".to_string()
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(ExecCommandExecution {
+        brief: resolve_tool_manage_brief(args.brief.as_deref(), args),
+        kind_label: "ToolManage".to_string(),
+        action_label: "Schema".to_string(),
+        model_output: lines.join("\n"),
+        command_preview: build_tool_manage_input_preview(args),
+        output_preview,
+        exit_code: Some(0),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    }))
+}
+
+fn tool_manage_context_governance_target(args: &ToolManageArgs) -> Result<PersonaScopeTarget> {
+    if let Some(target) =
+        parse_persona_scope_target(args.persona.as_deref(), "tool_manage.persona")?
+    {
+        return Ok(target);
+    }
+    if let Some(role_id) = args
+        .role
+        .as_ref()
+        .and_then(|role| role.id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            args.role_ids
+                .iter()
+                .map(|value| value.trim())
+                .find(|value| !value.is_empty())
+        })
+    {
+        let role = crate::roles::find_role(role_id)?
+            .ok_or_else(|| anyhow!("动态角色不存在：{role_id}"))?;
+        return Ok(PersonaScopeTarget::DynamicRole(role));
+    }
+    Ok(PersonaScopeTarget::Persona(current_tool_persona()))
+}
+
+fn execute_context_governance_manage(
+    args: &ToolManageArgs,
+) -> Result<Option<ExecCommandExecution>> {
+    let action = tool_manage_action_key(args);
+    if !matches!(
+        action.as_str(),
+        "context_governance"
+            | "context_governance_set"
+            | "set_context_governance"
+            | "governance_set"
+    ) {
+        return Ok(None);
+    }
+    if current_tool_persona() != crate::PersonaKind::Matrix {
+        anyhow::bail!("tool_manage context_governance 只允许 Matrix · 萤 使用");
+    }
+    let spec = resolved_tool_manage_context_governance(args)
+        .ok_or_else(|| anyhow!("context_governance_set 需要 context_governance 或阈值字段"))?;
+    let target = tool_manage_context_governance_target(args)?;
+    let mut side_effects = Vec::new();
+    let (target_label, applied) = match target {
+        PersonaScopeTarget::Persona(persona) => {
+            let applied =
+                crate::context::set_context_governance_spec_for_persona(persona, spec.clone())?;
+            let (action, tools, reason) = match applied.mode.trim().to_ascii_lowercase().as_str() {
+                "self_compact" | "summary_compact" | "compact" | "self" => (
+                    "open",
+                    vec!["context_compact".to_string(), "context_summary".to_string()],
+                    "context_governance summary_compact 需要开放 summary/compact 工具",
+                ),
+                "vision_compact" | "context_vision" | "vision" | "fast" => (
+                    "open",
+                    vec!["context_compact".to_string(), "context_vision".to_string()],
+                    "context_governance vision_compact 需要开放 vision/compact 工具",
+                ),
+                _ => (
+                    "close",
+                    vec![
+                        "context_compact".to_string(),
+                        "context_summary".to_string(),
+                        "context_vision".to_string(),
+                    ],
+                    "context_governance advisor_managed 撤回自管上下文工具授权",
+                ),
+            };
+            if let Ok(reply) = crate::context::tool_manage(
+                action,
+                tools.as_slice(),
+                Some(persona.context_dir_name()),
+                Some(reason),
+                args.plan.as_deref(),
+            ) {
+                side_effects.push(format!(
+                    "toolbox:{}",
+                    reply
+                        .model_output
+                        .lines()
+                        .filter(|line| line.starts_with("changed:"))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                ));
+            }
+            (persona.context_dir_name().to_string(), applied)
+        }
+        PersonaScopeTarget::DynamicRole(role) => {
+            let mut tools = role.default_tools.clone();
+            match spec.mode.trim().to_ascii_lowercase().as_str() {
+                "self_compact" | "summary_compact" | "compact" | "self" => {
+                    tools.extend(["context_compact", "context_summary"].map(str::to_string));
+                }
+                "vision_compact" | "context_vision" | "vision" | "fast" => {
+                    tools.extend(["context_compact", "context_vision"].map(str::to_string));
+                }
+                _ => {
+                    tools.retain(|tool| {
+                        !matches!(
+                            tool.trim(),
+                            "context_compact" | "context_summary" | "context_vision"
+                        )
+                    });
+                }
+            }
+            let tools = tools
+                .iter()
+                .map(|tool| tool.trim())
+                .filter(|tool| !tool.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let result = crate::roles::manage_role_action(
+                "role_update",
+                Some(crate::roles::DynamicRoleDraft {
+                    id: Some(role.id.clone()),
+                    default_tools: Some(tools),
+                    context_governance: Some(spec.clone()),
+                    ..Default::default()
+                }),
+                &[],
+                &[],
+            )?;
+            side_effects.push("role_update:ok".to_string());
+            if let Some(updated) = crate::roles::find_role(role.id.as_str())? {
+                side_effects.push(format!("role_tools:{}", updated.default_tools.join("|")));
+                (format!("role:{}", updated.id), updated.context_governance)
+            } else {
+                side_effects.push(result.model_output.lines().next().unwrap_or("").to_string());
+                (format!("role:{}", role.id), spec)
+            }
+        }
+    };
+    let mut lines = vec![
+        "tool_manage:ok".to_string(),
+        "action:CONTEXT_GOVERNANCE_SET".to_string(),
+        format!("target:{target_label}"),
+        format!("mode:{}", applied.mode),
+        format!("manage_threshold_kb:{}", applied.manage_threshold_kb),
+        format!("compact_threshold_kb:{}", applied.compact_threshold_kb),
+        format!("report_to_matrix:{}", applied.report_to_matrix),
+    ];
+    if applied.mode.trim().eq_ignore_ascii_case("summary_compact") {
+        lines.push("mode:self_compact".to_string());
+    }
+    if !side_effects.is_empty() {
+        lines.push(format!("side_effects:{}", side_effects.join(" | ")));
+    }
+    let model_output = lines.join("\n");
+    Ok(Some(ExecCommandExecution {
+        brief: resolve_tool_manage_brief(args.brief.as_deref(), args),
+        kind_label: "ToolManage".to_string(),
+        action_label: "Governance".to_string(),
+        model_output: model_output.clone(),
+        command_preview: build_tool_manage_input_preview(args),
+        output_preview: model_output,
+        exit_code: Some(0),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    }))
+}
+
+fn execute_settings_manage(args: &ToolManageArgs) -> Result<Option<ExecCommandExecution>> {
+    let action = tool_manage_action_key(args);
+    if action != "settings" {
+        return Ok(None);
+    }
+    if current_tool_persona() != crate::PersonaKind::Matrix {
+        anyhow::bail!("tool_manage settings 只允许 Matrix · 萤 使用");
+    }
+    let target_persona =
+        match parse_persona_scope_target(args.persona.as_deref(), "tool_manage.persona")? {
+            Some(PersonaScopeTarget::Persona(persona)) => persona,
+            Some(PersonaScopeTarget::DynamicRole(_)) => {
+                anyhow::bail!("tool_manage settings 只能作用于静态 persona")
+            }
+            None => current_tool_persona(),
+        };
+    let patch = crate::settings::PersonaSettingsPatch {
+        provider_body: args.provider_body,
+        provider_index: args.provider_index,
+        provider_model: args
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        default_tool_output_level: args.default_tool_output_level,
+        tool_output_small_kb: args.tool_output_small_kb,
+        tool_output_normal_kb: args.tool_output_normal_kb,
+        tool_output_large_kb: args.tool_output_large_kb,
+        name_en: args
+            .name_en
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        name_zh: args
+            .name_zh
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        agent_retention_limit: args.agent_retention_limit,
+        permission_mode: args.permission_mode,
+        terminal_audit_interval_secs: args.terminal_audit_interval_secs,
+        image_compression_quality: args.image_compression_quality,
+        image_upload_max_mb: args.image_upload_max_mb,
+        theme_preset: args.theme_preset,
+    };
+    if patch.provider_body.is_none()
+        && patch.provider_index.is_none()
+        && patch.provider_model.is_none()
+        && patch.default_tool_output_level.is_none()
+        && patch.tool_output_small_kb.is_none()
+        && patch.tool_output_normal_kb.is_none()
+        && patch.tool_output_large_kb.is_none()
+        && patch.name_en.is_none()
+        && patch.name_zh.is_none()
+        && patch.agent_retention_limit.is_none()
+        && patch.permission_mode.is_none()
+        && patch.terminal_audit_interval_secs.is_none()
+        && patch.image_compression_quality.is_none()
+        && patch.image_upload_max_mb.is_none()
+        && patch.theme_preset.is_none()
+    {
+        anyhow::bail!("tool_manage settings 需要至少一个设置字段");
+    }
+    let mut lines = vec![
+        "tool_manage:ok".to_string(),
+        "action:SETTINGS".to_string(),
+        format!("target:{}", target_persona.context_dir_name()),
+    ];
+    let result_lines = crate::settings::apply_persona_settings_patch(target_persona, patch)?;
+    lines.extend(result_lines);
+    let model_output = lines.join("\n");
+    Ok(Some(ExecCommandExecution {
+        brief: resolve_tool_manage_brief(args.brief.as_deref(), args),
+        kind_label: "ToolManage".to_string(),
+        action_label: "Settings".to_string(),
+        model_output: model_output.clone(),
+        command_preview: build_tool_manage_input_preview(args),
+        output_preview: model_output,
+        exit_code: Some(0),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    }))
+}
+
+fn execute_role_manage(args: &ToolManageArgs) -> Result<Option<ExecCommandExecution>> {
+    let action = tool_manage_action_key(args);
+    if !matches!(
+        action.as_str(),
+        "role_list"
+            | "list_roles"
+            | "role_reload"
+            | "reload_roles"
+            | "role_create"
+            | "create_role"
+            | "role_copy"
+            | "copy_role"
+            | "role_clone"
+            | "clone_role"
+            | "persona_copy"
+            | "copy_persona"
+            | "persona_clone"
+            | "clone_persona"
+            | "role_update"
+            | "update_role"
+            | "role_remove"
+            | "remove_role"
+            | "role_tool_add"
+            | "add_role_tools"
+            | "role_add_tools"
+            | "role_tool_remove"
+            | "remove_role_tools"
+            | "role_remove_tools"
+    ) {
+        return Ok(None);
+    }
+    let actor = current_tool_persona();
+    if actor != crate::PersonaKind::Matrix {
+        anyhow::bail!("tool_manage 动态角色治理只允许 Matrix · 萤 使用");
+    }
+    let result = crate::roles::manage_role_action(
+        action.as_str(),
+        args.role.clone(),
+        args.role_ids.as_slice(),
+        args.tool_ids.as_slice(),
+    )?;
+    Ok(Some(ExecCommandExecution {
+        brief: resolve_tool_manage_brief(args.brief.as_deref(), args),
+        kind_label: "ToolManage".to_string(),
+        action_label: "Role".to_string(),
+        model_output: result.model_output,
+        command_preview: build_tool_manage_input_preview(args),
+        output_preview: result.output_preview,
+        exit_code: Some(0),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    }))
+}
+
+fn execute_tool_manifest_manage(args: &ToolManageArgs) -> Result<Option<ExecCommandExecution>> {
+    let action = tool_manage_action_key(args);
+    if !matches!(action.as_str(), "create" | "update" | "remove") {
+        return Ok(None);
+    }
+    let actor = current_tool_persona();
+    if actor != crate::PersonaKind::Matrix {
+        anyhow::bail!("tool_manage 工具创建/移除只允许 Matrix · 萤 使用");
+    }
+    let brief = resolve_tool_manage_brief(args.brief.as_deref(), args);
+    let mut lines = vec![
+        "tool_manage:ok".to_string(),
+        format!("action:{}", action.to_ascii_uppercase()),
+    ];
+    let output_preview = match action.as_str() {
+        "create" | "update" => {
+            let manifest = args
+                .manifest
+                .clone()
+                .ok_or_else(|| anyhow!("tool_manage {action} 需要 manifest"))?;
+            if let Some(expected) = args.tool_ids.first().map(|value| value.trim())
+                && !expected.is_empty()
+                && expected != manifest.name.trim()
+            {
+                anyhow::bail!(
+                    "tool_ids[0] 与 manifest.name 不一致：{} != {}",
+                    expected,
+                    manifest.name.trim()
+                );
+            }
+            let (manifest, path, replaced) =
+                write_external_tool_manifest(manifest, action == "create")?;
+            lines.push(format!("tool:{}", manifest.name));
+            lines.push(format!("manifest:{}", display_path_for_ui(path.as_path())));
+            if !replaced.is_empty() {
+                lines.push(format!(
+                    "replaced:{}",
+                    replaced
+                        .iter()
+                        .map(|path| display_path_for_ui(path.as_path()))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                ));
+            }
+            [
+                format!("tool: {}", manifest.name),
+                format!("manifest: {}", display_path_for_ui(path.as_path())),
+                format!("program: {}", manifest.program),
+                format!(
+                    "schema: {}",
+                    if manifest.parameters.is_some() {
+                        "parameters"
+                    } else {
+                        "default"
+                    }
+                ),
+                format!(
+                    "ui: {}",
+                    manifest
+                        .display
+                        .as_ref()
+                        .and_then(|display| normalize_brief(Some(display.title.as_str())))
+                        .unwrap_or_else(|| {
+                            if manifest.display.is_some() {
+                                "display".to_string()
+                            } else {
+                                "default".to_string()
+                            }
+                        })
+                ),
+                "state: closed until Matrix opens or pins it for a persona".to_string(),
+            ]
+            .join("\n")
+        }
+        "remove" => {
+            let removed = remove_external_tool_manifests(args.tool_ids.as_slice())?;
+            let pruned_toolbox_entries =
+                crate::context::purge_removed_toolbox_entries(args.tool_ids.as_slice())?;
+            let pruned_roles = crate::roles::purge_removed_tool_ids(args.tool_ids.as_slice())?;
+            lines.push(format!(
+                "removed:{}",
+                removed
+                    .iter()
+                    .map(|path| display_path_for_ui(path.as_path()))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ));
+            [
+                format!("removed: {}", removed.len()),
+                removed
+                    .iter()
+                    .map(|path| display_path_for_ui(path.as_path()))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                format!("toolbox_entries_pruned: {pruned_toolbox_entries}"),
+                format!("roles_pruned: {pruned_roles}"),
+            ]
+            .join("\n")
+        }
+        _ => return Ok(None),
+    };
+    let _ = crate::context::tool_manage(
+        "reload",
+        &[],
+        args.persona.as_deref(),
+        Some("外部工具 manifest 已变更，刷新工具箱投影"),
+        args.plan.as_deref(),
+    );
+    lines.push("reload:requested".to_string());
+    Ok(Some(ExecCommandExecution {
+        brief,
+        kind_label: "ToolManage".to_string(),
+        action_label: "Manage".to_string(),
+        model_output: lines.join("\n"),
+        command_preview: build_tool_manage_input_preview(args),
+        output_preview,
+        exit_code: Some(0),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    }))
+}
+
 fn parse_context_target(raw: Option<&str>) -> Result<ContextTarget> {
-    match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
-        "context" => Ok(ContextTarget::Context),
-        "toolcontext" | "tool_context" | "taskcontext" | "task_context" | "focuscontext"
-        | "focus_context" => Ok(ContextTarget::FocusContext),
-        "fastmemory" | "fast_memory" => Ok(ContextTarget::FastMemory),
-        "fastcontext" | "fast_context" => Ok(ContextTarget::FastContext),
-        "adviceboard" | "advice_board" => Ok(ContextTarget::AdviceBoard),
-        other => anyhow::bail!("不支持的 context target：{other}"),
+    let raw_target = raw.unwrap_or("").trim();
+    match crate::canonical_context_target_name(raw_target) {
+        Some("context") => Ok(ContextTarget::Context),
+        Some("focuscontext") => Ok(ContextTarget::FocusContext),
+        Some("fastmemory") => Ok(ContextTarget::FastMemory),
+        _ => anyhow::bail!(
+            "不支持的 context target：{}",
+            raw_target.to_ascii_lowercase()
+        ),
+    }
+}
+
+fn context_manage_is_prompt_target(raw: Option<&str>) -> bool {
+    raw.and_then(crate::canonical_context_target_name) == Some("prompt")
+}
+
+fn context_manage_target_label(raw: Option<&str>) -> Option<&'static str> {
+    match raw.and_then(crate::canonical_context_target_name) {
+        Some("context") => Some(ContextTarget::Context.label()),
+        Some("focuscontext") => Some(ContextTarget::FocusContext.label()),
+        Some("fastmemory") => Some(ContextTarget::FastMemory.label()),
+        Some("prompt") => Some("提示词"),
+        _ => None,
+    }
+}
+
+enum PersonaScopeTarget {
+    Persona(crate::PersonaKind),
+    DynamicRole(crate::roles::DynamicRoleSpec),
+}
+
+fn parse_persona_scope_target(
+    raw: Option<&str>,
+    field_name: &str,
+) -> Result<Option<PersonaScopeTarget>> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if let Some(persona) = crate::PersonaKind::parse_alias(raw) {
+        return Ok(Some(PersonaScopeTarget::Persona(persona)));
+    }
+    if let Some(role) = crate::roles::find_role(raw)? {
+        return Ok(Some(PersonaScopeTarget::DynamicRole(role)));
+    }
+    anyhow::bail!("不支持的 {field_name}：{raw}")
+}
+
+fn parse_current_role_persona_scope_target(
+    raw: Option<&str>,
+    field_name: &str,
+) -> Result<Option<PersonaScopeTarget>> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if let Some(role_context) = current_tool_role_context()
+        && crate::PersonaKind::parse_alias(raw) == Some(role_context.base_persona)
+        && let Some(role) = crate::roles::find_role(role_context.role_id.as_str())?
+    {
+        return Ok(Some(PersonaScopeTarget::DynamicRole(role)));
+    }
+    parse_persona_scope_target(Some(raw), field_name)
+}
+
+fn parse_context_persona_scope(raw: Option<&str>) -> Result<Option<PersonaScopeTarget>> {
+    parse_persona_scope_target(raw, "context_manage.persona")
+}
+
+fn parse_context_compact_persona_scope(raw: Option<&str>) -> Result<Option<PersonaScopeTarget>> {
+    parse_current_role_persona_scope_target(raw, "context_compact.persona")
+}
+
+fn parse_context_summary_persona_scope(raw: Option<&str>) -> Result<Option<PersonaScopeTarget>> {
+    parse_current_role_persona_scope_target(raw, "context_summary.persona")
+}
+
+fn parse_context_vision_persona_scope(raw: Option<&str>) -> Result<Option<PersonaScopeTarget>> {
+    parse_current_role_persona_scope_target(raw, "context_vision.persona")
+}
+
+fn parse_context_compact_mode(raw: &str) -> Result<ContextCompactMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "all" => Ok(ContextCompactMode::All),
+        "old" => Ok(ContextCompactMode::Old),
+        "fast" => Ok(ContextCompactMode::Fast),
+        other => anyhow::bail!("不支持的 context_compact.mode：{other}"),
     }
 }
 
 fn parse_fastmemory_section(raw: Option<&str>) -> Result<FastMemorySection> {
     match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
-        "environment" => Ok(FastMemorySection::Environment),
-        "self" | "self_state" => Ok(FastMemorySection::SelfState),
-        "user" => Ok(FastMemorySection::User),
-        "event" => Ok(FastMemorySection::Event),
+        "public" | "shared" | "board" | "matrix_board" | "public_board" => {
+            Ok(FastMemorySection::Public)
+        }
+        "" | "surface" | "profile" | "preference" | "preferences" | "environment" | "self"
+        | "self_state" | "user" => Ok(FastMemorySection::Surface),
+        "experience" | "lesson" | "lessons" | "strategy" | "strategies" | "event" => {
+            Ok(FastMemorySection::Experience)
+        }
         other => anyhow::bail!("不支持的 fastmemory section：{other}"),
     }
 }
@@ -3729,29 +11510,50 @@ fn parse_context_role(raw: Option<&str>) -> Result<ContextRole> {
 
 fn context_manage_action_key(args: &ContextManageArgs) -> String {
     match args.action.trim().to_ascii_lowercase().as_str() {
-        "replace" => "summary".to_string(),
-        "task_enter" => "focus_enter".to_string(),
-        "task_exit" => "focus_exit".to_string(),
-        other => other.to_string(),
+        "replace" | "compact" => "summary".to_string(),
+        other => crate::canonical_focus_mode_action(other),
     }
 }
 
 fn context_manage_action_display_key(args: &ContextManageArgs) -> String {
-    match context_manage_action_key(args).as_str() {
-        "focus_enter" => "task_enter".to_string(),
-        "focus_exit" => "task_exit".to_string(),
-        other => other.to_string(),
-    }
+    context_manage_action_key(args)
+}
+
+fn context_management_tool_description(description: &str) -> String {
+    format!(
+        "{description}\n\n{}",
+        crate::context::CONTEXT_MANAGEMENT_ACTIVE_HINT
+    )
 }
 
 fn context_manage_labels(args: &ContextManageArgs) -> (String, String) {
+    let prompt_target = context_manage_is_prompt_target(args.target.as_deref());
     match context_manage_action_key(args).as_str() {
-        "focus_enter" => ("TASK".to_string(), "Enter".to_string()),
-        "focus_exit" => ("TASK".to_string(), "Exit".to_string()),
+        "focus_enter" => ("FOCUS".to_string(), "Enter".to_string()),
+        "focus_exit" => ("FOCUS".to_string(), "Exit".to_string()),
+        "summary" if prompt_target => ("PROMPT".to_string(), "Summary".to_string()),
         "summary" => ("CONTEXT".to_string(), "Summary".to_string()),
-        "compact" => ("CONTEXT".to_string(), "Compact".to_string()),
+        _ if prompt_target => ("PROMPT".to_string(), "Write".to_string()),
         _ => ("CONTEXT".to_string(), "Write".to_string()),
     }
+}
+
+fn context_compact_labels(args: &ContextCompactArgs) -> (String, String) {
+    let action = match args.mode.trim().to_ascii_lowercase().as_str() {
+        "all" => "ALL",
+        "old" => "OLD",
+        "fast" => "FAST",
+        _ => "COMPACT",
+    };
+    ("CONTEXT COMPACT".to_string(), action.to_string())
+}
+
+fn context_summary_labels(_args: &ContextSummaryArgs) -> (String, String) {
+    ("Context Summary".to_string(), "Fold".to_string())
+}
+
+fn context_vision_labels(_args: &ContextVisionArgs) -> (String, String) {
+    ("Context Vision".to_string(), "Set".to_string())
 }
 
 fn resolve_context_manage_brief(raw: Option<&str>, args: &ContextManageArgs) -> String {
@@ -3759,25 +11561,15 @@ fn resolve_context_manage_brief(raw: Option<&str>, args: &ContextManageArgs) -> 
         return brief;
     }
     match context_manage_action_key(args).as_str() {
-        "focus_enter" => "进入任务模式".to_string(),
-        "focus_exit" => "退出任务模式".to_string(),
+        "focus_enter" => "进入专注模式".to_string(),
+        "focus_exit" => "退出专注模式".to_string(),
         "summary" => format!(
             "收口{}",
-            parse_context_target(args.target.as_deref())
-                .map(|target| target.label().to_string())
-                .unwrap_or_else(|_| "外置上下文".to_string())
-        ),
-        "compact" => format!(
-            "压缩{}",
-            parse_context_target(args.target.as_deref())
-                .map(|target| target.label().to_string())
-                .unwrap_or_else(|_| "外置上下文".to_string())
+            context_manage_target_label(args.target.as_deref()).unwrap_or("外置上下文")
         ),
         _ => format!(
             "写入{}",
-            parse_context_target(args.target.as_deref())
-                .map(|target| target.label().to_string())
-                .unwrap_or_else(|_| "外置上下文".to_string())
+            context_manage_target_label(args.target.as_deref()).unwrap_or("外置上下文")
         ),
     }
 }
@@ -3797,7 +11589,7 @@ fn build_context_manage_input_preview(args: &ContextManageArgs) -> String {
     let action = context_manage_action_display_key(args);
     let mut lines = vec![format!("action: {action}")];
     match action.as_str() {
-        "task_enter" => {
+        "focus_enter" => {
             push_preview_line(&mut lines, "brief", args.brief.as_deref(), 120);
             push_preview_line(&mut lines, "task", args.task.as_deref(), 160);
             push_preview_line(&mut lines, "goal", args.user_goal.as_deref(), 160);
@@ -3813,7 +11605,7 @@ fn build_context_manage_input_preview(args: &ContextManageArgs) -> String {
             push_preview_line(&mut lines, "expected", args.expected_result.as_deref(), 140);
             push_preview_line(&mut lines, "exit", args.exit_condition.as_deref(), 120);
         }
-        "task_exit" => {
+        "focus_exit" => {
             push_preview_line(&mut lines, "summary", args.summary.as_deref(), 180);
             push_preview_line(&mut lines, "completed", args.completed.as_deref(), 140);
             push_preview_line(&mut lines, "implemented", args.implemented.as_deref(), 140);
@@ -3821,9 +11613,6 @@ fn build_context_manage_input_preview(args: &ContextManageArgs) -> String {
             push_preview_line(&mut lines, "key_info", args.key_info.as_deref(), 160);
             push_preview_line(&mut lines, "result", args.result.as_deref(), 140);
             push_preview_line(&mut lines, "exit_reason", args.exit_reason.as_deref(), 140);
-            if let Some(section) = args.fastmemory_section.as_deref() {
-                lines.push(format!("fastmemory_section: {}", section.trim()));
-            }
             push_preview_line(
                 &mut lines,
                 "fastmemory_text",
@@ -3834,6 +11623,17 @@ fn build_context_manage_input_preview(args: &ContextManageArgs) -> String {
         _ => {
             if let Some(target) = args.target.as_deref() {
                 lines.push(format!("target: {}", target.trim()));
+            }
+            if let Some(persona) = args.persona.as_deref() {
+                lines.push(format!("persona: {}", persona.trim()));
+            }
+            if let Some(scope) = args
+                .scope
+                .as_deref()
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+            {
+                lines.push(format!("scope: {scope}"));
             }
             if let Some(section) = args.section.as_deref() {
                 lines.push(format!("section: {}", section.trim()));
@@ -3852,94 +11652,298 @@ fn build_context_manage_input_preview(args: &ContextManageArgs) -> String {
             if !args.entry_ids.is_empty() {
                 lines.push(format!("entry_ids: {:?}", args.entry_ids));
             }
+            if let Some(entry_start_id) = args.entry_start_id {
+                lines.push(format!("entry_start_id: {entry_start_id}"));
+            }
+            if let Some(entry_end_id) = args.entry_end_id {
+                lines.push(format!("entry_end_id: {entry_end_id}"));
+            }
             if !args.item_ids.is_empty() {
                 lines.push(format!("item_ids: {:?}", args.item_ids));
             }
-            if action == "compact" && args.entry_ids.is_empty() && args.item_ids.is_empty() {
-                lines.push("scope: all".to_string());
+            if let Some(item_start_id) = args.item_start_id {
+                lines.push(format!("item_start_id: {item_start_id}"));
+            }
+            if let Some(item_end_id) = args.item_end_id {
+                lines.push(format!("item_end_id: {item_end_id}"));
             }
             push_preview_line(&mut lines, "text", args.text.as_deref(), 200);
         }
     }
+    lines.push(crate::context::CONTEXT_MANAGEMENT_ACTIVE_HINT.to_string());
+    lines.join("\n")
+}
+
+fn context_manage_summary_has_explicit_selection(
+    args: &ContextManageArgs,
+    target: ContextTarget,
+) -> bool {
+    match target {
+        ContextTarget::Context | ContextTarget::FocusContext => {
+            !args.entry_ids.is_empty()
+                || args.entry_start_id.is_some()
+                || args.entry_end_id.is_some()
+        }
+        ContextTarget::FastMemory => {
+            !args.item_ids.is_empty() || args.item_start_id.is_some() || args.item_end_id.is_some()
+        }
+    }
+}
+
+fn context_manage_prompt_summary_has_explicit_selection(args: &ContextManageArgs) -> bool {
+    !args.entry_ids.is_empty() || args.entry_start_id.is_some() || args.entry_end_id.is_some()
+}
+
+fn context_manage_summary_scope_is_all(args: &ContextManageArgs) -> bool {
+    args.scope
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|scope| scope.eq_ignore_ascii_case("all"))
+}
+
+fn validate_context_manage_summary_scope(
+    args: &ContextManageArgs,
+    target: ContextTarget,
+) -> Result<()> {
+    if context_manage_summary_has_explicit_selection(args, target)
+        || context_manage_summary_scope_is_all(args)
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "context_manage.summary 现在要求显式选择范围；如果要整区收口，请传 scope=\"all\"，否则必须提供 entry_ids / entry_start_id / entry_end_id 或 item_ids / item_start_id / item_end_id"
+    )
+}
+
+fn validate_context_manage_prompt_summary_scope(args: &ContextManageArgs) -> Result<()> {
+    if !args.item_ids.is_empty() || args.item_start_id.is_some() || args.item_end_id.is_some() {
+        anyhow::bail!(
+            "prompt summary 使用 entry_ids / entry_start_id / entry_end_id，不使用 item_ids"
+        )
+    }
+    if context_manage_prompt_summary_has_explicit_selection(args)
+        || context_manage_summary_scope_is_all(args)
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "context_manage.summary target=prompt 要求显式选择范围；如果要整段提示词收口，请传 scope=\"all\"，否则必须提供 entry_ids / entry_start_id / entry_end_id"
+    )
+}
+
+fn build_context_compact_input_preview(args: &ContextCompactArgs) -> String {
+    let mut lines = vec![format!("mode: {}", args.mode.trim())];
+    if let Some(persona) = args
+        .persona
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        lines.push(format!("persona: {persona}"));
+    }
+    if let Some(reason) = args
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        lines.push(format!("reason: {}", truncate_preview(reason, 160)));
+    }
+    if let Some(text) = args
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        lines.push(format!("text: {}", truncate_preview(text, 200)));
+    }
+    if let Some(report) = args.report_to_matrix {
+        lines.push(format!("report_to_matrix: {report}"));
+    }
+    lines.push(crate::context::CONTEXT_MANAGEMENT_ACTIVE_HINT.to_string());
+    lines.join("\n")
+}
+
+fn build_context_summary_input_preview(args: &ContextSummaryArgs) -> String {
+    let mut lines = vec![format!("action: {}", args.action.trim())];
+    if let Some(persona) = args
+        .persona
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        lines.push(format!("persona: {persona}"));
+    }
+    if let Some(reason) = args
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        lines.push(format!("reason: {}", truncate_preview(reason, 160)));
+    }
+    let ids = args
+        .entries
+        .iter()
+        .map(|entry| format!("e{}", entry.entry_id))
+        .collect::<Vec<_>>();
+    lines.push(format!(
+        "entries: {}",
+        if ids.is_empty() {
+            "(none)".to_string()
+        } else {
+            ids.join(", ")
+        }
+    ));
+    lines.push(crate::context::CONTEXT_MANAGEMENT_ACTIVE_HINT.to_string());
+    lines.join("\n")
+}
+
+fn resolve_context_vision_percent(args: &ContextVisionArgs) -> Result<u8> {
+    if let Some(value) = args.context_percent.as_ref() {
+        return parse_context_visibility_percent_value(value);
+    }
+    if let Some(mode) = args.mode.as_deref() {
+        return parse_context_visibility_percent_text(mode);
+    }
+    Ok(67)
+}
+
+fn build_context_vision_input_preview(args: &ContextVisionArgs) -> String {
+    let percent = resolve_context_vision_percent(args).unwrap_or(67);
+    let mut lines = vec![format!("context_return_threshold: approx {percent}%")];
+    if let Some(persona) = args
+        .persona
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        lines.push(format!("persona: {persona}"));
+    }
+    if let Some(reason) = args
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        lines.push(format!("reason: {}", truncate_preview(reason, 160)));
+    }
+    lines.push(crate::context::CONTEXT_MANAGEMENT_ACTIVE_HINT.to_string());
     lines.join("\n")
 }
 
 fn execute_context_manage_internal(args: ContextManageArgs) -> Result<ExecCommandExecution> {
     let action = context_manage_action_key(&args);
-    let request = match action.as_str() {
-        "write" => ContextManageRequest::Write {
-            target: parse_context_target(args.target.as_deref())?,
-            section: match args.section.as_deref() {
-                Some(_) => Some(parse_fastmemory_section(args.section.as_deref())?),
-                None => None,
+    let scoped_persona = parse_context_persona_scope(args.persona.as_deref())?;
+    let prompt_target = context_manage_is_prompt_target(args.target.as_deref());
+    if scoped_persona.is_some()
+        && !matches!(
+            current_tool_persona(),
+            crate::PersonaKind::Matrix | crate::PersonaKind::Advisor
+        )
+    {
+        anyhow::bail!("context_manage.persona 只允许 Matrix 或 司 使用");
+    }
+    let request = if prompt_target {
+        if matches!(action.as_str(), "focus_enter" | "focus_exit") {
+            anyhow::bail!("focus_mode 不支持 target=prompt；请使用 focus_mode enter/exit");
+        }
+        if action == "summary" {
+            validate_context_manage_prompt_summary_scope(&args)?;
+        }
+        match action.as_str() {
+            "write" => ContextManageRequest::PromptWrite {
+                text: args.text.clone().unwrap_or_default(),
             },
-            role: match args.role.as_deref() {
-                Some(_) => Some(parse_context_role(args.role.as_deref())?),
-                None => None,
+            "summary" => ContextManageRequest::PromptSummary {
+                entry_ids: args.entry_ids.clone(),
+                entry_start_id: args.entry_start_id,
+                entry_end_id: args.entry_end_id,
+                scope_all: context_manage_summary_scope_is_all(&args),
+                text: args.text.clone().unwrap_or_default(),
             },
-            kind: args.kind.clone(),
-            round_id: args.round_id,
-            text: args.text.clone().unwrap_or_default(),
-        },
-        "summary" | "replace" => ContextManageRequest::Summary {
-            target: parse_context_target(args.target.as_deref())?,
-            section: match args.section.as_deref() {
-                Some(_) => Some(parse_fastmemory_section(args.section.as_deref())?),
-                None => None,
+            other => anyhow::bail!("不支持的 context_manage.action：{other}"),
+        }
+    } else {
+        let target = match action.as_str() {
+            "focus_enter" | "focus_exit" => ContextTarget::FocusContext,
+            _ => parse_context_target(args.target.as_deref())?,
+        };
+        if action == "summary" {
+            validate_context_manage_summary_scope(&args, target)?;
+        }
+        match action.as_str() {
+            "write" => ContextManageRequest::Write {
+                target,
+                section: match args.section.as_deref() {
+                    Some(_) => Some(parse_fastmemory_section(args.section.as_deref())?),
+                    None => None,
+                },
+                role: match args.role.as_deref() {
+                    Some(_) => Some(parse_context_role(args.role.as_deref())?),
+                    None => None,
+                },
+                kind: args.kind.clone(),
+                round_id: args.round_id,
+                text: args.text.clone().unwrap_or_default(),
             },
-            role: match args.role.as_deref() {
-                Some(_) => Some(parse_context_role(args.role.as_deref())?),
-                None => None,
+            "summary" => ContextManageRequest::Summary {
+                target,
+                section: match args.section.as_deref() {
+                    Some(_) => Some(parse_fastmemory_section(args.section.as_deref())?),
+                    None => None,
+                },
+                role: match args.role.as_deref() {
+                    Some(_) => Some(parse_context_role(args.role.as_deref())?),
+                    None => None,
+                },
+                kind: args.kind.clone(),
+                entry_ids: args.entry_ids.clone(),
+                entry_start_id: args.entry_start_id,
+                entry_end_id: args.entry_end_id,
+                item_ids: args.item_ids.clone(),
+                item_start_id: args.item_start_id,
+                item_end_id: args.item_end_id,
+                text: args.text.clone().unwrap_or_default(),
             },
-            kind: args.kind.clone(),
-            entry_ids: args.entry_ids.clone(),
-            item_ids: args.item_ids.clone(),
-            text: args.text.clone().unwrap_or_default(),
-        },
-        "compact" => ContextManageRequest::Compact {
-            target: parse_context_target(args.target.as_deref())?,
-            section: match args.section.as_deref() {
-                Some(_) => Some(parse_fastmemory_section(args.section.as_deref())?),
-                None => None,
+            "focus_enter" => ContextManageRequest::FocusEnter {
+                brief: args
+                    .brief
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "专注模式".to_string()),
+                task: args.task.clone().unwrap_or_default(),
+                user_goal: args.user_goal.clone(),
+                reason: args.reason.clone(),
+                plan_a: args.plan_a.clone(),
+                plan_b: args.plan_b.clone(),
+                fallback: args.fallback.clone().or(args.plan_c.clone()),
+                expected_result: args.expected_result.clone(),
+                exit_condition: args.exit_condition.clone(),
             },
-            entry_ids: args.entry_ids.clone(),
-            item_ids: args.item_ids.clone(),
-            text: args.text.clone().unwrap_or_default(),
-        },
-        "focus_enter" => ContextManageRequest::FocusEnter {
-            brief: args
-                .brief
-                .clone()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "任务模式".to_string()),
-            task: args.task.clone().unwrap_or_default(),
-            user_goal: args.user_goal.clone(),
-            reason: args.reason.clone(),
-            plan_a: args.plan_a.clone(),
-            plan_b: args.plan_b.clone(),
-            fallback: args.fallback.clone().or(args.plan_c.clone()),
-            expected_result: args.expected_result.clone(),
-            exit_condition: args.exit_condition.clone(),
-        },
-        "focus_exit" => ContextManageRequest::FocusExit {
-            summary: args.summary.clone().unwrap_or_default(),
-            completed: args.completed.clone(),
-            implemented: args.implemented.clone(),
-            steps: args.steps.clone(),
-            key_info: args.key_info.clone(),
-            result: args.result.clone(),
-            exit_reason: args.exit_reason.clone(),
-            fastmemory_section: match args.fastmemory_section.as_deref() {
-                Some(_) => Some(parse_fastmemory_section(
-                    args.fastmemory_section.as_deref(),
-                )?),
-                None => None,
+            "focus_exit" => ContextManageRequest::FocusExit {
+                summary: args.summary.clone().unwrap_or_default(),
+                completed: args.completed.clone(),
+                implemented: args.implemented.clone(),
+                steps: args.steps.clone(),
+                key_info: args.key_info.clone(),
+                result: args.result.clone(),
+                exit_reason: args.exit_reason.clone(),
+                fastmemory_section: None,
+                fastmemory_text: args.fastmemory_text.clone(),
             },
-            fastmemory_text: args.fastmemory_text.clone(),
-        },
-        other => anyhow::bail!("不支持的 context_manage.action：{other}"),
+            other => anyhow::bail!("不支持的 context_manage.action：{other}"),
+        }
     };
-    let reply = crate::context::manage_request(request)?;
+    let reply = match scoped_persona {
+        Some(PersonaScopeTarget::Persona(persona)) => {
+            crate::context::manage_request_for_persona(persona, request)?
+        }
+        Some(PersonaScopeTarget::DynamicRole(role)) => {
+            crate::context::manage_request_for_dynamic_role(&role, request)?
+        }
+        None => crate::context::manage_request(request)?,
+    };
     let (kind_label, action_label) = context_manage_labels(&args);
     let brief = resolve_context_manage_brief(args.brief.as_deref(), &args);
     Ok(ExecCommandExecution {
@@ -3951,7 +11955,7 @@ fn execute_context_manage_internal(args: ContextManageArgs) -> Result<ExecComman
         output_preview: reply.output_preview,
         exit_code: Some(0),
         extra_output_items: Vec::new(),
-        history_entry_id: None,
+        toolmemory_entry_id: None,
         archived_output: None,
     })
 }
@@ -3960,41 +11964,1922 @@ fn execute_context_manage(arguments: &str) -> Result<ExecCommandExecution> {
     execute_context_manage_internal(parse_context_manage_arguments(arguments)?)
 }
 
-fn execute_task_mode(arguments: &str) -> Result<ExecCommandExecution> {
-    let args = parse_task_mode_arguments(arguments)?;
-    execute_context_manage_internal(task_mode_to_context_manage_args(args))
+fn execute_context_compact(arguments: &str) -> Result<ExecCommandExecution> {
+    let args = parse_context_compact_arguments(arguments)?;
+    let scoped_persona = parse_context_compact_persona_scope(args.persona.as_deref())?;
+    if scoped_persona.is_some()
+        && !matches!(
+            current_tool_persona(),
+            crate::PersonaKind::Matrix | crate::PersonaKind::Advisor
+        )
+    {
+        anyhow::bail!("context_compact.persona 只允许 Matrix 或 司 使用");
+    }
+    let request = ContextCompactRequest {
+        mode: parse_context_compact_mode(args.mode.as_str())?,
+        text: args.text.clone(),
+        reason: args.reason.clone(),
+    };
+    let reply = match scoped_persona {
+        Some(PersonaScopeTarget::Persona(persona)) => {
+            crate::context::compact_request_for_persona(persona, request)?
+        }
+        Some(PersonaScopeTarget::DynamicRole(role)) => {
+            crate::context::compact_request_for_dynamic_role(&role, request)?
+        }
+        None => crate::context::compact_request(request)?,
+    };
+    let (kind_label, action_label) = context_compact_labels(&args);
+    Ok(ExecCommandExecution {
+        brief: normalize_brief(args.brief.as_deref())
+            .unwrap_or_else(|| "快速压缩上下文".to_string()),
+        kind_label,
+        action_label,
+        model_output: reply.model_output,
+        command_preview: build_context_compact_input_preview(&args),
+        output_preview: reply.output_preview,
+        exit_code: Some(0),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    })
 }
 
-fn execute_toolbox_manage(arguments: &str) -> Result<ExecCommandExecution> {
-    let args = parse_toolbox_manage_arguments(arguments)?;
-    let brief = resolve_toolbox_manage_brief(args.brief.as_deref(), &args);
-    let reply = crate::context::toolbox_manage(
+fn execute_context_summary(arguments: &str) -> Result<ExecCommandExecution> {
+    let args = parse_context_summary_arguments(arguments)?;
+    if args.action.trim().to_ascii_lowercase() != "fold" {
+        anyhow::bail!("不支持的 context_summary.action：{}", args.action);
+    }
+    let scoped_persona = parse_context_summary_persona_scope(args.persona.as_deref())?;
+    if scoped_persona.is_some()
+        && !matches!(
+            current_tool_persona(),
+            crate::PersonaKind::Matrix | crate::PersonaKind::Advisor
+        )
+    {
+        anyhow::bail!("context_summary.persona 只允许 Matrix 或 司 使用");
+    }
+    let request = ContextSummaryRequest {
+        entries: args
+            .entries
+            .iter()
+            .map(|entry| ContextSummaryFoldEntry {
+                entry_id: entry.entry_id,
+                text: entry.text.clone(),
+            })
+            .collect(),
+        reason: args.reason.clone(),
+    };
+    let reply = match scoped_persona {
+        Some(PersonaScopeTarget::Persona(persona)) => {
+            crate::context::summary_request_for_persona(persona, request)?
+        }
+        Some(PersonaScopeTarget::DynamicRole(role)) => {
+            crate::context::summary_request_for_dynamic_role(&role, request)?
+        }
+        None => crate::context::summary_request(request)?,
+    };
+    let (kind_label, action_label) = context_summary_labels(&args);
+    Ok(ExecCommandExecution {
+        brief: normalize_brief(args.brief.as_deref())
+            .unwrap_or_else(|| "折叠上下文条目".to_string()),
+        kind_label,
+        action_label,
+        model_output: reply.model_output,
+        command_preview: build_context_summary_input_preview(&args),
+        output_preview: reply.output_preview,
+        exit_code: Some(0),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    })
+}
+
+fn execute_context_vision(arguments: &str) -> Result<ExecCommandExecution> {
+    let args = parse_context_vision_arguments(arguments)?;
+    let scoped_persona = parse_context_vision_persona_scope(args.persona.as_deref())?;
+    if scoped_persona.is_some()
+        && !matches!(
+            current_tool_persona(),
+            crate::PersonaKind::Matrix | crate::PersonaKind::Advisor
+        )
+    {
+        anyhow::bail!("context_vision.persona 只允许 Matrix 或 司 使用");
+    }
+    let percent = resolve_context_vision_percent(&args)?;
+    let request = ContextVisionRequest {
+        percent,
+        reason: args.reason.clone(),
+    };
+    let reply = match scoped_persona {
+        Some(PersonaScopeTarget::Persona(persona)) => {
+            crate::context::set_context_visibility_percent_for_persona(persona, request)?
+        }
+        Some(PersonaScopeTarget::DynamicRole(role)) => {
+            crate::context::set_context_visibility_percent_for_dynamic_role(&role, request)?
+        }
+        None => crate::context::set_context_visibility_percent(request)?,
+    };
+    let (kind_label, action_label) = context_vision_labels(&args);
+    Ok(ExecCommandExecution {
+        brief: normalize_brief(args.brief.as_deref())
+            .unwrap_or_else(|| format!("上下文返回阈值约 {percent}%")),
+        kind_label,
+        action_label,
+        model_output: reply.model_output,
+        command_preview: build_context_vision_input_preview(&args),
+        output_preview: reply.output_preview,
+        exit_code: Some(0),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    })
+}
+
+fn execute_focus_mode(arguments: &str) -> Result<ExecCommandExecution> {
+    let args = parse_focus_mode_arguments(arguments)?;
+    execute_context_manage_internal(focus_mode_to_context_manage_args(args))
+}
+
+fn execute_tool_manage(arguments: &str) -> Result<ExecCommandExecution> {
+    let args = parse_tool_manage_arguments(arguments)?;
+    if let Some(execution) = execute_tool_health_read(&args)? {
+        return Ok(execution);
+    }
+    if let Some(execution) = execute_schema_manage(&args)? {
+        return Ok(execution);
+    }
+    if let Some(execution) = execute_context_governance_manage(&args)? {
+        return Ok(execution);
+    }
+    if let Some(execution) = execute_settings_manage(&args)? {
+        return Ok(execution);
+    }
+    if let Some(execution) = execute_role_manage(&args)? {
+        return Ok(execution);
+    }
+    if let Some(execution) = execute_tool_manifest_manage(&args)? {
+        return Ok(execution);
+    }
+    let brief = resolve_tool_manage_brief(args.brief.as_deref(), &args);
+    let reply = crate::context::tool_manage(
         args.action.as_str(),
         &args.tool_ids,
+        args.persona.as_deref(),
         args.reason.as_deref(),
         args.plan.as_deref(),
     )?;
     Ok(ExecCommandExecution {
         brief,
-        kind_label: "Toolbox".to_string(),
+        kind_label: "ToolManage".to_string(),
         action_label: "Manage".to_string(),
         model_output: reply.model_output,
-        command_preview: build_toolbox_manage_input_preview(&args),
+        command_preview: build_tool_manage_input_preview(&args),
         output_preview: reply.output_preview,
         exit_code: Some(0),
         extra_output_items: Vec::new(),
-        history_entry_id: None,
+        toolmemory_entry_id: None,
         archived_output: None,
     })
 }
 
+fn sanitize_output_stream_max_bytes(raw: Option<usize>) -> usize {
+    raw.unwrap_or(OUTPUT_STREAM_DEFAULT_MAX_BYTES)
+        .clamp(1024, OUTPUT_STREAM_HARD_MAX_BYTES)
+}
+
+fn sanitize_output_stream_tail_lines(raw: Option<usize>) -> usize {
+    raw.unwrap_or(OUTPUT_STREAM_DEFAULT_TAIL_LINES)
+        .clamp(1, OUTPUT_STREAM_MAX_TAIL_LINES)
+}
+
+fn output_stream_ref_path(ref_id: &str) -> Result<String> {
+    let trimmed = ref_id.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("memory_read target=output 的 ref_id 不能为空");
+    }
+    if let Some(entry_id) = trimmed.strip_prefix("toolmemory:") {
+        anyhow::bail!(
+            "ref_id={trimmed} 指向 toolmemory；请改用 memory_check target=toolmemory entry_id={} 后再 memory_read 精读。",
+            entry_id.trim()
+        );
+    }
+    for prefix in ["path:", "file:", "output:"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return Ok(rest.trim().to_string());
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
+fn output_stream_target_path(args: &OutputStreamReadArgs) -> Result<PathBuf> {
+    let raw = match args
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(path) => path.to_string(),
+        None => args
+            .ref_id
+            .as_deref()
+            .map(output_stream_ref_path)
+            .transpose()?
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("memory_read target=output 需要 path 或 ref_id"))?,
+    };
+    let project_root = projectying_root();
+    let candidate = if Path::new(raw.as_str()).is_absolute() {
+        PathBuf::from(raw.as_str())
+    } else {
+        project_root.join(trim_relative_prefixes(raw.as_str()))
+    };
+    let normalized = normalize_lexical_path(candidate.as_path());
+    let output_root = normalize_lexical_path(crate::app_output_root().as_path());
+    if !normalized.starts_with(output_root.as_path()) {
+        anyhow::bail!(
+            "memory_read target=output 只允许读取 memory/output 下的外导文件：{}",
+            display_path_for_ui(normalized.as_path())
+        );
+    }
+    if !normalized.is_file() {
+        anyhow::bail!(
+            "memory_read target=output 目标不是文件：{}",
+            normalized.display()
+        );
+    }
+    Ok(normalized)
+}
+
+fn parse_output_stream_byte_cursor(cursor: Option<&str>) -> Option<u64> {
+    let raw = cursor?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    for part in raw.split(',') {
+        let part = part.trim();
+        if let Some(value) = part.strip_prefix("byte:") {
+            return value.trim().parse::<u64>().ok();
+        }
+    }
+    raw.parse::<u64>().ok()
+}
+
+fn read_file_byte_window(path: &Path, start: u64, max_bytes: usize) -> Result<(String, u64)> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("打开外导输出失败：{}", path.display()))?;
+    file.seek(SeekFrom::Start(start))
+        .with_context(|| format!("定位外导输出失败：{}", path.display()))?;
+    let mut buf = vec![0u8; max_bytes];
+    let read = file
+        .read(buf.as_mut_slice())
+        .with_context(|| format!("读取外导输出失败：{}", path.display()))?;
+    buf.truncate(read);
+    Ok((
+        String::from_utf8_lossy(buf.as_slice()).replace('\u{0}', ""),
+        start.saturating_add(read as u64),
+    ))
+}
+
+fn read_file_tail_window(path: &Path, file_len: u64, max_bytes: usize) -> Result<(String, u64)> {
+    let start = file_len.saturating_sub(max_bytes as u64);
+    read_file_byte_window(path, start, max_bytes)
+}
+
+fn tail_lines(text: &str, tail_lines: usize) -> String {
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(tail_lines);
+    lines[start..].join("\n")
+}
+
+fn count_file_lines(path: &Path) -> usize {
+    fs::File::open(path)
+        .ok()
+        .map(BufReader::new)
+        .map(|reader| reader.lines().count())
+        .unwrap_or(0)
+}
+
+fn read_file_line_range(
+    path: &Path,
+    line_start: Option<usize>,
+    line_end: Option<usize>,
+    max_bytes: usize,
+) -> Result<(String, usize, bool)> {
+    let start = line_start.unwrap_or(1).max(1);
+    let end = line_end.unwrap_or(start.saturating_add(OUTPUT_STREAM_DEFAULT_TAIL_LINES));
+    if end < start {
+        anyhow::bail!("line_end 不能小于 line_start");
+    }
+    let file =
+        fs::File::open(path).with_context(|| format!("打开外导输出失败：{}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut selected = Vec::new();
+    let mut total_lines = 0usize;
+    let mut bytes = 0usize;
+    let mut truncated = false;
+    for (index, line) in reader.lines().enumerate() {
+        let line_no = index.saturating_add(1);
+        let line = line.with_context(|| format!("读取外导输出行失败：{}", path.display()))?;
+        total_lines = line_no;
+        if line_no < start {
+            continue;
+        }
+        if line_no > end {
+            break;
+        }
+        let next_bytes = bytes.saturating_add(line.len()).saturating_add(1);
+        if next_bytes > max_bytes {
+            truncated = true;
+            break;
+        }
+        bytes = next_bytes;
+        selected.push(line);
+    }
+    Ok((selected.join("\n"), total_lines, truncated))
+}
+
+fn execute_output_stream_read_from_args(
+    args: OutputStreamReadArgs,
+    tool_label: &str,
+    kind_label: &str,
+    action_label: &str,
+    brief_fallback: &str,
+) -> Result<ExecCommandExecution> {
+    let policy = ReadPolicy::parse(args.mode.as_deref());
+    let max_bytes = sanitize_output_stream_max_bytes(args.max_bytes);
+    let tail_limit = sanitize_output_stream_tail_lines(args.tail_lines);
+    let path = output_stream_target_path(&args)?;
+    let metadata = fs::metadata(path.as_path())
+        .with_context(|| format!("读取外导输出元数据失败：{}", path.display()))?;
+    let file_len = metadata.len();
+    let total_lines = count_file_lines(path.as_path());
+    let (content, cursor, truncated, observed_lines) = match policy {
+        ReadPolicy::Range => {
+            let (content, observed_lines, truncated) =
+                read_file_line_range(path.as_path(), args.line_start, args.line_end, max_bytes)?;
+            (content, file_len, truncated, observed_lines)
+        }
+        ReadPolicy::SinceCursor => {
+            let start = parse_output_stream_byte_cursor(args.cursor.as_deref())
+                .unwrap_or(0)
+                .min(file_len);
+            let (content, cursor) = read_file_byte_window(path.as_path(), start, max_bytes)?;
+            (content, cursor, cursor < file_len, total_lines)
+        }
+        ReadPolicy::Full => {
+            let (content, cursor) = read_file_byte_window(path.as_path(), 0, max_bytes)?;
+            (content, cursor, cursor < file_len, total_lines)
+        }
+        ReadPolicy::Summary => {
+            let (content, cursor) = read_file_tail_window(path.as_path(), file_len, max_bytes)?;
+            (
+                tail_lines(content.as_str(), tail_limit.min(40)),
+                cursor,
+                file_len > max_bytes as u64,
+                total_lines,
+            )
+        }
+        ReadPolicy::Latest | ReadPolicy::Tail => {
+            let (content, cursor) = read_file_tail_window(path.as_path(), file_len, max_bytes)?;
+            (
+                tail_lines(content.as_str(), tail_limit),
+                cursor,
+                file_len > max_bytes as u64,
+                total_lines,
+            )
+        }
+    };
+    let returned_bytes = content.len();
+    let returned_lines = count_lines(content.as_str());
+    let next_cursor = format!("line:{observed_lines},byte:{cursor}");
+    let path_label = display_path_for_ui(path.as_path());
+    let model_output = [
+        format!("{tool_label}:ok"),
+        format!("path:{path_label}"),
+        format!("mode:{}", policy.key()),
+        format!("cursor:{next_cursor}"),
+        format!("file_bytes:{file_len}"),
+        format!("returned_bytes:{returned_bytes}"),
+        format!("returned_lines:{returned_lines}"),
+        format!("truncated:{truncated}"),
+        "content:".to_string(),
+        content.clone(),
+    ]
+    .join("\n");
+    let output_preview = [
+        format!(
+            "OutputRef · {} · {} bytes · {} lines · cursor:{}",
+            policy.key(),
+            returned_bytes,
+            returned_lines,
+            next_cursor
+        ),
+        content.clone(),
+    ]
+    .join("\n");
+    let read_scheduler = SchedulerPolicy {
+        dedupe_key: Some(format!("{tool_label}:{path_label}")),
+        deadline_ms: 1,
+        poll_interval_ms: 0,
+        max_retries: 0,
+        payload_policy: "replace_not_stack".to_string(),
+        ..SchedulerPolicy::default()
+    };
+    let read_dedupe_key =
+        scheduler_dedupe_key(&read_scheduler, format!("{tool_label}:{path_label}"));
+    emit_scheduler_event(
+        "tool.output.read",
+        tool_label,
+        &read_scheduler,
+        read_dedupe_key.as_str(),
+        json!({
+            "path": path_label.as_str(),
+            "mode": policy.key(),
+            "file_bytes": file_len,
+            "returned_bytes": returned_bytes,
+            "returned_lines": returned_lines,
+            "truncated": truncated,
+            "cursor": next_cursor.as_str(),
+        }),
+    );
+    Ok(ExecCommandExecution {
+        brief: normalize_brief(args.brief.as_deref()).unwrap_or_else(|| brief_fallback.to_string()),
+        kind_label: kind_label.to_string(),
+        action_label: action_label.to_string(),
+        model_output,
+        command_preview: format!(
+            "{} · {} · max_bytes={}",
+            policy.key(),
+            path_label,
+            max_bytes
+        ),
+        output_preview: clamp_report_text(output_preview),
+        exit_code: Some(0),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    })
+}
+
+fn resolve_draw_image_output_dir(_raw: Option<&str>) -> Result<PathBuf> {
+    Ok(media_dir().join("dcim"))
+}
+
+fn resolve_optional_draw_source(path: Option<&str>) -> Result<Option<DrawImageSource>> {
+    let Some(raw) = path.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    ensure_media_links()?;
+    let resolved = resolve_view_image_path(raw, projectying_root().as_path())?;
+    if !resolved.is_file() {
+        anyhow::bail!("draw_image.source_path 只支持普通图片文件");
+    }
+    let Some(mime) = detect_image_mime(resolved.as_path()) else {
+        anyhow::bail!("draw_image.source_path 暂不支持该图片格式");
+    };
+    Ok(Some(DrawImageSource {
+        path: resolved.clone(),
+        display_path: display_path_for_ui(resolved.as_path()),
+        mime: mime.to_string(),
+    }))
+}
+
+fn collapse_whitespace_text(raw: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_space = false;
+    for ch in raw.chars() {
+        if ch.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_was_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn draw_image_effective_prompt(prompt: &str, transparent_background: bool) -> String {
+    let prompt = collapse_whitespace_text(prompt);
+    if !transparent_background {
+        return prompt.to_string();
+    }
+    let chroma = DRAW_IMAGE_CHROMA_KEY_HEX;
+    format!(
+        "Create the requested image on a perfectly flat solid {chroma} chroma-key background for background removal.\nThe background must be one uniform color with no shadows, gradients, texture, reflections, floor plane, or lighting variation.\nKeep the subject fully separated from the background with crisp edges and generous padding.\nDo not use {chroma} anywhere in the subject.\nNo cast shadow, no contact shadow, no reflection, no watermark, and no text unless explicitly requested.\n\n{prompt}"
+    )
+}
+
+fn draw_image_format_extension(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::WebP => "webp",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Bmp => "bmp",
+        _ => "png",
+    }
+}
+
+fn draw_image_format_mime(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "image/png",
+        ImageFormat::Jpeg => "image/jpeg",
+        ImageFormat::WebP => "image/webp",
+        ImageFormat::Gif => "image/gif",
+        ImageFormat::Bmp => "image/bmp",
+        _ => "image/png",
+    }
+}
+
+fn draw_image_auth_label(auth_variant: AuthVariant) -> &'static str {
+    match auth_variant {
+        AuthVariant::None => "none",
+        AuthVariant::Bearer => "bearer",
+        AuthVariant::XApiKey => "x-api-key",
+        AuthVariant::ApiKey => "api-key",
+        AuthVariant::AuthorizationRaw => "authorization-raw",
+    }
+}
+
+fn apply_draw_image_auth(
+    mut req: reqwest::blocking::RequestBuilder,
+    api_key: &str,
+    auth_variant: AuthVariant,
+) -> reqwest::blocking::RequestBuilder {
+    match auth_variant {
+        AuthVariant::None => req,
+        AuthVariant::Bearer => req.bearer_auth(api_key),
+        AuthVariant::XApiKey => {
+            req = req.header("x-api-key", api_key);
+            req
+        }
+        AuthVariant::ApiKey => {
+            req = req.header("api-key", api_key);
+            req
+        }
+        AuthVariant::AuthorizationRaw => {
+            req = req.header(reqwest::header::AUTHORIZATION, api_key);
+            req
+        }
+    }
+}
+
+fn draw_image_err_body_snippet(resp: reqwest::blocking::Response) -> String {
+    match resp.text() {
+        Ok(text) => {
+            let trimmed = text.trim().to_string();
+            if trimmed.is_empty() {
+                "(empty body)".to_string()
+            } else {
+                truncate_chars(trimmed.as_str(), 260)
+            }
+        }
+        Err(_) => "(body read failed)".to_string(),
+    }
+}
+
+fn draw_image_http_error_note(
+    label: &str,
+    url: &str,
+    status: Option<reqwest::StatusCode>,
+    detail: &str,
+) -> String {
+    let detail = detail.trim();
+    match status {
+        Some(code)
+            if code == reqwest::StatusCode::UNAUTHORIZED
+                || code == reqwest::StatusCode::FORBIDDEN =>
+        {
+            format!("{label} {url} HTTP {code} | {detail}")
+        }
+        Some(code) => format!("{url} HTTP {code} | {detail}"),
+        None => format!("{url} send error: {detail}"),
+    }
+}
+
+fn draw_image_is_retryable_http_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::REQUEST_TIMEOUT
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+            | reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn draw_image_is_retryable_transport_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_request() || err.is_body() || err.is_decode()
+}
+
+fn draw_image_retry_failure_message(kind: &str, notes: &[String]) -> String {
+    if notes.is_empty() {
+        return format!("{kind} failed");
+    }
+
+    let mut lines = Vec::with_capacity(notes.len() + 1);
+    lines.push(format!("{kind} failed after {} attempt(s)", notes.len()));
+    for (index, note) in notes.iter().enumerate() {
+        lines.push(format!("第{}次：{}", index + 1, note));
+    }
+    lines.join("\n")
+}
+
+fn draw_image_should_stop_auth_variant_search(note: &str) -> bool {
+    !note.contains("HTTP ")
+}
+
+fn post_json_with_auth_retries(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    body: &Value,
+    api_key: &str,
+    auth_variant: AuthVariant,
+    label: &str,
+    accept: Option<&str>,
+) -> std::result::Result<String, String> {
+    let mut attempt_notes = Vec::new();
+    for attempt in 0..DRAW_IMAGE_HTTP_RETRY_ATTEMPTS {
+        let mut req = client.post(url).json(body);
+        if let Some(accept) = accept {
+            req = req.header(reqwest::header::ACCEPT, accept);
+        }
+        let req = apply_draw_image_auth(req, api_key, auth_variant);
+        let resp = match req.send() {
+            Ok(resp) => resp,
+            Err(err) => {
+                let note = draw_image_http_error_note(label, url, None, err.to_string().as_str());
+                attempt_notes.push(note.clone());
+                if draw_image_is_retryable_transport_error(&err)
+                    && attempt + 1 < DRAW_IMAGE_HTTP_RETRY_ATTEMPTS
+                {
+                    thread::sleep(Duration::from_millis(
+                        DRAW_IMAGE_HTTP_RETRY_BACKOFF_MS.saturating_mul((attempt + 1) as u64),
+                    ));
+                    continue;
+                }
+                return Err(draw_image_retry_failure_message(
+                    "draw_image JSON request",
+                    attempt_notes.as_slice(),
+                ));
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let body = draw_image_err_body_snippet(resp);
+            let note = draw_image_http_error_note(label, url, Some(status), body.as_str());
+            attempt_notes.push(note.clone());
+            if draw_image_is_retryable_http_status(status)
+                && attempt + 1 < DRAW_IMAGE_HTTP_RETRY_ATTEMPTS
+            {
+                thread::sleep(Duration::from_millis(
+                    DRAW_IMAGE_HTTP_RETRY_BACKOFF_MS.saturating_mul((attempt + 1) as u64),
+                ));
+                continue;
+            }
+            return Err(draw_image_retry_failure_message(
+                "draw_image JSON request",
+                attempt_notes.as_slice(),
+            ));
+        }
+        let body_text = match resp.text() {
+            Ok(text) => text,
+            Err(err) => {
+                let note = format!("{url} response body error: {}", err);
+                attempt_notes.push(note.clone());
+                if draw_image_is_retryable_transport_error(&err)
+                    && attempt + 1 < DRAW_IMAGE_HTTP_RETRY_ATTEMPTS
+                {
+                    thread::sleep(Duration::from_millis(
+                        DRAW_IMAGE_HTTP_RETRY_BACKOFF_MS.saturating_mul((attempt + 1) as u64),
+                    ));
+                    continue;
+                }
+                return Err(draw_image_retry_failure_message(
+                    "draw_image JSON request",
+                    attempt_notes.as_slice(),
+                ));
+            }
+        };
+        return Ok(body_text);
+    }
+    Err(draw_image_retry_failure_message(
+        "draw_image JSON request",
+        attempt_notes.as_slice(),
+    ))
+}
+
+fn post_multipart_with_auth_retries<F>(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    api_key: &str,
+    auth_variant: AuthVariant,
+    label: &str,
+    mut build_form: F,
+) -> std::result::Result<String, String>
+where
+    F: FnMut() -> Result<Form>,
+{
+    let mut attempt_notes = Vec::new();
+    for attempt in 0..DRAW_IMAGE_HTTP_RETRY_ATTEMPTS {
+        let form = match build_form() {
+            Ok(form) => form,
+            Err(err) => return Err(err.to_string()),
+        };
+        let req = apply_draw_image_auth(client.post(url).multipart(form), api_key, auth_variant);
+        let resp = match req.send() {
+            Ok(resp) => resp,
+            Err(err) => {
+                let note = draw_image_http_error_note(label, url, None, err.to_string().as_str());
+                attempt_notes.push(note.clone());
+                if draw_image_is_retryable_transport_error(&err)
+                    && attempt + 1 < DRAW_IMAGE_HTTP_RETRY_ATTEMPTS
+                {
+                    thread::sleep(Duration::from_millis(
+                        DRAW_IMAGE_HTTP_RETRY_BACKOFF_MS.saturating_mul((attempt + 1) as u64),
+                    ));
+                    continue;
+                }
+                return Err(draw_image_retry_failure_message(
+                    "draw_image multipart request",
+                    attempt_notes.as_slice(),
+                ));
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let body = draw_image_err_body_snippet(resp);
+            let note = draw_image_http_error_note(label, url, Some(status), body.as_str());
+            attempt_notes.push(note.clone());
+            if draw_image_is_retryable_http_status(status)
+                && attempt + 1 < DRAW_IMAGE_HTTP_RETRY_ATTEMPTS
+            {
+                thread::sleep(Duration::from_millis(
+                    DRAW_IMAGE_HTTP_RETRY_BACKOFF_MS.saturating_mul((attempt + 1) as u64),
+                ));
+                continue;
+            }
+            return Err(draw_image_retry_failure_message(
+                "draw_image multipart request",
+                attempt_notes.as_slice(),
+            ));
+        }
+        let body_text = match resp.text() {
+            Ok(text) => text,
+            Err(err) => {
+                let note = format!("{url} response body error: {}", err);
+                attempt_notes.push(note.clone());
+                if draw_image_is_retryable_transport_error(&err)
+                    && attempt + 1 < DRAW_IMAGE_HTTP_RETRY_ATTEMPTS
+                {
+                    thread::sleep(Duration::from_millis(
+                        DRAW_IMAGE_HTTP_RETRY_BACKOFF_MS.saturating_mul((attempt + 1) as u64),
+                    ));
+                    continue;
+                }
+                return Err(draw_image_retry_failure_message(
+                    "draw_image multipart request",
+                    attempt_notes.as_slice(),
+                ));
+            }
+        };
+        return Ok(body_text);
+    }
+    Err(draw_image_retry_failure_message(
+        "draw_image multipart request",
+        attempt_notes.as_slice(),
+    ))
+}
+
+fn post_json_with_auth_variants(
+    client: &reqwest::blocking::Client,
+    urls: &[String],
+    body: &Value,
+    api_key: &str,
+) -> Result<String> {
+    let mut last_err = None;
+    for auth_variant in auth_variants(api_key) {
+        let label = draw_image_auth_label(auth_variant);
+        for url in urls {
+            match post_json_with_auth_retries(
+                client,
+                url.as_str(),
+                body,
+                api_key,
+                auth_variant,
+                label,
+                Some("application/json"),
+            ) {
+                Ok(text) => return Ok(text),
+                Err(err) => {
+                    if draw_image_should_stop_auth_variant_search(err.as_str()) {
+                        return Err(anyhow!(err));
+                    }
+                    last_err = Some(err)
+                }
+            }
+        }
+    }
+    Err(anyhow!(last_err.unwrap_or_else(|| {
+        "draw_image JSON request failed".to_string()
+    })))
+}
+
+fn post_multipart_with_auth_variants<F>(
+    client: &reqwest::blocking::Client,
+    urls: &[String],
+    api_key: &str,
+    mut build_form: F,
+) -> Result<String>
+where
+    F: FnMut() -> Result<Form>,
+{
+    let mut last_err = None;
+    for auth_variant in auth_variants(api_key) {
+        let label = draw_image_auth_label(auth_variant);
+        for url in urls {
+            match post_multipart_with_auth_retries(
+                client,
+                url.as_str(),
+                api_key,
+                auth_variant,
+                label,
+                &mut build_form,
+            ) {
+                Ok(text) => return Ok(text),
+                Err(err) => {
+                    if draw_image_should_stop_auth_variant_search(err.as_str()) {
+                        return Err(anyhow!(err));
+                    }
+                    last_err = Some(err)
+                }
+            }
+        }
+    }
+    Err(anyhow!(last_err.unwrap_or_else(|| {
+        "draw_image multipart request failed".to_string()
+    })))
+}
+
+fn draw_image_target_path(output_dir: &Path, request_id: &str, extension: &str) -> PathBuf {
+    let mut candidate = output_dir.join(format!("{request_id}.{extension}"));
+    let mut suffix = 1usize;
+    while candidate.exists() {
+        candidate = output_dir.join(format!("{request_id}-{suffix}.{extension}"));
+        suffix = suffix.saturating_add(1);
+    }
+    candidate
+}
+
+fn draw_image_wait_for_written_file(path: &Path) -> Result<()> {
+    for _ in 0..DRAW_IMAGE_READY_ATTEMPTS {
+        if let Ok(metadata) = fs::metadata(path)
+            && metadata.is_file()
+            && metadata.len() > 0
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(DRAW_IMAGE_READY_SLEEP_MS));
+    }
+    anyhow::bail!("生成图片文件未就绪：{}", path.display())
+}
+
+fn draw_image_decode_base64_field(encoded: &str) -> Result<Vec<u8>> {
+    let encoded = encoded
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    let encoded = encoded
+        .strip_prefix("data:")
+        .and_then(|value| value.split_once(',').map(|(_, payload)| payload))
+        .map(str::to_string)
+        .unwrap_or(encoded);
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_str())
+        .context("解码图像 base64 失败")
+}
+
+fn draw_image_download_url_bytes(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    raw_url: &str,
+) -> Result<Vec<u8>> {
+    let resolved = if raw_url.trim_start().starts_with("data:") {
+        return draw_image_decode_base64_field(raw_url);
+    } else if let Ok(url) = Url::parse(raw_url.trim()) {
+        url
+    } else {
+        Url::parse(base_url)
+            .with_context(|| format!("图像 URL 基础地址无效：{base_url}"))?
+            .join(raw_url.trim())
+            .with_context(|| format!("图像 URL 无法解析：{raw_url}"))?
+    };
+    let mut attempt_notes = Vec::new();
+    for attempt in 0..DRAW_IMAGE_HTTP_RETRY_ATTEMPTS {
+        let resp = match client.get(resolved.as_str()).send() {
+            Ok(resp) => resp,
+            Err(err) => {
+                let note = format!(
+                    "下载生成图片失败：{} send error: {}",
+                    resolved.as_str(),
+                    err
+                );
+                attempt_notes.push(note.clone());
+                if draw_image_is_retryable_transport_error(&err)
+                    && attempt + 1 < DRAW_IMAGE_HTTP_RETRY_ATTEMPTS
+                {
+                    thread::sleep(Duration::from_millis(
+                        DRAW_IMAGE_HTTP_RETRY_BACKOFF_MS.saturating_mul((attempt + 1) as u64),
+                    ));
+                    continue;
+                }
+                anyhow::bail!(
+                    "{}",
+                    draw_image_retry_failure_message("下载生成图片", attempt_notes.as_slice())
+                );
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let body = draw_image_err_body_snippet(resp);
+            let note = format!(
+                "下载生成图片失败：{} HTTP {} | {}",
+                resolved.as_str(),
+                status,
+                body
+            );
+            attempt_notes.push(note.clone());
+            if draw_image_is_retryable_http_status(status)
+                && attempt + 1 < DRAW_IMAGE_HTTP_RETRY_ATTEMPTS
+            {
+                thread::sleep(Duration::from_millis(
+                    DRAW_IMAGE_HTTP_RETRY_BACKOFF_MS.saturating_mul((attempt + 1) as u64),
+                ));
+                continue;
+            }
+            anyhow::bail!(
+                "{}",
+                draw_image_retry_failure_message("下载生成图片", attempt_notes.as_slice())
+            );
+        }
+        match resp.bytes() {
+            Ok(bytes) => return Ok(bytes.to_vec()),
+            Err(err) => {
+                let note = format!(
+                    "下载生成图片失败：{} response body error: {}",
+                    resolved.as_str(),
+                    err
+                );
+                attempt_notes.push(note.clone());
+                if draw_image_is_retryable_transport_error(&err)
+                    && attempt + 1 < DRAW_IMAGE_HTTP_RETRY_ATTEMPTS
+                {
+                    thread::sleep(Duration::from_millis(
+                        DRAW_IMAGE_HTTP_RETRY_BACKOFF_MS.saturating_mul((attempt + 1) as u64),
+                    ));
+                    continue;
+                }
+                anyhow::bail!(
+                    "{}",
+                    draw_image_retry_failure_message("下载生成图片", attempt_notes.as_slice())
+                );
+            }
+        }
+    }
+    anyhow::bail!(
+        "{}",
+        draw_image_retry_failure_message("下载生成图片", attempt_notes.as_slice())
+    );
+}
+
+fn draw_image_border_key_color(image: &image::RgbaImage) -> [u8; 3] {
+    let mut counts: HashMap<(u8, u8, u8), usize> = HashMap::new();
+    let width = image.width();
+    let height = image.height();
+    if width == 0 || height == 0 {
+        return [0, 255, 0];
+    }
+
+    let mut sample = |x: u32, y: u32| {
+        let pixel = image.get_pixel(x, y).0;
+        if pixel[3] == 0 {
+            return;
+        }
+        let key = (pixel[0] & 0xF0, pixel[1] & 0xF0, pixel[2] & 0xF0);
+        *counts.entry(key).or_insert(0) += 1;
+    };
+
+    for x in 0..width {
+        sample(x, 0);
+        if height > 1 {
+            sample(x, height - 1);
+        }
+    }
+    for y in 1..height.saturating_sub(1) {
+        sample(0, y);
+        if width > 1 {
+            sample(width - 1, y);
+        }
+    }
+
+    counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|((r, g, b), _)| [r, g, b])
+        .unwrap_or([0, 255, 0])
+}
+
+fn draw_image_apply_chroma_key(image: &image::RgbaImage) -> image::RgbaImage {
+    let key = draw_image_border_key_color(image);
+    let mut out = image.clone();
+    let inner = 24u32;
+    let outer = 96u32;
+    for pixel in out.pixels_mut() {
+        let [red, green, blue, alpha] = pixel.0;
+        let distance = u32::from(red.abs_diff(key[0]))
+            + u32::from(green.abs_diff(key[1]))
+            + u32::from(blue.abs_diff(key[2]));
+        let chroma_alpha = if distance <= inner {
+            0u8
+        } else if distance >= outer {
+            255u8
+        } else {
+            let span = outer.saturating_sub(inner).max(1);
+            ((distance - inner) * 255 / span) as u8
+        };
+        let final_alpha = ((u16::from(alpha) * u16::from(chroma_alpha)) / 255) as u8;
+        pixel.0[3] = final_alpha;
+    }
+    out
+}
+
+fn draw_image_has_existing_transparency(image: &DynamicImage) -> bool {
+    if !image.color().has_alpha() {
+        return false;
+    }
+    image.to_rgba8().pixels().any(|pixel| pixel.0[3] < 250)
+}
+
+fn draw_image_save_bytes_or_png(
+    output_dir: &Path,
+    request_id: &str,
+    bytes: &[u8],
+    transparent_background: bool,
+) -> Result<(PathBuf, String)> {
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("创建绘图输出目录失败：{}", output_dir.display()))?;
+    let image = image::load_from_memory(bytes).context("生成图片不是有效图像")?;
+    let format = image::guess_format(bytes).unwrap_or(ImageFormat::Png);
+    if transparent_background {
+        let rgba = if draw_image_has_existing_transparency(&image) {
+            image.to_rgba8()
+        } else {
+            draw_image_apply_chroma_key(&image.to_rgba8())
+        };
+        let path = draw_image_target_path(output_dir, request_id, "png");
+        image::DynamicImage::ImageRgba8(rgba)
+            .save_with_format(path.as_path(), ImageFormat::Png)
+            .with_context(|| format!("写入生成图片失败：{}", path.display()))?;
+        draw_image_wait_for_written_file(path.as_path())?;
+        return Ok((path, "image/png".to_string()));
+    }
+
+    let extension = draw_image_format_extension(format);
+    let path = draw_image_target_path(output_dir, request_id, extension);
+    fs::write(path.as_path(), bytes)
+        .with_context(|| format!("写入生成图片失败：{}", path.display()))?;
+    draw_image_wait_for_written_file(path.as_path())?;
+    Ok((path, draw_image_format_mime(format).to_string()))
+}
+
+fn draw_image_response_bytes(
+    client: &reqwest::blocking::Client,
+    provider: &crate::ProviderConfig,
+    response: DrawImageGenerationResponse,
+) -> Result<Vec<u8>> {
+    let Some(entry) = response
+        .data
+        .into_iter()
+        .find(|item| item.b64_json.is_some() || item.url.is_some())
+    else {
+        anyhow::bail!("图像生成响应缺少可用数据");
+    };
+    if let Some(encoded) = entry.b64_json.as_deref() {
+        return draw_image_decode_base64_field(encoded);
+    }
+    let Some(url) = entry.url.as_deref() else {
+        anyhow::bail!("图像生成响应缺少可下载 URL");
+    };
+    draw_image_download_url_bytes(client, provider.base_url.as_str(), url)
+}
+
+fn execute_draw_image(
+    arguments: &str,
+    runtime_ctx: Option<&ToolRuntimeContext>,
+) -> Result<ExecCommandExecution> {
+    let runtime_ctx = execution_runtime_ctx(runtime_ctx)?;
+    let provider = runtime_ctx.provider.clone();
+    let args: DrawImageArgs =
+        serde_json::from_str(arguments).context("解析 draw_image 参数失败")?;
+    let prompt = args.prompt.trim();
+    if prompt.is_empty() {
+        anyhow::bail!("draw_image 需要 prompt");
+    }
+    if args.mode == DrawImageMode::Edit
+        && args
+            .source_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+    {
+        anyhow::bail!("draw_image edit 模式需要 source_path");
+    }
+
+    ensure_media_links()?;
+    let output_dir = resolve_draw_image_output_dir(args.output_dir.as_deref())?;
+    let source = resolve_optional_draw_source(args.source_path.as_deref())?;
+    let request_seq = NEXT_DRAW_IMAGE_REQUEST_ID.fetch_add(1, Ordering::SeqCst);
+    let created_at = crate::unix_timestamp_secs_shared();
+    let request_id = format!("draw-{created_at}-{request_seq}");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(
+            provider.timeout_secs.max(DRAW_IMAGE_HTTP_TIMEOUT_MIN_SECS),
+        ))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .context("创建绘图 HTTP 客户端失败")?;
+    let effective_prompt = draw_image_effective_prompt(prompt, args.transparent_background);
+    let image_bytes = match args.mode {
+        DrawImageMode::Generate => {
+            let body = json!({
+                "model": DRAW_IMAGE_MODEL,
+                "prompt": effective_prompt,
+                "size": args.size.key(),
+                "n": 1,
+            });
+            let urls = crate::apiurl::images_url_candidates(provider.base_url.as_str());
+            let body_text = post_json_with_auth_variants(
+                &client,
+                urls.as_slice(),
+                &body,
+                provider.effective_api_key(),
+            )
+            .with_context(|| {
+                format!(
+                    "图像生成请求失败：model={DRAW_IMAGE_MODEL}, endpoint={}",
+                    urls.join(", ")
+                )
+            })?;
+            let parsed: DrawImageGenerationResponse = serde_json::from_str(body_text.trim())
+                .with_context(|| {
+                    format!(
+                        "解析图像生成响应失败：{}",
+                        truncate_chars(body_text.as_str(), 320)
+                    )
+                })?;
+            draw_image_response_bytes(&client, &provider, parsed)?
+        }
+        DrawImageMode::Edit => {
+            let Some(source) = source.as_ref() else {
+                anyhow::bail!("draw_image edit 模式需要 source_path");
+            };
+            let source_bytes = fs::read(source.path.as_path())
+                .with_context(|| format!("读取绘图源图失败：{}", source.display_path.as_str()))?;
+            let urls = crate::apiurl::images_edits_url_candidates(provider.base_url.as_str());
+            let body_text = post_multipart_with_auth_variants(
+                &client,
+                urls.as_slice(),
+                provider.effective_api_key(),
+                {
+                    let source = source.clone();
+                    let source_bytes = source_bytes.clone();
+                    let effective_prompt = effective_prompt.clone();
+                    let size = args.size.key().to_string();
+                    move || {
+                        let file_name = source
+                            .path
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or("source.png")
+                            .to_string();
+                        let part = Part::bytes(source_bytes.clone())
+                            .file_name(file_name)
+                            .mime_str(source.mime.as_str())
+                            .context("构建绘图上传图片失败")?;
+                        Ok(Form::new()
+                            .text("model", DRAW_IMAGE_MODEL)
+                            .text("prompt", effective_prompt.clone())
+                            .text("size", size.clone())
+                            .part("image", part))
+                    }
+                },
+            )
+            .with_context(|| {
+                format!(
+                    "图像编辑请求失败：model={DRAW_IMAGE_MODEL}, endpoint={}",
+                    urls.join(", ")
+                )
+            })?;
+            let parsed: DrawImageGenerationResponse = serde_json::from_str(body_text.trim())
+                .with_context(|| {
+                    format!(
+                        "解析图像编辑响应失败：{}",
+                        truncate_chars(body_text.as_str(), 320)
+                    )
+                })?;
+            draw_image_response_bytes(&client, &provider, parsed)?
+        }
+    };
+
+    let (saved_path, saved_mime) = draw_image_save_bytes_or_png(
+        output_dir.as_path(),
+        request_id.as_str(),
+        image_bytes.as_slice(),
+        args.transparent_background,
+    )?;
+    let saved_display = display_path_for_ui(saved_path.as_path());
+    let mut output_preview = vec![
+        format!("文件：{saved_display}"),
+        format!("模式：{}", args.mode.label()),
+        format!("尺寸：{}", args.size.key()),
+        format!(
+            "透明背景：{}",
+            if args.transparent_background {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
+        format!("模型：{DRAW_IMAGE_MODEL}"),
+        format!("MIME：{saved_mime}"),
+        format!("输出目录：{}", display_path_for_ui(output_dir.as_path())),
+        format!("提示词：{}", truncate_chars(prompt, 260)),
+    ];
+    if let Some(source) = source.as_ref() {
+        output_preview.push(format!("源图：{}", source.display_path.as_str()));
+    }
+    let mut model_lines = vec![
+        "draw_image:done".to_string(),
+        format!("image_path={saved_display}"),
+        format!("model={DRAW_IMAGE_MODEL}"),
+        format!("mode={}", args.mode.key()),
+        format!("size={}", args.size.key()),
+        format!("transparent_background={}", args.transparent_background),
+        format!("mime={saved_mime}"),
+    ];
+    if let Some(source) = source.as_ref() {
+        model_lines.push(format!("source_path={}", source.display_path.as_str()));
+    }
+    Ok(ExecCommandExecution {
+        brief: resolve_draw_image_brief(args.brief.as_deref(), prompt),
+        kind_label: "Image".to_string(),
+        action_label: "Draw".to_string(),
+        model_output: model_lines.join("\n"),
+        command_preview: build_draw_image_input_preview(&args),
+        output_preview: output_preview.join("\n"),
+        exit_code: Some(0),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    })
+}
+
+fn external_tool_timeout_fallback_ms(manifest: &ExternalToolManifest) -> u64 {
+    manifest
+        .timeout_secs
+        .unwrap_or(EXTERNAL_TOOL_DEFAULT_TIMEOUT_SECS)
+        .saturating_mul(1_000)
+        .clamp(1, EXTERNAL_TOOL_MAX_TIMEOUT_SECS.saturating_mul(1_000))
+}
+
+fn external_tool_scheduler_policy(manifest: &ExternalToolManifest) -> SchedulerPolicy {
+    let fallback_ms = external_tool_timeout_fallback_ms(manifest);
+    match manifest.scheduler.clone() {
+        Some(policy) => policy,
+        None => SchedulerPolicy {
+            deadline_ms: fallback_ms,
+            ..SchedulerPolicy::default()
+        },
+    }
+}
+
+fn external_tool_timeout_duration(manifest: &ExternalToolManifest) -> Duration {
+    let fallback_ms = external_tool_timeout_fallback_ms(manifest);
+    let policy = external_tool_scheduler_policy(manifest);
+    let deadline_ms = scheduler_deadline_ms(&policy, fallback_ms)
+        .clamp(1, EXTERNAL_TOOL_MAX_TIMEOUT_SECS.saturating_mul(1_000));
+    Duration::from_millis(deadline_ms)
+}
+
+fn external_tool_workdir(manifest: &ExternalToolManifest) -> Result<PathBuf> {
+    let project_root = crate::app_project_root();
+    let raw = manifest.working_dir.as_deref().unwrap_or(".").trim();
+    let candidate = if raw.is_empty() || raw == "." {
+        project_root.clone()
+    } else {
+        let path = Path::new(raw);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            project_root.join(path)
+        }
+    };
+    let canonical = candidate
+        .canonicalize()
+        .with_context(|| format!("外部工具工作目录不可用：{}", candidate.display()))?;
+    let canonical_root = project_root
+        .canonicalize()
+        .with_context(|| format!("项目根目录不可用：{}", project_root.display()))?;
+    if !canonical.starts_with(canonical_root.as_path()) {
+        anyhow::bail!(
+            "外部工具 working_dir 必须位于项目目录内：{}",
+            canonical.display()
+        );
+    }
+    Ok(canonical)
+}
+
+fn external_tool_program(manifest: &ExternalToolManifest, workdir: &Path) -> Result<String> {
+    let raw = manifest.program.trim();
+    if raw.contains('/') {
+        let path = Path::new(raw);
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            workdir.join(path)
+        };
+        let canonical = candidate
+            .canonicalize()
+            .with_context(|| format!("外部工具程序不可用：{}", candidate.display()))?;
+        let project_root = crate::app_project_root()
+            .canonicalize()
+            .with_context(|| "项目根目录不可用".to_string())?;
+        if !canonical.starts_with(project_root.as_path()) {
+            anyhow::bail!(
+                "外部工具程序路径必须位于项目目录内：{}",
+                canonical.display()
+            );
+        }
+        Ok(canonical.to_string_lossy().to_string())
+    } else {
+        Ok(raw.to_string())
+    }
+}
+
+fn spawn_external_pipe_reader<R>(mut reader: R) -> thread::JoinHandle<String>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = reader.read_to_end(&mut bytes);
+        String::from_utf8_lossy(bytes.as_slice()).replace('\u{0}', "")
+    })
+}
+
+#[cfg(unix)]
+fn isolate_external_tool_process_group(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn isolate_external_tool_process_group(_command: &mut Command) {}
+
+fn kill_external_tool_process_group(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        unsafe {
+            let _ = libc::kill(-pid, libc::SIGKILL);
+            let _ = libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
+fn execute_external_tool(
+    name: &str,
+    arguments: &str,
+    call_display: &FunctionCallDisplay,
+) -> Result<ExecCommandExecution> {
+    let manifest = external_tool_manifest(name).with_context(|| format!("未知外部工具：{name}"))?;
+    let workdir = external_tool_workdir(&manifest)?;
+    let program = external_tool_program(&manifest, workdir.as_path())?;
+    let scheduler = external_tool_scheduler_policy(&manifest);
+    let dedupe_key = scheduler_dedupe_key(&scheduler, format!("external:{}", manifest.name));
+    let timeout = external_tool_timeout_duration(&manifest);
+    emit_scheduler_event(
+        "scheduler.task.started",
+        manifest.name.as_str(),
+        &scheduler,
+        dedupe_key.as_str(),
+        json!({
+            "program": manifest.program.as_str(),
+            "args": &manifest.args,
+            "timeout_ms": timeout.as_millis() as u64,
+            "input_bytes": arguments.len(),
+        }),
+    );
+    let mut command = Command::new(program.as_str());
+    isolate_external_tool_process_group(&mut command);
+    let mut child = command
+        .args(manifest.args.iter())
+        .current_dir(workdir.as_path())
+        .env("PROJECTYING_TOOL_NAME", manifest.name.as_str())
+        .env("PROJECTYING_PROJECT_ROOT", crate::app_project_root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("启动外部工具失败：{}", manifest.name))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(arguments.as_bytes())
+            .context("写入外部工具 stdin 失败")?;
+        let _ = stdin.write_all(b"\n");
+    }
+    let stdout_reader = child.stdout.take().map(spawn_external_pipe_reader);
+    let stderr_reader = child.stderr.take().map(spawn_external_pipe_reader);
+
+    let started = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("等待外部工具失败")? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            timed_out = true;
+            kill_external_tool_process_group(&mut child);
+            break child.wait().context("终止超时外部工具失败")?;
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let stdout = stdout_reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let mut sections = vec![
+        format!("External tool: {}", manifest.name),
+        format!(
+            "status: {}",
+            if timed_out { "timeout" } else { "completed" }
+        ),
+        format!("exit_code: {}", status.code().unwrap_or(-1)),
+    ];
+    if !stdout.trim().is_empty() {
+        sections.push(format!("STDOUT:\n{}", stdout.trim_end()));
+    }
+    if !stderr.trim().is_empty() {
+        sections.push(format!("STDERR:\n{}", stderr.trim_end()));
+    }
+    emit_scheduler_event(
+        if timed_out {
+            "scheduler.task.timeout"
+        } else {
+            "scheduler.task.done"
+        },
+        manifest.name.as_str(),
+        &scheduler,
+        dedupe_key.as_str(),
+        json!({
+            "elapsed_ms": elapsed_ms,
+            "exit_code": if timed_out { 124 } else { status.code().unwrap_or(1) },
+            "stdout_bytes": stdout.len(),
+            "stderr_bytes": stderr.len(),
+        }),
+    );
+    let output = clamp_report_text(sections.join("\n"));
+    Ok(ExecCommandExecution {
+        brief: call_display.brief.clone(),
+        kind_label: call_display.kind_label.clone(),
+        action_label: if timed_out {
+            "Timeout".to_string()
+        } else {
+            call_display.action_label.clone()
+        },
+        command_preview: format!(
+            "{} {}\nstdin: {}",
+            manifest.program,
+            manifest.args.join(" "),
+            truncate_output(arguments, Some(240))
+        ),
+        output_preview: output.clone(),
+        model_output: output,
+        exit_code: Some(if timed_out {
+            124
+        } else {
+            status.code().unwrap_or(1)
+        }),
+        extra_output_items: Vec::new(),
+        toolmemory_entry_id: None,
+        archived_output: None,
+    })
+}
+
+fn persona_command_queue_path() -> PathBuf {
+    crate::app_runtime_config_root().join("persona-commands.jsonl")
+}
+
+fn append_persona_command(request: &crate::PersonaCommandRequest) -> Result<()> {
+    let path = persona_command_queue_path();
+    crate::ensure_parent_dir_shared(
+        path.as_path(),
+        "persona command 队列路径缺少父目录",
+        "创建 persona command 队列目录失败",
+    )?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path.as_path())
+        .with_context(|| format!("打开 persona command 队列失败：{}", path.display()))?;
+    let line = serde_json::to_string(request).context("序列化 persona command 失败")?;
+    writeln!(file, "{line}")
+        .with_context(|| format!("写入 persona command 队列失败：{}", path.display()))
+}
+
+fn role_base_persona(role: &crate::roles::DynamicRoleSpec) -> crate::PersonaKind {
+    role.contract().capability.base_persona
+}
+
+fn execute_dynamic_role_persona_manage(
+    actor: crate::PersonaKind,
+    args: &PersonaManageArgs,
+    role: crate::roles::DynamicRoleSpec,
+) -> Result<ExecCommandExecution> {
+    let action = persona_manage_action_key(args);
+    let brief = resolve_persona_manage_brief(args.brief.as_deref(), args);
+    match action.as_str() {
+        "observe" => {
+            if !matches!(
+                actor,
+                crate::PersonaKind::Matrix | crate::PersonaKind::Advisor
+            ) {
+                return Err(anyhow!(
+                    "persona_manage.observe 只允许 Matrix · 萤 或 司 使用"
+                ));
+            }
+            let include_recent = args.include_recent.unwrap_or(8).clamp(1, 24);
+            let mut model_output = crate::roles::role_folded_observation(&role, include_recent)?;
+            if let Ok(dispatch) = crate::aidebug::persona_dispatch_observation(
+                crate::app_project_root().as_path(),
+                role.contract().capability.base_persona.context_dir_name(),
+                Some(role.id.as_str()),
+                include_recent,
+            ) && !dispatch.is_empty()
+            {
+                model_output.push('\n');
+                model_output.push_str(dispatch.as_str());
+            }
+            let model_output = append_datememory_pressure_snapshot(model_output);
+            Ok(ExecCommandExecution {
+                brief,
+                kind_label: "Persona".to_string(),
+                action_label: "Observe".to_string(),
+                model_output: model_output.clone(),
+                command_preview: build_persona_manage_input_preview(args),
+                output_preview: model_output,
+                exit_code: Some(0),
+                extra_output_items: Vec::new(),
+                toolmemory_entry_id: None,
+                archived_output: None,
+            })
+        }
+        "send" | "interrupt" => {
+            let contract = role.contract();
+            if action == "interrupt"
+                && !matches!(
+                    actor,
+                    crate::PersonaKind::Matrix | crate::PersonaKind::Advisor
+                )
+            {
+                return Err(anyhow!(
+                    "persona_manage.interrupt 只允许 Matrix · 萤 或 司 使用"
+                ));
+            }
+            let base_persona = role_base_persona(&role);
+            let message = args
+                .message
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            if action == "send" && message.is_none() {
+                return Err(anyhow!("persona_manage.send 需要 message"));
+            }
+            let interrupt_active =
+                persona_manage_send_interrupts_target(actor, action.as_str(), args);
+            let actor_role = current_tool_role_context();
+            let tool_projection = if !matches!(action.as_str(), "send") {
+                "interrupt_only".to_string()
+            } else if contract.capability.default_tools.is_empty() {
+                "none".to_string()
+            } else {
+                let changed = crate::context::open_role_tool_projection_for_persona(
+                    base_persona,
+                    contract.capability.default_tools.as_slice(),
+                )
+                .with_context(|| {
+                    format!(
+                        "动态角色 {} 的工具投影到 {} 失败",
+                        role.id,
+                        base_persona.context_dir_name()
+                    )
+                })?;
+                if changed.is_empty() {
+                    "already_open".to_string()
+                } else {
+                    format!("opened {}", changed.join(" | "))
+                }
+            };
+            let request = crate::PersonaCommandRequest {
+                id: format!(
+                    "persona-{}-{}",
+                    crate::unix_timestamp_millis_shared(),
+                    NEXT_PERSONA_COMMAND_ID.fetch_add(1, Ordering::Relaxed)
+                ),
+                action: if action == "interrupt" {
+                    crate::PersonaCommandAction::Interrupt
+                } else {
+                    crate::PersonaCommandAction::Send
+                },
+                persona: base_persona.context_dir_name().to_string(),
+                source_persona: Some(actor.context_dir_name().to_string()),
+                source_role: actor_role.as_ref().map(|role| role.role_id.clone()),
+                source_role_label: actor_role.as_ref().map(|role| role.label.clone()),
+                source_role_context_dir: actor_role.as_ref().map(|role| role.context_dir.clone()),
+                target_role: Some(contract.identity.id.clone()),
+                target_role_label: Some(contract.identity.header_badge.clone()),
+                target_role_context_dir: Some(contract.storage.context_dir.clone()),
+                message,
+                brief: args.brief.clone(),
+                reason: args.reason.clone(),
+                interrupt_active,
+                created_at_ms: crate::unix_timestamp_millis_u64_shared(),
+            };
+            append_persona_command(&request)?;
+            let _ = crate::aidebug::write_persona_dispatch_event(
+                crate::app_project_root().as_path(),
+                json!({
+                    "id": request.id.as_str(),
+                    "phase": "queued",
+                    "status": "queued",
+                    "action": action.as_str(),
+                    "priority": if request.interrupt_active { "urgent" } else { "normal" },
+                    "interrupt_active": request.interrupt_active,
+                    "source_persona": request.source_persona.as_deref(),
+                    "source_role": request.source_role.as_deref(),
+                    "source_role_label": request.source_role_label.as_deref(),
+                    "source_role_context_dir": request.source_role_context_dir.as_deref(),
+                    "target_persona": request.persona.as_str(),
+                    "target_role": request.target_role.as_deref(),
+                    "target_role_label": request.target_role_label.as_deref(),
+                    "target_role_context_dir": request.target_role_context_dir.as_deref(),
+                    "brief": request.brief.as_deref(),
+                    "reason": request.reason.as_deref(),
+                    "message_chars": request.message.as_ref().map(|value| value.chars().count()),
+                    "created_at_ms": request.created_at_ms,
+                }),
+            );
+            let model_output = format!(
+                "To {} · role:{} · persona_manage:queued\nid:{}\naction:{}\nfrom:{}\nbase_persona:{}\nrole_execution:direct\npriority:{}\nvisibility: folded_chat_only\ntool_projection:{}",
+                contract.identity.header_badge,
+                contract.identity.id,
+                request.id,
+                action.to_ascii_uppercase(),
+                actor.context_dir_name(),
+                base_persona.context_dir_name(),
+                if request.interrupt_active {
+                    "urgent"
+                } else {
+                    "normal"
+                },
+                tool_projection
+            );
+            Ok(ExecCommandExecution {
+                brief,
+                kind_label: "Persona".to_string(),
+                action_label: persona_manage_action_label(action.as_str()).to_string(),
+                model_output: model_output.clone(),
+                command_preview: build_persona_manage_input_preview(args),
+                output_preview: model_output,
+                exit_code: Some(0),
+                extra_output_items: Vec::new(),
+                toolmemory_entry_id: None,
+                archived_output: None,
+            })
+        }
+        other => Err(anyhow!(
+            "persona_manage action 仅支持 observe / send / interrupt，收到：{other}"
+        )),
+    }
+}
+
+fn execute_persona_manage(arguments: &str) -> Result<ExecCommandExecution> {
+    let actor = current_tool_persona();
+    let actor_role = current_tool_role_context();
+    let args = parse_persona_manage_arguments(arguments)?;
+    let action = persona_manage_action_key(&args);
+    let Some(persona) = crate::PersonaKind::parse_alias(args.persona.as_str()) else {
+        let Some(role) = crate::roles::find_role(args.persona.as_str())? else {
+            anyhow::bail!("未知 persona 或动态角色：{}", args.persona.trim());
+        };
+        return execute_dynamic_role_persona_manage(actor, &args, role);
+    };
+    let brief = resolve_persona_manage_brief(args.brief.as_deref(), &args);
+    match action.as_str() {
+        "observe" => {
+            if !matches!(
+                actor,
+                crate::PersonaKind::Matrix | crate::PersonaKind::Advisor
+            ) {
+                return Err(anyhow!(
+                    "persona_manage.observe 只允许 Matrix · 萤 或 司 使用"
+                ));
+            }
+            let include_recent = args.include_recent.unwrap_or(8).clamp(1, 24);
+            let mut model_output =
+                crate::context::persona_folded_observation(persona, include_recent)?;
+            if let Ok(dispatch) = crate::aidebug::persona_dispatch_observation(
+                crate::app_project_root().as_path(),
+                persona.context_dir_name(),
+                None,
+                include_recent,
+            ) && !dispatch.is_empty()
+            {
+                model_output.push('\n');
+                model_output.push_str(dispatch.as_str());
+            }
+            let model_output = append_datememory_pressure_snapshot(model_output);
+            Ok(ExecCommandExecution {
+                brief,
+                kind_label: "Persona".to_string(),
+                action_label: "Observe".to_string(),
+                model_output: model_output.clone(),
+                command_preview: build_persona_manage_input_preview(&args),
+                output_preview: model_output,
+                exit_code: Some(0),
+                extra_output_items: Vec::new(),
+                toolmemory_entry_id: None,
+                archived_output: None,
+            })
+        }
+        "send" | "interrupt" => {
+            if action == "interrupt"
+                && !matches!(
+                    actor,
+                    crate::PersonaKind::Matrix | crate::PersonaKind::Advisor
+                )
+            {
+                return Err(anyhow!(
+                    "persona_manage.interrupt 只允许 Matrix · 萤 或 司 使用"
+                ));
+            }
+            if action == "send" && persona == actor && actor_role.is_none() {
+                return Err(anyhow!("persona_manage.send 不需要发送给当前 persona"));
+            }
+            let message = args
+                .message
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            if action == "send" && message.is_none() {
+                return Err(anyhow!("persona_manage.send 需要 message"));
+            }
+            let interrupt_active =
+                persona_manage_send_interrupts_target(actor, action.as_str(), &args);
+            let request = crate::PersonaCommandRequest {
+                id: format!(
+                    "persona-{}-{}",
+                    crate::unix_timestamp_millis_shared(),
+                    NEXT_PERSONA_COMMAND_ID.fetch_add(1, Ordering::Relaxed)
+                ),
+                action: if action == "interrupt" {
+                    crate::PersonaCommandAction::Interrupt
+                } else {
+                    crate::PersonaCommandAction::Send
+                },
+                persona: persona.context_dir_name().to_string(),
+                source_persona: Some(actor.context_dir_name().to_string()),
+                source_role: actor_role.as_ref().map(|role| role.role_id.clone()),
+                source_role_label: actor_role.as_ref().map(|role| role.label.clone()),
+                source_role_context_dir: actor_role.as_ref().map(|role| role.context_dir.clone()),
+                target_role: None,
+                target_role_label: None,
+                target_role_context_dir: None,
+                message,
+                brief: args.brief.clone(),
+                reason: args.reason.clone(),
+                interrupt_active,
+                created_at_ms: crate::unix_timestamp_millis_u64_shared(),
+            };
+            append_persona_command(&request)?;
+            let _ = crate::aidebug::write_persona_dispatch_event(
+                crate::app_project_root().as_path(),
+                json!({
+                    "id": request.id.as_str(),
+                    "phase": "queued",
+                    "status": "queued",
+                    "action": action.as_str(),
+                    "priority": if request.interrupt_active { "urgent" } else { "normal" },
+                    "interrupt_active": request.interrupt_active,
+                    "source_persona": request.source_persona.as_deref(),
+                    "source_role": request.source_role.as_deref(),
+                    "source_role_label": request.source_role_label.as_deref(),
+                    "source_role_context_dir": request.source_role_context_dir.as_deref(),
+                    "target_persona": request.persona.as_str(),
+                    "target_role": request.target_role.as_deref(),
+                    "target_role_label": request.target_role_label.as_deref(),
+                    "target_role_context_dir": request.target_role_context_dir.as_deref(),
+                    "brief": request.brief.as_deref(),
+                    "reason": request.reason.as_deref(),
+                    "message_chars": request.message.as_ref().map(|value| value.chars().count()),
+                    "created_at_ms": request.created_at_ms,
+                }),
+            );
+            let model_output = format!(
+                "To {} · persona_manage:queued\nid:{}\naction:{}\nfrom:{}\npersona:{}\npriority:{}\nvisibility: folded_chat_only",
+                persona.tab_title(),
+                request.id,
+                action.to_ascii_uppercase(),
+                actor.context_dir_name(),
+                persona.context_dir_name(),
+                if request.interrupt_active {
+                    "urgent"
+                } else {
+                    "normal"
+                }
+            );
+            Ok(ExecCommandExecution {
+                brief,
+                kind_label: "Persona".to_string(),
+                action_label: persona_manage_action_label(action.as_str()).to_string(),
+                model_output: model_output.clone(),
+                command_preview: build_persona_manage_input_preview(&args),
+                output_preview: model_output,
+                exit_code: Some(0),
+                extra_output_items: Vec::new(),
+                toolmemory_entry_id: None,
+                archived_output: None,
+            })
+        }
+        other => Err(anyhow!(
+            "persona_manage action 仅支持 observe / send / interrupt，收到：{other}"
+        )),
+    }
+}
+
 fn parse_memory_target(raw: &str) -> Result<crate::memory::MemoryTarget> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "datememory" => Ok(crate::memory::MemoryTarget::DateMemory),
-        "metamemory" => Ok(crate::memory::MemoryTarget::MetaMemory),
-        "contextmemory" => Ok(crate::memory::MemoryTarget::ContextMemory),
-        "toolmemory" => Ok(crate::memory::MemoryTarget::ToolMemory),
+        "datememory" => Ok(crate::memory::MemoryTarget::Date),
+        "metamemory" => Ok(crate::memory::MemoryTarget::Meta),
+        "toolmemory" => Ok(crate::memory::MemoryTarget::Tool),
         other => anyhow::bail!("不支持的 memory target：{other}"),
+    }
+}
+
+fn is_memory_output_target(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "output" | "tool_output" | "tooloutput" | "external_output" | "externalized_output"
+    )
+}
+
+fn output_stream_read_args_from_memory_read(args: &MemoryReadArgs) -> OutputStreamReadArgs {
+    OutputStreamReadArgs {
+        ref_id: args.ref_id.clone().or_else(|| {
+            args.tool_ref
+                .as_deref()
+                .filter(|value| {
+                    !value.trim().is_empty() && !value.trim().starts_with("toolmemory:")
+                })
+                .map(str::to_string)
+        }),
+        path: args.path.clone(),
+        mode: args.mode.clone(),
+        tail_lines: args.tail_lines,
+        line_start: args.line_start,
+        line_end: args.line_end,
+        cursor: args.cursor.clone(),
+        max_bytes: args.max_bytes,
+        brief: args.brief.clone(),
     }
 }
 
@@ -4030,13 +13915,18 @@ fn parse_memory_scope(args: &MemoryCheckArgs) -> Result<Option<crate::memory::Da
     )
 }
 
+fn parse_memory_scope_target(raw: Option<&str>) -> Result<Option<PersonaScopeTarget>> {
+    parse_persona_scope_target(raw, "memory.persona")
+}
+
 fn resolve_memory_add_brief(args: &MemoryAddArgs) -> String {
     normalize_brief(args.brief.as_deref()).unwrap_or_else(|| {
-        let dates = args
-            .entries
+        let entries = resolved_memory_add_entries(args);
+        let dates = entries
             .iter()
             .take(2)
-            .map(|entry| entry.date.trim())
+            .filter_map(|entry| entry.date.as_deref())
+            .map(str::trim)
             .filter(|date| !date.is_empty())
             .collect::<Vec<_>>();
         match dates.as_slice() {
@@ -4047,16 +13937,8 @@ fn resolve_memory_add_brief(args: &MemoryAddArgs) -> String {
     })
 }
 
-fn resolve_memory_replace_brief(args: &MemoryReplaceArgs) -> String {
-    normalize_brief(args.brief.as_deref()).unwrap_or_else(|| format!("替换日记 #{}", args.entry_id))
-}
-
 fn resolve_memory_check_brief(args: &MemoryCheckArgs) -> String {
     normalize_brief(args.brief.as_deref()).unwrap_or_else(|| format!("检索 {}", args.target.trim()))
-}
-
-fn resolve_memory_search_brief(args: &MemorySearchArgs) -> String {
-    normalize_brief(args.brief.as_deref()).unwrap_or_else(|| format!("搜索 {}", args.target.trim()))
 }
 
 fn resolve_memory_read_brief(args: &MemoryReadArgs) -> String {
@@ -4064,14 +13946,37 @@ fn resolve_memory_read_brief(args: &MemoryReadArgs) -> String {
 }
 
 fn build_memory_add_input_preview(args: &MemoryAddArgs) -> String {
-    let mut lines = vec![format!("entries: {}", args.entries.len())];
+    let target = args
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("datememory");
+    let entries = resolved_memory_add_entries(args);
+    let persona_label = args
+        .persona
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(crate::memory::current_scope_hint);
+    let mut lines = vec![
+        format!("target: {target}"),
+        format!("persona: {persona_label}"),
+        format!("entries: {}", entries.len()),
+    ];
     if args.clear_context {
         lines.push("clear_context: true".to_string());
     }
-    for entry in args.entries.iter().take(4) {
+    for entry in entries.iter().take(4) {
+        let date_label = entry
+            .date
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("(auto)");
         let mut line = format!(
-            "{} · {}",
-            entry.date.trim(),
+            "{date_label} · {}",
             truncate_preview(entry.content.trim(), 72)
         );
         if let Some(title) = entry
@@ -4080,40 +13985,74 @@ fn build_memory_add_input_preview(args: &MemoryAddArgs) -> String {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            line = format!("{} · {}", entry.date.trim(), truncate_preview(title, 28));
+            line = format!("{date_label} · {}", truncate_preview(title, 28));
+        }
+        if let Some(kind) = entry
+            .kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            line.push_str(format!(" · kind={kind}").as_str());
         }
         if !entry.evidence_entry_ids.is_empty() {
             line.push_str(format!(" · evidence={}", entry.evidence_entry_ids.len()).as_str());
         }
         lines.push(line);
     }
-    if args.entries.len() > 4 {
-        lines.push(format!("... +{} entries", args.entries.len() - 4));
+    if entries.len() > 4 {
+        lines.push(format!("... +{} entries", entries.len() - 4));
     }
     lines.join("\n")
 }
 
-fn build_memory_replace_input_preview(args: &MemoryReplaceArgs) -> String {
-    let mut lines = vec![
-        format!("entry_id: {}", args.entry_id),
-        format!("date: {}", args.date.trim()),
-        format!("content: {}", truncate_preview(args.content.trim(), 96)),
-    ];
-    if !args.evidence_entry_ids.is_empty() {
-        lines.push(format!(
-            "evidence_entry_ids: {}",
-            args.evidence_entry_ids
-                .iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+fn resolved_memory_add_entries(args: &MemoryAddArgs) -> Vec<MemoryEntryArgs> {
+    let mut entries = args.entries.clone();
+    if entries.is_empty()
+        && let Some(content) = args
+            .content
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        entries.push(MemoryEntryArgs {
+            date: args.date.clone(),
+            kind: args.kind.clone(),
+            title: args.title.clone(),
+            keywords: args.keywords.clone(),
+            summary: args.summary.clone(),
+            content: content.to_string(),
+            evidence_entry_ids: args.evidence_entry_ids.clone(),
+        });
     }
-    lines.join("\n")
+    for entry in &mut entries {
+        if entry.date.is_none() {
+            entry.date = args.date.clone();
+        }
+        if entry.kind.is_none() {
+            entry.kind = args.kind.clone();
+        }
+        if entry.title.is_none() {
+            entry.title = args.title.clone();
+        }
+        if entry.summary.is_none() {
+            entry.summary = args.summary.clone();
+        }
+        if entry.keywords.is_empty() {
+            entry.keywords = args.keywords.clone();
+        }
+        if entry.evidence_entry_ids.is_empty() {
+            entry.evidence_entry_ids = args.evidence_entry_ids.clone();
+        }
+    }
+    entries
 }
 
 fn build_memory_check_input_preview(args: &MemoryCheckArgs) -> String {
     let mut lines = vec![format!("target: {}", args.target.trim())];
+    if let Some(persona) = args.persona.as_deref() {
+        lines.push(format!("persona: {}", persona.trim()));
+    }
     if !args.keywords.is_empty() {
         lines.push(format!("keywords: {}", args.keywords.join(", ")));
     }
@@ -4132,19 +14071,9 @@ fn build_memory_check_input_preview(args: &MemoryCheckArgs) -> String {
     if let Some(tool_ref) = args.tool_ref.as_deref() {
         lines.push(format!("tool_ref: {}", tool_ref.trim()));
     }
-    if let Some(limit) = args.limit {
-        lines.push(format!("limit: {limit}"));
+    if let Some(entry_id) = args.entry_id {
+        lines.push(format!("entry_id: {entry_id}"));
     }
-    lines.join("\n")
-}
-
-fn build_memory_search_input_preview(args: &MemorySearchArgs) -> String {
-    let mut lines = vec![format!("target: {}", args.target.trim())];
-    if !args.keywords.is_empty() {
-        lines.push(format!("keywords: {}", args.keywords.join(", ")));
-    }
-    lines.push(format!("start_date: {}", args.start_date.trim()));
-    lines.push(format!("end_date: {}", args.end_date.trim()));
     if let Some(limit) = args.limit {
         lines.push(format!("limit: {limit}"));
     }
@@ -4153,8 +14082,21 @@ fn build_memory_search_input_preview(args: &MemorySearchArgs) -> String {
 
 fn build_memory_read_input_preview(args: &MemoryReadArgs) -> String {
     let mut lines = vec![format!("target: {}", args.target.trim())];
+    if let Some(persona) = args.persona.as_deref() {
+        lines.push(format!("persona: {}", persona.trim()));
+    }
     if let Some(entry_id) = args.entry_id {
         lines.push(format!("entry_id: {entry_id}"));
+    }
+    if !args.entry_ids.is_empty() {
+        lines.push(format!(
+            "entry_ids: {}",
+            args.entry_ids
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     if let Some(entry_start_id) = args.entry_start_id {
         lines.push(format!("entry_start_id: {entry_start_id}"));
@@ -4174,26 +14116,65 @@ fn build_memory_read_input_preview(args: &MemoryReadArgs) -> String {
     if let Some(line_end) = args.line_end {
         lines.push(format!("line_end: {line_end}"));
     }
+    if let Some(ref_id) = args.ref_id.as_deref() {
+        lines.push(format!("ref_id: {}", ref_id.trim()));
+    }
+    if let Some(path) = args.path.as_deref() {
+        lines.push(format!("path: {}", path.trim()));
+    }
+    if let Some(mode) = args.mode.as_deref() {
+        lines.push(format!("mode: {}", mode.trim()));
+    }
+    if let Some(tail_lines) = args.tail_lines {
+        lines.push(format!("tail_lines: {tail_lines}"));
+    }
+    if let Some(cursor) = args.cursor.as_deref() {
+        lines.push(format!("cursor: {}", cursor.trim()));
+    }
+    if let Some(max_bytes) = args.max_bytes {
+        lines.push(format!("max_bytes: {max_bytes}"));
+    }
     lines.join("\n")
 }
 
 fn execute_memory_add(arguments: &str) -> Result<ExecCommandExecution> {
-    let args: MemoryAddArgs =
-        serde_json::from_str(arguments).context("解析 memory_add 参数失败")?;
-    let entries = args
-        .entries
-        .iter()
-        .cloned()
-        .map(|entry| crate::memory::DateMemoryDraft {
-            date: entry.date,
-            title: entry.title,
-            keywords: entry.keywords,
-            summary: entry.summary,
-            content: entry.content,
-            evidence_entry_ids: entry.evidence_entry_ids,
-        })
-        .collect::<Vec<_>>();
-    let reply = crate::memory::add_datememory_entries(entries, args.clear_context)?;
+    let args = parse_memory_add_arguments(arguments)?;
+    let target = args
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("datememory")
+        .to_ascii_lowercase();
+    let reply = if target == "datememory" {
+        let entries = resolved_memory_add_entries(&args)
+            .iter()
+            .cloned()
+            .map(|entry| crate::memory::DateMemoryDraft {
+                date: entry.date.unwrap_or_default(),
+                title: entry.title,
+                keywords: entry.keywords,
+                summary: entry.summary,
+                content: entry.content,
+                evidence_entry_ids: entry.evidence_entry_ids,
+            })
+            .collect::<Vec<_>>();
+        match parse_memory_scope_target(args.persona.as_deref())? {
+            Some(PersonaScopeTarget::Persona(persona)) => {
+                crate::memory::with_memory_persona(persona, || {
+                    crate::memory::add_datememory_entries(entries, args.clear_context)
+                })?
+            }
+            Some(PersonaScopeTarget::DynamicRole(role)) => {
+                crate::memory::with_dynamic_role_context(&role, || {
+                    crate::memory::add_datememory_entries(entries, args.clear_context)
+                })?
+            }
+            None => crate::memory::add_datememory_entries(entries, args.clear_context)?,
+        }
+    } else {
+        anyhow::bail!("不支持的 memory_add.target：{target}");
+    };
     Ok(ExecCommandExecution {
         brief: resolve_memory_add_brief(&args),
         kind_label: "Memory".to_string(),
@@ -4203,48 +14184,35 @@ fn execute_memory_add(arguments: &str) -> Result<ExecCommandExecution> {
         output_preview: reply.output_preview,
         exit_code: Some(0),
         extra_output_items: Vec::new(),
-        history_entry_id: None,
-        archived_output: None,
-    })
-}
-
-fn execute_memory_replace(arguments: &str) -> Result<ExecCommandExecution> {
-    let args: MemoryReplaceArgs =
-        serde_json::from_str(arguments).context("解析 memory_replace 参数失败")?;
-    let reply = crate::memory::replace_datememory_entry(crate::memory::DateMemoryReplaceDraft {
-        entry_id: args.entry_id,
-        date: args.date.clone(),
-        title: args.title.clone(),
-        keywords: args.keywords.clone(),
-        summary: args.summary.clone(),
-        content: args.content.clone(),
-        evidence_entry_ids: args.evidence_entry_ids.clone(),
-    })?;
-    Ok(ExecCommandExecution {
-        brief: resolve_memory_replace_brief(&args),
-        kind_label: "Memory".to_string(),
-        action_label: "Replace".to_string(),
-        model_output: reply.output_preview.clone(),
-        command_preview: build_memory_replace_input_preview(&args),
-        output_preview: reply.output_preview,
-        exit_code: Some(0),
-        extra_output_items: Vec::new(),
-        history_entry_id: None,
+        toolmemory_entry_id: None,
         archived_output: None,
     })
 }
 
 fn execute_memory_check(arguments: &str) -> Result<ExecCommandExecution> {
-    let args: MemoryCheckArgs =
-        serde_json::from_str(arguments).context("解析 memory_check 参数失败")?;
-    let reply = crate::memory::check_memory(crate::memory::MemoryCheckRequest {
+    let args = parse_memory_check_arguments(arguments)?;
+    let request = crate::memory::MemoryCheckRequest {
         target: parse_memory_target(args.target.as_str())?,
         keywords: args.keywords.clone(),
         scope: parse_memory_scope(&args)?,
         date: args.date.clone(),
         tool_ref: args.tool_ref.clone(),
+        entry_id: args.entry_id,
         limit: args.limit.unwrap_or(8),
-    })?;
+    };
+    let reply = match parse_memory_scope_target(args.persona.as_deref())? {
+        Some(PersonaScopeTarget::Persona(persona)) => {
+            crate::memory::with_memory_persona(persona, || {
+                crate::memory::check_memory(request.clone())
+            })?
+        }
+        Some(PersonaScopeTarget::DynamicRole(role)) => {
+            crate::memory::with_dynamic_role_context(&role, || {
+                crate::memory::check_memory(request.clone())
+            })?
+        }
+        None => crate::memory::check_memory(request)?,
+    };
     Ok(ExecCommandExecution {
         brief: resolve_memory_check_brief(&args),
         kind_label: "Memory".to_string(),
@@ -4254,48 +14222,51 @@ fn execute_memory_check(arguments: &str) -> Result<ExecCommandExecution> {
         output_preview: reply.output_preview,
         exit_code: Some(0),
         extra_output_items: Vec::new(),
-        history_entry_id: None,
-        archived_output: None,
-    })
-}
-
-fn execute_memory_search(arguments: &str) -> Result<ExecCommandExecution> {
-    let args: MemorySearchArgs =
-        serde_json::from_str(arguments).context("解析 memory_search 参数失败")?;
-    let reply = crate::memory::search_memory(crate::memory::MemorySearchRequest {
-        target: parse_memory_target(args.target.as_str())?,
-        keywords: args.keywords.clone(),
-        start_date: args.start_date.clone(),
-        end_date: args.end_date.clone(),
-        limit: args.limit.unwrap_or(8),
-    })?;
-    Ok(ExecCommandExecution {
-        brief: resolve_memory_search_brief(&args),
-        kind_label: "Memory".to_string(),
-        action_label: "Search".to_string(),
-        model_output: reply.output_preview.clone(),
-        command_preview: build_memory_search_input_preview(&args),
-        output_preview: reply.output_preview,
-        exit_code: Some(0),
-        extra_output_items: Vec::new(),
-        history_entry_id: None,
+        toolmemory_entry_id: None,
         archived_output: None,
     })
 }
 
 fn execute_memory_read(arguments: &str) -> Result<ExecCommandExecution> {
-    let args: MemoryReadArgs =
-        serde_json::from_str(arguments).context("解析 memory_read 参数失败")?;
-    let reply = crate::memory::read_memory(crate::memory::MemoryReadRequest {
+    let args = parse_memory_read_arguments(arguments)?;
+    if is_memory_output_target(args.target.as_str()) {
+        let brief =
+            normalize_brief(args.brief.as_deref()).unwrap_or_else(|| "读取外导输出".to_string());
+        let mut execution = execute_output_stream_read_from_args(
+            output_stream_read_args_from_memory_read(&args),
+            "memory_read",
+            "Memory",
+            "Read",
+            brief.as_str(),
+        )?;
+        execution.brief = brief;
+        execution.command_preview = build_memory_read_input_preview(&args);
+        return Ok(execution);
+    }
+    let request = crate::memory::MemoryReadRequest {
         target: parse_memory_target(args.target.as_str())?,
         date: args.date.clone(),
         tool_ref: args.tool_ref.clone(),
         entry_id: args.entry_id,
+        entry_ids: args.entry_ids.clone(),
         entry_start_id: args.entry_start_id,
         entry_end_id: args.entry_end_id,
         line_start: args.line_start,
         line_end: args.line_end,
-    })?;
+    };
+    let reply = match parse_memory_scope_target(args.persona.as_deref())? {
+        Some(PersonaScopeTarget::Persona(persona)) => {
+            crate::memory::with_memory_persona(persona, || {
+                crate::memory::read_memory(request.clone())
+            })?
+        }
+        Some(PersonaScopeTarget::DynamicRole(role)) => {
+            crate::memory::with_dynamic_role_context(&role, || {
+                crate::memory::read_memory(request.clone())
+            })?
+        }
+        None => crate::memory::read_memory(request)?,
+    };
     Ok(ExecCommandExecution {
         brief: resolve_memory_read_brief(&args),
         kind_label: "Memory".to_string(),
@@ -4305,19 +14276,18 @@ fn execute_memory_read(arguments: &str) -> Result<ExecCommandExecution> {
         output_preview: reply.output_preview,
         exit_code: Some(0),
         extra_output_items: Vec::new(),
-        history_entry_id: None,
+        toolmemory_entry_id: None,
         archived_output: None,
     })
 }
 
-fn parse_request_user_input_arguments(arguments: &str) -> Result<RequestUserInputArgs> {
-    let args: RequestUserInputArgs =
-        serde_json::from_str(arguments).context("解析 request_user_input 参数失败")?;
+fn parse_ask_user_arguments(arguments: &str) -> Result<AskUserArgs> {
+    let args: AskUserArgs = serde_json::from_str(arguments).context("解析 ask_user 参数失败")?;
     if args.questions.is_empty() {
-        anyhow::bail!("request_user_input 需要至少 1 个 question");
+        anyhow::bail!("ask_user 需要至少 1 个 question");
     }
     if args.questions.len() > 10 {
-        anyhow::bail!("request_user_input 最多只支持 10 个 question");
+        anyhow::bail!("ask_user 最多只支持 10 个 question");
     }
     let mut seen_ids = HashSet::new();
     for (index, question) in args.questions.iter().enumerate() {
@@ -4364,7 +14334,7 @@ fn parse_request_user_input_arguments(arguments: &str) -> Result<RequestUserInpu
     Ok(args)
 }
 
-fn derive_request_user_input_brief(args: &RequestUserInputArgs) -> String {
+fn derive_ask_user_brief(args: &AskUserArgs) -> String {
     let Some(first) = args.questions.first() else {
         return "发起对账".to_string();
     };
@@ -4385,7 +14355,7 @@ fn derive_request_user_input_brief(args: &RequestUserInputArgs) -> String {
     }
 }
 
-fn build_request_user_input_preview(args: &RequestUserInputArgs) -> String {
+fn build_ask_user_preview(args: &AskUserArgs) -> String {
     args.questions
         .iter()
         .enumerate()
@@ -4405,7 +14375,7 @@ fn build_request_user_input_preview(args: &RequestUserInputArgs) -> String {
         )
 }
 
-fn summarize_request_user_input_answer(answer: &UserInputAnswer) -> Option<String> {
+fn summarize_ask_user_answer(answer: &UserInputAnswer) -> Option<String> {
     let parts = answer
         .answers
         .iter()
@@ -4428,10 +14398,7 @@ fn summarize_request_user_input_answer(answer: &UserInputAnswer) -> Option<Strin
     }
 }
 
-fn build_request_user_input_response_preview(
-    args: &RequestUserInputArgs,
-    response: &UserInputResponse,
-) -> String {
+fn build_ask_user_response_preview(args: &AskUserArgs, response: &UserInputResponse) -> String {
     let answered = response
         .answers
         .values()
@@ -4440,7 +14407,7 @@ fn build_request_user_input_response_preview(
     let mut lines = vec![format!("已完成 {answered}/{} 项对账", args.questions.len())];
     for (index, question) in args.questions.iter().enumerate() {
         if let Some(answer) = response.answers.get(question.id.as_str())
-            && let Some(summary) = summarize_request_user_input_answer(answer)
+            && let Some(summary) = summarize_ask_user_answer(answer)
         {
             lines.push(format!(
                 "{}. {} · {}",
@@ -4696,7 +14663,7 @@ fn extract_submitted_stdin_command(chars: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn build_user_input_questions(args: &RequestUserInputArgs) -> Vec<UserInputQuestion> {
+fn build_user_input_questions(args: &AskUserArgs) -> Vec<UserInputQuestion> {
     args.questions
         .iter()
         .map(|question| UserInputQuestion {
@@ -4717,40 +14684,37 @@ fn build_user_input_questions(args: &RequestUserInputArgs) -> Vec<UserInputQuest
         .collect()
 }
 
-fn execute_request_user_input(call_id: &str, arguments: &str) -> Result<ExecCommandExecution> {
-    let args = parse_request_user_input_arguments(arguments)?;
+fn execute_ask_user(call_id: &str, arguments: &str) -> Result<ExecCommandExecution> {
+    let args = parse_ask_user_arguments(arguments)?;
     let questions = build_user_input_questions(&args);
     let sink = user_input_sink()
         .lock()
         .ok()
         .and_then(|guard| guard.clone())
-        .context("request_user_input UI 未安装")?;
+        .context("ask_user UI 未安装")?;
     let (response_tx, response_rx) = mpsc::channel();
     sink.send(UserInputRequest {
         call_id: call_id.to_string(),
         questions: questions.clone(),
         response_tx,
     })
-    .context("发送 request_user_input 请求失败")?;
-    let response = response_rx
-        .recv()
-        .context("等待 request_user_input 响应失败")?;
+    .context("发送 ask_user 请求失败")?;
+    let response = response_rx.recv().context("等待 ask_user 响应失败")?;
     let response = match response {
         UserInputToolResponse::Answered(response) => response,
-        UserInputToolResponse::Cancelled => anyhow::bail!("request_user_input cancelled by user"),
+        UserInputToolResponse::Cancelled => anyhow::bail!("ask_user cancelled by user"),
     };
-    let model_output =
-        serde_json::to_string(&response).context("序列化 request_user_input 响应失败")?;
+    let model_output = serde_json::to_string(&response).context("序列化 ask_user 响应失败")?;
     Ok(ExecCommandExecution {
-        brief: derive_request_user_input_brief(&args),
+        brief: derive_ask_user_brief(&args),
         kind_label: "对账".to_string(),
         action_label: "完成".to_string(),
         model_output,
-        command_preview: build_request_user_input_preview(&args),
-        output_preview: build_request_user_input_response_preview(&args, &response),
+        command_preview: build_ask_user_preview(&args),
+        output_preview: build_ask_user_response_preview(&args, &response),
         exit_code: Some(0),
         extra_output_items: Vec::new(),
-        history_entry_id: None,
+        toolmemory_entry_id: None,
         archived_output: None,
     })
 }
@@ -5054,7 +15018,7 @@ fn push_agent_completion_events(
     }
 }
 
-fn compact_agent_preview_line(text: &str, max_chars: usize) -> String {
+fn preview_agent_line(text: &str, max_chars: usize) -> String {
     let source = text
         .lines()
         .map(str::trim)
@@ -5063,7 +15027,7 @@ fn compact_agent_preview_line(text: &str, max_chars: usize) -> String {
     truncate_chars(normalize_agent_event_text(source).as_str(), max_chars)
 }
 
-fn compact_agent_path_display(path: &str) -> String {
+fn preview_agent_path(path: &str) -> String {
     let components = path
         .split(['/', '\\'])
         .filter(|segment| !segment.is_empty() && *segment != ".")
@@ -5082,11 +15046,11 @@ fn agent_apply_patch_preview(preview: &str) -> String {
     for raw_line in preview.lines() {
         let line = raw_line.trim();
         if let Some(path) = line.strip_prefix("*** Update File: ") {
-            paths.push(compact_agent_path_display(path.trim()));
+            paths.push(preview_agent_path(path.trim()));
         } else if let Some(path) = line.strip_prefix("*** Add File: ") {
-            paths.push(compact_agent_path_display(path.trim()));
+            paths.push(preview_agent_path(path.trim()));
         } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
-            paths.push(compact_agent_path_display(path.trim()));
+            paths.push(preview_agent_path(path.trim()));
         } else if line.starts_with('+') {
             added += 1;
         } else if line.starts_with('-') {
@@ -5096,7 +15060,7 @@ fn agent_apply_patch_preview(preview: &str) -> String {
     let summary = match paths.split_first() {
         Some((first, [])) => first.clone(),
         Some((first, rest)) => format!("{first} +{}", rest.len()),
-        None => compact_agent_preview_line(preview, 72),
+        None => preview_agent_line(preview, 72),
     };
     if added == 0 && removed == 0 {
         summary
@@ -5120,27 +15084,21 @@ fn agent_context_manage_event(preview: &str) -> String {
             _ => {}
         }
     }
-    let action_label = match action.as_str() {
+    let canonical_action = crate::canonical_focus_mode_action(action.as_str());
+    let canonical_target = crate::canonical_context_target_name(target.as_str());
+    let action_label = match canonical_action.as_str() {
         "write" => "WRITE",
-        "summary" => "SUMMARY",
-        "compact" => "COMPACT",
-        "enter" | "focus_enter" | "task_enter" => "ENTER",
-        "exit" | "focus_exit" | "task_exit" => "EXIT",
+        "summary" | "compact" => "SUMMARY",
+        "focus_enter" => "ENTER",
+        "focus_exit" => "EXIT",
         _ => "MANAGE",
     };
-    let area_label = match target.as_str() {
-        "fastmemory" if !section.is_empty() => format!("FastMemory/{section}"),
-        "fastmemory" => "FastMemory".to_string(),
-        "fastcontext" => "FastContext".to_string(),
-        "toolcontext" | "taskcontext" | "focuscontext" => "ToolContext".to_string(),
-        "context" => "Context".to_string(),
-        _ if matches!(
-            action.as_str(),
-            "enter" | "exit" | "focus_enter" | "focus_exit" | "task_enter" | "task_exit"
-        ) =>
-        {
-            "Task".to_string()
-        }
+    let area_label = match canonical_target {
+        Some("fastmemory") if !section.is_empty() => format!("FastMemory/{section}"),
+        Some("fastmemory") => "FastMemory".to_string(),
+        Some("focuscontext") => "FocusContext".to_string(),
+        Some("context") => "Context".to_string(),
+        _ if crate::is_focus_mode_action(canonical_action.as_str()) => "Focus".to_string(),
         _ => String::new(),
     };
     if area_label.is_empty() {
@@ -5168,7 +15126,7 @@ fn agent_exec_command_event(preview: &str) -> String {
         }
         "rg" | "grep" => {
             let target = if tail.is_empty() {
-                compact_agent_preview_line(command, 64)
+                preview_agent_line(command, 64)
             } else {
                 tail
             };
@@ -5176,7 +15134,7 @@ fn agent_exec_command_event(preview: &str) -> String {
         }
         "cat" | "sed" | "head" | "tail" | "bat" | "awk" => {
             let target = if tail.is_empty() {
-                compact_agent_preview_line(command, 64)
+                preview_agent_line(command, 64)
             } else {
                 tail
             };
@@ -5190,33 +15148,39 @@ fn agent_exec_command_event(preview: &str) -> String {
             };
             format!("◌ Git · {target}")
         }
-        _ => format!("◌ Run · {}", compact_agent_preview_line(command, 72)),
+        _ => format!("◌ Run · {}", preview_agent_line(command, 72)),
     }
 }
 
 fn agent_tool_event_line(name: &str, brief: &str, preview: &str) -> String {
     let title = match name.trim() {
-        "exec_command" => return agent_exec_command_event(preview),
+        "exec_command" | "command" => return agent_exec_command_event(preview),
+        "pty_run" => format!("◌ PTY · {}", preview_agent_line(preview, 72)),
+        "pty_input" => format!("◌ PTY Input · {}", preview_agent_line(preview, 72)),
+        "pty_wait" => format!("◌ PTY Wait · {}", preview_agent_line(preview, 72)),
         "apply_patch" | "rewrite_section" => {
             format!("✎ Edit · {}", agent_apply_patch_preview(preview))
         }
-        "context_manage" | "task_mode" => agent_context_manage_event(preview),
-        "view_image" => format!("◉ View · {}", compact_agent_preview_line(preview, 72)),
-        "web_search" => format!("◎ Web · {}", compact_agent_preview_line(preview, 72)),
-        "wait_agent" => format!("◌ Wait · {}", compact_agent_preview_line(preview, 72)),
+        "context_manage" | "focus_mode" => agent_context_manage_event(preview),
+        "context_compact" => format!("◌ Compact · {}", preview_agent_line(preview, 72)),
+        "context_summary" => format!("◌ Summary · {}", preview_agent_line(preview, 72)),
+        "view_image" => format!("◉ View · {}", preview_agent_line(preview, 72)),
+        "server_manage" => format!("◌ Server · {}", preview_agent_line(preview, 72)),
+        "server_split" => format!("◌ 御网络 · {}", preview_agent_line(preview, 72)),
+        "web_search" => format!("◎ Web · {}", preview_agent_line(preview, 72)),
+        "wait_agent" => format!("◌ Wait · {}", preview_agent_line(preview, 72)),
         "list_agent" => "◌ List · agents".to_string(),
-        "spawn_agent" => format!("◌ Spawn · {}", compact_agent_preview_line(preview, 72)),
-        "send_input" => format!("◌ Send · {}", compact_agent_preview_line(preview, 72)),
-        "resume_agent" => format!("◌ Resume · {}", compact_agent_preview_line(preview, 72)),
-        "close_agent" => format!("◌ Close · {}", compact_agent_preview_line(preview, 72)),
-        "request_user_input" => format!("◌ 对账 · {}", compact_agent_preview_line(preview, 72)),
+        "spawn_agent" => format!("◌ Spawn · {}", preview_agent_line(preview, 72)),
+        "send_input" => format!("◌ Send · {}", preview_agent_line(preview, 72)),
+        "close_agent" => format!("◌ Close · {}", preview_agent_line(preview, 72)),
+        "ask_user" => format!("◌ 对账 · {}", preview_agent_line(preview, 72)),
         other => {
             let source = if !brief.trim().is_empty() {
                 brief
             } else {
                 preview
             };
-            format!("◌ {} · {}", other, compact_agent_preview_line(source, 72))
+            format!("◌ {} · {}", other, preview_agent_line(source, 72))
         }
     };
     normalize_agent_event_text(title.as_str())
@@ -5267,7 +15231,17 @@ fn current_agent_runtime_snapshots(
                     event_lines: record
                         .event_lines
                         .lock()
-                        .map(|guard| guard.clone())
+                        .map(|guard| {
+                            guard
+                                .iter()
+                                .rev()
+                                .take(AGENT_WAIT_PREVIEW_EVENT_LINES)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect()
+                        })
                         .unwrap_or_default(),
                 })
                 .unwrap_or(AgentRuntimeSnapshot {
@@ -5313,7 +15287,13 @@ fn build_wait_agent_preview(
         .collect::<Vec<_>>()
         .join(" · ");
     let status_line = if timed_out {
-        if summary.is_empty() {
+        if timeout_ms == 0 {
+            if summary.is_empty() {
+                "仍在执行 · 已登记等待".to_string()
+            } else {
+                format!("{summary} · 已登记等待")
+            }
+        } else if summary.is_empty() {
             format!("仍在执行 · 已等待 {}s", timeout_ms / 1000)
         } else {
             format!("{summary} · 已等待 {}s", timeout_ms / 1000)
@@ -5324,11 +15304,10 @@ fn build_wait_agent_preview(
         summary
     };
     let mut lines = Vec::new();
-    if !running_ids.is_empty() {
-        let joined = running_ids.join("/");
-        let verb = if running_ids.len() == 1 { "is" } else { "are" };
+    if timed_out && !running_ids.is_empty() {
+        let joined = running_ids.join(" / ");
         lines.push(format!(
-            "{joined} {verb} still working, now wait for finish."
+            "已登记等待：{joined}。它们结束后会自动回传，无需再次 wait_agent。"
         ));
     }
     lines.push(status_line);
@@ -5340,12 +15319,17 @@ fn build_wait_agent_preview(
         ));
         match &snapshot.status {
             AgentStatusValue::Completed(Some(text)) if !text.trim().is_empty() => {
-                for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-                    lines.push(line.to_string());
+                for line in text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .take(8)
+                {
+                    lines.push(truncate_preview(line, 240));
                 }
             }
             AgentStatusValue::Errored(text) if !text.trim().is_empty() => {
-                lines.push(format!("✕ {}", text.trim()));
+                lines.push(format!("✕ {}", truncate_preview(text.trim(), 240)));
             }
             _ => {
                 let detail_lines = if snapshot.event_lines.is_empty() {
@@ -5366,34 +15350,26 @@ fn build_wait_agent_preview(
                         .rev()
                         .collect::<Vec<_>>()
                 };
-                lines.extend(detail_lines);
+                lines.extend(
+                    detail_lines
+                        .into_iter()
+                        .map(|line| truncate_preview(line.trim(), 240))
+                        .filter(|line| !line.is_empty()),
+                );
             }
         }
     }
     lines.join("\n")
 }
 
-fn all_agent_snapshots_final(snapshots: &BTreeMap<String, AgentRuntimeSnapshot>) -> bool {
+fn any_agent_snapshot_final(snapshots: &BTreeMap<String, AgentRuntimeSnapshot>) -> bool {
     snapshots
         .values()
-        .all(|snapshot| is_final_agent_status(&snapshot.status))
+        .any(|snapshot| is_final_agent_status(&snapshot.status))
 }
 
-fn build_list_agent_preview(snapshots: &[AgentUiSnapshot], include_closed: bool) -> String {
-    let visible_count = snapshots
-        .iter()
-        .filter(|snapshot| !matches!(snapshot.status, AgentStatusValue::Shutdown))
-        .count();
-    let mut lines = vec![format!(
-        "{} 个子代理 · {} 显示",
-        snapshots.len(),
-        if include_closed {
-            "含已关闭"
-        } else {
-            "仅活动"
-        }
-    )];
-    lines.push(format!("当前可见：{visible_count}"));
+fn build_list_agent_preview(snapshots: &[AgentUiSnapshot]) -> String {
+    let mut lines = vec![format!("{} 个活动子代理", snapshots.len())];
     for snapshot in snapshots {
         let role = snapshot
             .agent_type
@@ -5474,6 +15450,7 @@ fn spawn_local_agent_thread(
                                         ),
                                     );
                                 }
+                                crate::provider::ChatProgressEvent::ProviderPhase(_) => {}
                                 crate::provider::ChatProgressEvent::Retrying(retry) => {
                                     push_agent_event(
                                         &event_lines,
@@ -5599,10 +15576,7 @@ fn execute_spawn_agent(
         manager.next_agent_id = manager.next_agent_id.saturating_add(1);
         let agent_id = format!("agent-{agent_number}");
         let nickname = Some(format!("Agent #{agent_number}"));
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let created_at = crate::unix_timestamp_secs_shared();
         let log_path = agent_log_path(agent_id.as_str());
         initialize_agent_log(
             log_path.as_path(),
@@ -5620,8 +15594,6 @@ fn execute_spawn_agent(
             LocalAgentRecord {
                 nickname: nickname.clone(),
                 agent_type: args.agent_type.clone(),
-                provider: provider.clone(),
-                transcript: transcript.clone(),
                 status: status.clone(),
                 cancel_flag: cancel_flag.clone(),
                 command_tx: Some(tx.clone()),
@@ -5680,7 +15652,7 @@ fn execute_spawn_agent(
         )),
         exit_code: Some(0),
         extra_output_items: Vec::new(),
-        history_entry_id: None,
+        toolmemory_entry_id: None,
         archived_output: None,
     })
 }
@@ -5715,7 +15687,7 @@ fn execute_send_input(arguments: &str) -> Result<ExecCommandExecution> {
             .command_tx
             .as_ref()
             .cloned()
-            .context("agent 已关闭，请先 resume_agent")?;
+            .context("agent 已关闭，请重新创建或改用其他活动子代理")?;
         tx.send(AgentCommand::Run {
             prompt: prompt.clone(),
         })
@@ -5735,7 +15707,7 @@ fn execute_send_input(arguments: &str) -> Result<ExecCommandExecution> {
         output_preview: format!("{} · 已接收并开始处理", agent_label_text(args.id.as_str())),
         exit_code: Some(0),
         extra_output_items: Vec::new(),
-        history_entry_id: None,
+        toolmemory_entry_id: None,
         archived_output: None,
     })
 }
@@ -5753,17 +15725,52 @@ fn execute_wait_agent(arguments: &str) -> Result<ExecCommandExecution> {
             WAIT_AGENT_MIN_TIMEOUT_MS as i64,
             WAIT_AGENT_MAX_TIMEOUT_MS as i64,
         ) as u64;
+    let scheduler = SchedulerPolicy {
+        dedupe_key: Some(format!("wait_agent:{}", args.ids.join(","))),
+        deadline_ms: timeout_ms,
+        poll_interval_ms: 100,
+        max_retries: 0,
+        payload_policy: "replace_not_stack".to_string(),
+        ..SchedulerPolicy::default()
+    };
+    let dedupe_key = scheduler_dedupe_key(&scheduler, "wait_agent");
+    emit_scheduler_event(
+        "scheduler.task.started",
+        "wait_agent",
+        &scheduler,
+        dedupe_key.as_str(),
+        json!({
+            "ids": &args.ids,
+            "timeout_ms": timeout_ms,
+        }),
+    );
     let started = Instant::now();
     let snapshots = loop {
         let snapshots = current_agent_runtime_snapshots(args.ids.as_slice())?;
-        if all_agent_snapshots_final(&snapshots)
+        if any_agent_snapshot_final(&snapshots)
             || started.elapsed().as_millis() as u64 >= timeout_ms
         {
             break snapshots;
         }
         thread::sleep(std::time::Duration::from_millis(100));
     };
-    let timed_out = !all_agent_snapshots_final(&snapshots);
+    let timed_out = !any_agent_snapshot_final(&snapshots);
+    emit_scheduler_event(
+        if timed_out {
+            "scheduler.task.timeout"
+        } else {
+            "scheduler.task.done"
+        },
+        "wait_agent",
+        &scheduler,
+        dedupe_key.as_str(),
+        json!({
+            "ids": &args.ids,
+            "timeout_ms": timeout_ms,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "snapshot_count": snapshots.len(),
+        }),
+    );
     let status_map = snapshots
         .iter()
         .map(|(id, snapshot)| (id.clone(), agent_status_json_value(&snapshot.status)))
@@ -5798,28 +15805,30 @@ fn execute_wait_agent(arguments: &str) -> Result<ExecCommandExecution> {
     Ok(ExecCommandExecution {
         brief: default_tool_brief("wait_agent"),
         kind_label: "Agent".to_string(),
-        action_label: "Wait".to_string(),
+        action_label: if timed_out {
+            "已登记等待".to_string()
+        } else {
+            "等待完成".to_string()
+        },
         model_output,
         command_preview: format!("{} 个子代理", args.ids.len()),
         output_preview: build_wait_agent_preview(&snapshots, timeout_ms, timed_out),
         exit_code: Some(0),
         extra_output_items: Vec::new(),
-        history_entry_id: None,
+        toolmemory_entry_id: None,
         archived_output: None,
     })
 }
 
 fn execute_list_agent(arguments: &str) -> Result<ExecCommandExecution> {
-    let args: ListAgentArgs = if arguments.trim().is_empty() {
+    let _args: ListAgentArgs = if arguments.trim().is_empty() {
         ListAgentArgs::default()
     } else {
         serde_json::from_str(arguments).context("解析 list_agent 参数失败")?
     };
     let snapshots = list_agent_snapshots()
         .into_iter()
-        .filter(|snapshot| {
-            args.include_closed || !matches!(snapshot.status, AgentStatusValue::Shutdown)
-        })
+        .filter(|snapshot| !matches!(snapshot.status, AgentStatusValue::Shutdown))
         .collect::<Vec<_>>();
     let model_output = build_agent_tool_json_output(json!({
         "count": snapshots.len(),
@@ -5839,89 +15848,11 @@ fn execute_list_agent(arguments: &str) -> Result<ExecCommandExecution> {
         kind_label: "Agent".to_string(),
         action_label: "List".to_string(),
         model_output,
-        command_preview: if args.include_closed {
-            "全部子代理（含已关闭）".to_string()
-        } else {
-            "仅当前活动子代理".to_string()
-        },
-        output_preview: build_list_agent_preview(&snapshots, args.include_closed),
+        command_preview: "仅当前活动子代理".to_string(),
+        output_preview: build_list_agent_preview(&snapshots),
         exit_code: Some(0),
         extra_output_items: Vec::new(),
-        history_entry_id: None,
-        archived_output: None,
-    })
-}
-
-fn execute_resume_agent(arguments: &str) -> Result<ExecCommandExecution> {
-    let args: SingleAgentArgs =
-        serde_json::from_str(arguments).context("解析 resume_agent 参数失败")?;
-    let ids = args.resolved_ids()?;
-    let statuses = {
-        let mut manager = agent_manager()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("agent manager lock poisoned"))?;
-        let mut collected = Vec::new();
-        for id in &ids {
-            let status = if let Some(record) = manager.agents.get_mut(id.as_str()) {
-                if record.command_tx.is_none() {
-                    let (tx, rx) = mpsc::channel();
-                    record.command_tx = Some(tx);
-                    if let Ok(mut guard) = record.status.lock() {
-                        *guard = AgentStatusValue::Running;
-                    }
-                    push_agent_event(
-                        &record.event_lines,
-                        Some(record.log_path.as_path()),
-                        "◌ 已恢复",
-                    );
-                    spawn_local_agent_thread(
-                        record.provider.clone(),
-                        record.transcript.clone(),
-                        record.status.clone(),
-                        record.cancel_flag.clone(),
-                        record.event_lines.clone(),
-                        record.log_path.clone(),
-                        rx,
-                    );
-                }
-                agent_status_snapshot(&record.status)
-            } else {
-                AgentStatusValue::NotFound
-            };
-            collected.push((id.clone(), status));
-        }
-        collected
-    };
-    let model_output = build_agent_tool_json_output(json!({
-        "statuses": statuses.iter().map(|(id, status)| json!({
-            "id": id,
-            "status": agent_status_json_value(status),
-        })).collect::<Vec<_>>(),
-    }))?;
-    Ok(ExecCommandExecution {
-        brief: default_tool_brief("resume_agent"),
-        kind_label: "Agent".to_string(),
-        action_label: "Resume".to_string(),
-        model_output,
-        command_preview: ids
-            .iter()
-            .map(|id| agent_label_text(id.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        output_preview: statuses
-            .iter()
-            .map(|(id, status)| {
-                format!(
-                    "{} · {}",
-                    agent_label_text(id.as_str()),
-                    agent_status_display_text(status)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        exit_code: Some(0),
-        extra_output_items: Vec::new(),
-        history_entry_id: None,
+        toolmemory_entry_id: None,
         archived_output: None,
     })
 }
@@ -5989,333 +15920,7 @@ fn execute_close_agent(arguments: &str) -> Result<ExecCommandExecution> {
             .join("\n"),
         exit_code: Some(0),
         extra_output_items: Vec::new(),
-        history_entry_id: None,
-        archived_output: None,
-    })
-}
-
-fn resolve_tool_file_path(raw: &str, base_dir: &Path) -> Result<PathBuf> {
-    let path = Path::new(raw.trim());
-    if path.is_absolute() {
-        Ok(normalize_lexical_path(path))
-    } else {
-        resolve_non_absolute_tool_path(raw, base_dir)
-    }
-}
-
-fn batch_item_id_from_record(
-    headers: &[String],
-    record: &csv::StringRecord,
-    row_index: usize,
-    id_column: Option<&str>,
-) -> String {
-    if let Some(id_column) = id_column
-        && let Some(position) = headers.iter().position(|header| header == id_column)
-        && let Some(value) = record.get(position)
-        && !value.trim().is_empty()
-    {
-        return value.trim().to_string();
-    }
-    format!("row-{}", row_index.saturating_add(1))
-}
-
-fn interpolate_batch_instruction(
-    template: &str,
-    headers: &[String],
-    record: &csv::StringRecord,
-) -> String {
-    let mut out = template.to_string();
-    for (index, header) in headers.iter().enumerate() {
-        let value = record.get(index).unwrap_or("");
-        out = out.replace(format!("{{{header}}}").as_str(), value);
-    }
-    out
-}
-
-fn execute_spawn_agents_on_csv(
-    arguments: &str,
-    runtime_ctx: Option<&ToolRuntimeContext>,
-) -> Result<ExecCommandExecution> {
-    let args: SpawnAgentsOnCsvArgs =
-        serde_json::from_str(arguments).context("解析 spawn_agents_on_csv 参数失败")?;
-    if args.instruction.trim().is_empty() {
-        anyhow::bail!("instruction 不能为空");
-    }
-    let runtime_ctx = execution_runtime_ctx(runtime_ctx)?;
-    let base_dir = env::current_dir().context("读取当前目录失败")?;
-    let csv_path = resolve_tool_file_path(args.csv_path.as_str(), base_dir.as_path())?;
-    let output_csv_path = args
-        .output_csv_path
-        .as_deref()
-        .map(|path| resolve_tool_file_path(path, base_dir.as_path()))
-        .transpose()?
-        .unwrap_or_else(|| {
-            csv_path.with_file_name(format!(
-                "{}.results.csv",
-                csv_path
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("agent_job")
-            ))
-        });
-    let mut reader = csv::Reader::from_path(&csv_path)
-        .with_context(|| format!("打开 CSV 失败：{}", csv_path.display()))?;
-    let headers = reader
-        .headers()
-        .context("读取 CSV 表头失败")?
-        .iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>();
-    if headers.is_empty() {
-        anyhow::bail!("CSV 缺少表头");
-    }
-    let max_concurrency = args
-        .max_workers
-        .or(args.max_concurrency)
-        .unwrap_or(DEFAULT_AGENT_BATCH_CONCURRENCY)
-        .clamp(1, MAX_AGENT_BATCH_CONCURRENCY);
-    let _max_runtime = args
-        .max_runtime_seconds
-        .unwrap_or(DEFAULT_AGENT_BATCH_RUNTIME_SECS);
-    let mut outcomes = Vec::new();
-    for (row_index, record) in reader.records().enumerate() {
-        let record = record.context("读取 CSV 行失败")?;
-        let item_id = batch_item_id_from_record(
-            headers.as_slice(),
-            &record,
-            row_index,
-            args.id_column.as_deref(),
-        );
-        let instruction =
-            interpolate_batch_instruction(args.instruction.as_str(), headers.as_slice(), &record);
-        let result = crate::provider::chat_completion_blocking(
-            &runtime_ctx.provider,
-            &collect_agent_base_messages(runtime_ctx, false)
-                .into_iter()
-                .chain(std::iter::once(crate::provider::ApiMessage::user(
-                    instruction,
-                )))
-                .collect::<Vec<_>>(),
-        );
-        match result {
-            Ok(completion) => {
-                let text = completion.text.trim();
-                let parsed = if let Some(schema) = args.output_schema.as_ref() {
-                    let _ = schema;
-                    serde_json::from_str::<Value>(text).ok()
-                } else {
-                    None
-                };
-                outcomes.push(BatchWorkerOutcome {
-                    item_id,
-                    source_id: None,
-                    result: parsed.or_else(|| Some(json!({ "text": text }))),
-                    error: None,
-                });
-            }
-            Err(err) => outcomes.push(BatchWorkerOutcome {
-                item_id,
-                source_id: None,
-                result: None,
-                error: Some(format!("{err:#}")),
-            }),
-        }
-        if outcomes.len() >= max_concurrency {
-            // 当前实现仍按顺序执行；这里保留并发参数的边界与回显，后续可替换为真正并行 worker。
-        }
-    }
-    let mut writer = csv::Writer::from_path(&output_csv_path)
-        .with_context(|| format!("创建结果 CSV 失败：{}", output_csv_path.display()))?;
-    writer
-        .write_record(["item_id", "status", "result", "error"])
-        .context("写入结果 CSV 表头失败")?;
-    let mut failed = Vec::new();
-    let mut completed_items = 0usize;
-    for outcome in &outcomes {
-        let (status, result_text, error_text) = match (&outcome.result, &outcome.error) {
-            (Some(result), None) => {
-                completed_items = completed_items.saturating_add(1);
-                (
-                    "completed",
-                    serde_json::to_string(result).unwrap_or_default(),
-                    String::new(),
-                )
-            }
-            (_, Some(error)) => {
-                failed.push(BatchFailureSummary {
-                    item_id: outcome.item_id.clone(),
-                    source_id: outcome.source_id.clone(),
-                    last_error: error.clone(),
-                });
-                ("failed", String::new(), error.clone())
-            }
-            _ => ("failed", String::new(), "empty result".to_string()),
-        };
-        writer
-            .write_record([
-                outcome.item_id.as_str(),
-                status,
-                result_text.as_str(),
-                error_text.as_str(),
-            ])
-            .context("写入结果 CSV 行失败")?;
-    }
-    writer.flush().context("刷新结果 CSV 失败")?;
-    let job_id = {
-        let mut manager = agent_manager()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("agent manager lock poisoned"))?;
-        let job_id = format!("job-{}", manager.next_batch_job_id);
-        manager.next_batch_job_id = manager.next_batch_job_id.saturating_add(1);
-        job_id
-    };
-    let payload = json!({
-        "job_id": job_id,
-        "status": if failed.is_empty() { "completed" } else { "completed_with_failures" },
-        "output_csv_path": output_csv_path.display().to_string(),
-        "total_items": outcomes.len(),
-        "completed_items": completed_items,
-        "failed_items": failed.len(),
-        "job_error": Value::Null,
-        "failed_item_errors": if failed.is_empty() { Value::Null } else { json!(failed) },
-    });
-    let model_output = build_agent_tool_json_output(payload)?;
-    Ok(ExecCommandExecution {
-        brief: default_tool_brief("spawn_agents_on_csv"),
-        kind_label: "Batch".to_string(),
-        action_label: "Run".to_string(),
-        model_output,
-        command_preview: format!(
-            "{} · {}",
-            csv_path.display(),
-            truncate_preview(args.instruction.as_str(), 72)
-        ),
-        output_preview: format!(
-            "completed {} row(s), failed {}, export {}",
-            completed_items,
-            failed.len(),
-            output_csv_path.display()
-        ),
-        exit_code: Some(0),
-        extra_output_items: Vec::new(),
-        history_entry_id: None,
-        archived_output: None,
-    })
-}
-
-fn execute_report_agent_job_result(arguments: &str) -> Result<ExecCommandExecution> {
-    fn resolve_snapshot(args: &ReportAgentJobResultArgs) -> Option<AgentUiSnapshot> {
-        let snapshots = list_agent_snapshots();
-        let direct_id = args
-            .result
-            .get("agent_id")
-            .and_then(Value::as_str)
-            .or_else(|| args.result.get("id").and_then(Value::as_str))
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        if let Some(direct_id) = direct_id
-            && let Some(snapshot) = snapshots.iter().find(|snapshot| {
-                snapshot.id == direct_id
-                    || snapshot.nickname.as_deref() == Some(direct_id)
-                    || agent_label_text(snapshot.id.as_str()) == direct_id
-            })
-        {
-            return Some(snapshot.clone());
-        }
-        snapshots.into_iter().rev().find(|snapshot| {
-            !matches!(
-                snapshot.status,
-                AgentStatusValue::Shutdown | AgentStatusValue::NotFound
-            )
-        })
-    }
-
-    fn build_snapshot_preview(snapshot: Option<&AgentUiSnapshot>) -> String {
-        let Some(snapshot) = snapshot else {
-            return "暂无可用的子代理快照".to_string();
-        };
-        let mut lines = vec![format!(
-            "{} · {}",
-            agent_label_text(snapshot.id.as_str()),
-            agent_status_display_text(&snapshot.status)
-        )];
-        lines.push(compact_agent_preview_line(
-            snapshot.task_preview.as_str(),
-            88,
-        ));
-        lines.extend(
-            snapshot
-                .event_lines
-                .iter()
-                .rev()
-                .take(4)
-                .cloned()
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev(),
-        );
-        lines.join("\n")
-    }
-
-    let args: ReportAgentJobResultArgs =
-        serde_json::from_str(arguments).context("解析 report_agent_job_result 参数失败")?;
-    if !args.result.is_object() {
-        anyhow::bail!("report_agent_job_result.result 必须是 object");
-    }
-    let snapshot = resolve_snapshot(&args);
-    let model_output = build_agent_tool_json_output(json!({
-        "accepted": true,
-        "job_id": args.job_id,
-        "item_id": args.item_id,
-        "stop": args.stop.unwrap_or(false),
-        "reported_result": args.result,
-        "agent_snapshot": snapshot.as_ref().map(|snapshot| json!({
-            "id": snapshot.id.clone(),
-            "nickname": snapshot.nickname.clone(),
-            "agent_type": snapshot.agent_type.clone(),
-            "status": agent_status_json_value(&snapshot.status),
-            "task_preview": snapshot.task_preview.clone(),
-            "event_lines": snapshot.event_lines.clone(),
-            "log_path": snapshot.log_path.clone(),
-            "created_at": snapshot.created_at,
-        })),
-    }))?;
-    Ok(ExecCommandExecution {
-        brief: default_tool_brief("report_agent_job_result"),
-        kind_label: "Batch".to_string(),
-        action_label: "Report".to_string(),
-        model_output,
-        command_preview: format!("{} · {}", args.job_id, args.item_id),
-        output_preview: build_snapshot_preview(snapshot.as_ref()),
-        exit_code: Some(0),
-        extra_output_items: Vec::new(),
-        history_entry_id: None,
-        archived_output: None,
-    })
-}
-
-fn execute_write_stdin(arguments: &str) -> Result<ExecCommandExecution> {
-    let args: WriteStdinArgs =
-        serde_json::from_str(arguments).context("解析 write_stdin 参数失败")?;
-    if let Some(command) = extract_submitted_stdin_command(args.chars.as_str()) {
-        confirm_dangerous_command_if_needed(command.as_str())?;
-    }
-    let output = terminal::write_stdin(terminal::WriteStdinRequest {
-        session_id: args.session_id,
-        chars: args.chars.clone(),
-        yield_time_ms: args.yield_time_ms,
-        max_output_tokens: args.max_output_tokens,
-    })?;
-    Ok(ExecCommandExecution {
-        brief: default_tool_brief("write_stdin"),
-        kind_label: "TERMINAL".to_string(),
-        action_label: terminal_input_action_label(args.chars.as_str(), false),
-        model_output: output.model_output,
-        command_preview: output.command_preview,
-        output_preview: output.output_preview,
-        exit_code: output.exit_code,
-        extra_output_items: Vec::new(),
-        history_entry_id: None,
+        toolmemory_entry_id: None,
         archived_output: None,
     })
 }
@@ -6364,36 +15969,435 @@ fn execute_pty_kill(arguments: &str) -> Result<terminal::ToolReply> {
 fn default_tool_brief(name: &str) -> String {
     match name {
         "exec_command" | "command" | "shell_command" => "执行终端命令".to_string(),
-        "multi_tool_use.parallel" => "并行探索".to_string(),
+        "persona_manage" => "调度 ProjectYing persona".to_string(),
         "view_image" => "查看图片内容".to_string(),
+        "draw_image" | "image_gen" => "生成图片".to_string(),
+        "browser" => "浏览网页会话".to_string(),
+        "server_manage" => "管理服务器连接".to_string(),
+        "server_split" => "管理御网络分裂".to_string(),
         "apply_patch" => "应用补丁修改文件".to_string(),
         "rewrite_section" => "稳定改写文件片段".to_string(),
         "update_plan" => "更新任务计划".to_string(),
-        "task_mode" => "进入或退出任务模式".to_string(),
+        "focus_mode" => "进入或退出专注模式".to_string(),
         "context_manage" => "管理外置上下文".to_string(),
+        "context_compact" => "快速压缩上下文".to_string(),
+        "context_summary" => "折叠上下文条目".to_string(),
         "memory_add" => "写入长期记忆日记".to_string(),
-        "memory_replace" => "替换长期记忆日记".to_string(),
         "memory_check" => "检索长期记忆".to_string(),
-        "memory_search" => "按日期区间搜索长期记忆".to_string(),
         "memory_read" => "读取长期记忆".to_string(),
-        "request_user_input" => "发起对账".to_string(),
+        "ask_user" => "发起对账".to_string(),
         "spawn_agent" => "启动子代理".to_string(),
         "send_input" => "继续给子代理发送任务".to_string(),
         "wait_agent" => "等待子代理完成".to_string(),
-        "list_agent" => "查看子代理列表".to_string(),
-        "resume_agent" => "恢复子代理".to_string(),
+        "list_agent" => "查看活动子代理".to_string(),
         "close_agent" => "关闭子代理".to_string(),
-        "spawn_agents_on_csv" => "批量处理 CSV 行任务".to_string(),
-        "report_agent_job_result" => "回写批处理结果".to_string(),
-        "write_stdin" => "继续操作终端".to_string(),
+        "pty_run" => "启动终端会话".to_string(),
+        "pty_input" => "向终端发送输入".to_string(),
+        "pty_wait" => "等待终端结束".to_string(),
         "pty_list" => "查看终端会话".to_string(),
         "pty_kill" => "结束终端会话".to_string(),
         _ => "执行工具调用".to_string(),
     }
 }
 
+fn browser_action_key(args: &BrowserArgs) -> String {
+    args.action.trim().to_ascii_lowercase()
+}
+
+fn persona_manage_action_key(args: &PersonaManageArgs) -> String {
+    args.action.trim().to_ascii_lowercase()
+}
+
+fn persona_manage_persona_label(persona: &str) -> String {
+    if let Some(persona) = crate::PersonaKind::parse_alias(persona) {
+        return persona.tab_title().to_string();
+    }
+    if let Ok(Some(role)) = crate::roles::find_role(persona) {
+        let identity = role.contract().identity;
+        return format!("{} · {}", identity.header_badge, identity.id);
+    }
+    persona.trim().to_string()
+}
+
+fn resolve_persona_manage_brief(raw: Option<&str>, args: &PersonaManageArgs) -> String {
+    normalize_brief(raw).unwrap_or_else(|| {
+        let target = persona_manage_persona_label(args.persona.as_str());
+        match persona_manage_action_key(args).as_str() {
+            "observe" => format!("观察 {target}"),
+            "send" => format!("指派 {target}"),
+            "interrupt" => format!("打断 {target}"),
+            _ => "调度 persona".to_string(),
+        }
+    })
+}
+
+fn persona_manage_action_label(action: &str) -> &'static str {
+    match action {
+        "observe" => "Observe",
+        "send" => "Send",
+        "interrupt" => "Interrupt",
+        _ => "Run",
+    }
+}
+
+fn append_datememory_pressure_snapshot(mut observation: String) -> String {
+    let limit_kb = crate::memory::default_context_limit_kb();
+    let bytes = crate::memory::datememorycontext_total_size_bytes();
+    let kb = ((bytes.saturating_add(1023)) / 1024) as u64;
+    observation.push_str("\nmemory_pressure:");
+    observation.push_str(format!("\n- datememory_context_kb: {kb}").as_str());
+    observation.push_str(format!("\n- datememory_context_limit_kb: {limit_kb}").as_str());
+    observation.push_str(format!("\n- datememory_context_over_limit: {}", kb > limit_kb).as_str());
+    observation
+}
+
+fn build_persona_manage_input_preview(args: &PersonaManageArgs) -> String {
+    let action = persona_manage_action_key(args);
+    let target = persona_manage_persona_label(args.persona.as_str());
+    let mut lines = vec![format!("action={action}"), format!("to={target}")];
+    if let Some(priority) = persona_manage_priority(args) {
+        lines.push(format!("priority={priority}"));
+    }
+    if let Some(reason) = normalize_brief(args.reason.as_deref()) {
+        lines.push(format!("reason={reason}"));
+    }
+    if let Some(message) = args
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(truncate_with_ellipsis(message, 240));
+    }
+    lines.join("\n")
+}
+
+fn persona_manage_priority(args: &PersonaManageArgs) -> Option<&'static str> {
+    match args
+        .priority
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("urgent" | "interrupt" | "realtime" | "high") => Some("urgent"),
+        Some("normal" | "queue" | "queued") => Some("normal"),
+        Some(_) => Some("normal"),
+        None => None,
+    }
+}
+
+fn persona_manage_send_interrupts_target(
+    actor: crate::PersonaKind,
+    action: &str,
+    args: &PersonaManageArgs,
+) -> bool {
+    if action == "interrupt" {
+        return true;
+    }
+    if persona_manage_priority(args) == Some("urgent") {
+        return true;
+    }
+    matches!(
+        actor,
+        crate::PersonaKind::Matrix | crate::PersonaKind::Advisor
+    )
+}
+
+fn browser_action_label(args: &BrowserArgs) -> &'static str {
+    match browser_action_key(args).as_str() {
+        "create" => "Create",
+        "list" => "List",
+        "open" => "Open",
+        "read" => "Read",
+        "submit" => "Submit",
+        "close" => "Close",
+        "app_status" => "App Status",
+        "app_open" => "App Open",
+        "app_open_many" => "App Batch",
+        "app_switch" => "App Switch",
+        "app_close" => "App Close",
+        "app_reload" => "App Reload",
+        "app_back" => "App Back",
+        "app_forward" => "App Forward",
+        "app_snapshot" => "App Snapshot",
+        "app_request_human" => "Human Assist",
+        "app_set_ua" => "Set UA",
+        "app_click" => "App Click",
+        "app_fill" => "App Fill",
+        "app_submit" => "App Submit",
+        _ => "Run",
+    }
+}
+
+fn resolve_browser_brief(raw: Option<&str>, args: &BrowserArgs) -> String {
+    normalize_brief(raw).unwrap_or_else(|| match browser_action_key(args).as_str() {
+        "create" => "创建网页会话".to_string(),
+        "list" => "查看网页会话".to_string(),
+        "open" => args
+            .url
+            .as_deref()
+            .map(|url| {
+                truncate_chars(
+                    format!("打开 {}", truncate_preview(url.trim(), 20)).as_str(),
+                    24,
+                )
+            })
+            .unwrap_or_else(|| "打开网页".to_string()),
+        "read" => "读取网页内容".to_string(),
+        "submit" => "提交网页表单".to_string(),
+        "close" => "关闭网页会话".to_string(),
+        "app_status" => "读取手机浏览器状态".to_string(),
+        "app_open" => args
+            .url
+            .as_deref()
+            .map(|url| {
+                truncate_chars(
+                    format!("APP 打开 {}", truncate_preview(url.trim(), 18)).as_str(),
+                    24,
+                )
+            })
+            .unwrap_or_else(|| "APP 打开页面".to_string()),
+        "app_open_many" => "APP 批量打开标签页".to_string(),
+        "app_switch" => "切换手机浏览器标签页".to_string(),
+        "app_close" => "关闭手机浏览器标签页".to_string(),
+        "app_reload" => "刷新手机浏览器页面".to_string(),
+        "app_back" => "手机浏览器后退".to_string(),
+        "app_forward" => "手机浏览器前进".to_string(),
+        "app_snapshot" => "读取手机浏览器页面快照".to_string(),
+        "app_request_human" => "请求人工接管浏览器".to_string(),
+        "app_set_ua" => "切换手机浏览器 UA".to_string(),
+        "app_click" => "点击手机浏览器元素".to_string(),
+        "app_fill" => "填写手机浏览器表单".to_string(),
+        "app_submit" => "提交手机浏览器表单".to_string(),
+        _ => default_tool_brief("browser"),
+    })
+}
+
+fn build_browser_input_preview(args: &BrowserArgs) -> String {
+    let action = browser_action_key(args);
+    let headline = match action.as_str() {
+        "create" => "CREATE · browser session".to_string(),
+        "list" => "LIST · browser sessions".to_string(),
+        "open" => "OPEN · page request".to_string(),
+        "read" => "READ · page snapshot".to_string(),
+        "submit" => "SUBMIT · form request".to_string(),
+        "close" => "CLOSE · browser session".to_string(),
+        "app_status" => "STATUS · browser app".to_string(),
+        "app_open" => "OPEN · browser app tab".to_string(),
+        "app_open_many" => "BATCH · browser app tabs".to_string(),
+        "app_switch" => "SWITCH · browser app tab".to_string(),
+        "app_close" => "CLOSE · browser app tab".to_string(),
+        "app_reload" => "RELOAD · browser app tab".to_string(),
+        "app_back" => "BACK · browser app tab".to_string(),
+        "app_forward" => "FORWARD · browser app tab".to_string(),
+        "app_snapshot" => "SNAPSHOT · browser app tab".to_string(),
+        "app_request_human" => "ASSIST · browser app".to_string(),
+        "app_set_ua" => "UA · browser app".to_string(),
+        "app_click" => "CLICK · browser app element".to_string(),
+        "app_fill" => "FILL · browser app field".to_string(),
+        "app_submit" => "SUBMIT · browser app form".to_string(),
+        _ => format!("RUN · {action}"),
+    };
+    let mut lines = vec![headline];
+    if let Some(session_id) = args
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("session: {session_id}"));
+    }
+    if let Some(name) = args
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("name: {}", truncate_preview(name, 48)));
+    }
+    if let Some(url) = args
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("url: {}", truncate_preview(url, 96)));
+    }
+    if let Some(method) = args
+        .method
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("method: {}", method.to_ascii_uppercase()));
+    } else if action == "open" {
+        lines.push("method: GET".to_string());
+    } else if action == "submit" {
+        lines.push("method: POST".to_string());
+    }
+    if !args.form.is_empty() {
+        let fields = args
+            .form
+            .keys()
+            .take(5)
+            .map(|key| truncate_preview(key, 24))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("form_fields: {} ({fields})", args.form.len()));
+    }
+    let selectors = browser_requested_selectors(args);
+    if !selectors.is_empty() {
+        lines.push(format!(
+            "selectors: {}",
+            selectors
+                .iter()
+                .take(3)
+                .map(|value| truncate_preview(value.as_str(), 32))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(max_items) = args.max_items {
+        lines.push(format!(
+            "max_items: {}",
+            sanitize_browser_max_items(max_items)
+        ));
+    }
+    if !args.urls.is_empty() {
+        lines.push(format!("urls: {}", args.urls.len()));
+        for url in args.urls.iter().take(3) {
+            lines.push(format!("- {}", truncate_preview(url.trim(), 96)));
+        }
+    }
+    if let Some(tab_id) = args
+        .tab_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("tab_id: {tab_id}"));
+    }
+    if let Some(tab_index) = args.tab_index {
+        lines.push(format!("tab_index: {tab_index}"));
+    }
+    if let Some(background) = args.background {
+        lines.push(format!("background: {background}"));
+    }
+    if let Some(mode) = args
+        .mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("mode: {mode}"));
+    }
+    if let Some(selector) = args
+        .selector
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && browser_action_uses_agentbrowser(action.as_str())
+    {
+        lines.push(format!("selector: {}", truncate_preview(selector, 96)));
+    }
+    if let Some(match_text) = args
+        .match_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("match_text: {}", truncate_preview(match_text, 96)));
+    }
+    if let Some(href_contains) = args
+        .href_contains
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!(
+            "href_contains: {}",
+            truncate_preview(href_contains, 96)
+        ));
+    }
+    if let Some(field_name) = args
+        .field_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("field_name: {}", truncate_preview(field_name, 96)));
+    }
+    if let Some(placeholder) = args
+        .placeholder
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!(
+            "placeholder: {}",
+            truncate_preview(placeholder, 96)
+        ));
+    }
+    if let Some(value) = args
+        .value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("value: {}", truncate_preview(value, 96)));
+    }
+    if let Some(element_index) = args.element_index {
+        lines.push(format!("element_index: {element_index}"));
+    }
+    lines.join("\n")
+}
+
 fn resolve_view_image_brief(raw: Option<&str>, path: &str) -> String {
     normalize_brief(raw).unwrap_or_else(|| derive_view_image_brief(path))
+}
+
+fn resolve_draw_image_brief(raw: Option<&str>, prompt: &str) -> String {
+    normalize_brief(raw).unwrap_or_else(|| {
+        let text = collapse_whitespace_text(prompt);
+        if text.is_empty() {
+            "生成图片".to_string()
+        } else {
+            truncate_chars(format!("生成图片：{text}").as_str(), 28)
+        }
+    })
+}
+
+fn build_draw_image_input_preview(args: &DrawImageArgs) -> String {
+    let mut lines = vec![
+        format!("mode: {}", args.mode.key()),
+        format!("size: {}", args.size.key()),
+        format!(
+            "transparent_background: {}",
+            if args.transparent_background {
+                "yes"
+            } else {
+                "no"
+            }
+        ),
+    ];
+    if let Some(source_path) = args
+        .source_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!(
+            "source: {}",
+            build_view_image_input_preview(source_path)
+        ));
+    }
+    lines.push(format!(
+        "prompt: {}",
+        truncate_chars(args.prompt.trim(), 220)
+    ));
+    lines.join("\n")
 }
 
 fn derive_view_image_brief(path: &str) -> String {
@@ -7032,6 +17036,63 @@ fn terminal_input_pending_action_label(chars: &str) -> String {
     format!("{}中", terminal_interaction_action(chars))
 }
 
+fn pty_input_action_label(chars: &str, failed: bool) -> String {
+    if chars.trim().is_empty() {
+        if failed {
+            "发送失败".to_string()
+        } else {
+            "已发送".to_string()
+        }
+    } else {
+        terminal_input_action_label(chars, failed)
+    }
+}
+
+fn pty_input_pending_action_label(chars: &str) -> String {
+    if chars.trim().is_empty() {
+        "发送中".to_string()
+    } else {
+        terminal_input_pending_action_label(chars)
+    }
+}
+
+fn build_pty_selector_preview(
+    session_id: Option<u64>,
+    pid: Option<i32>,
+    name: Option<&str>,
+    fallback: &str,
+) -> String {
+    if let Some(session_id) = session_id {
+        return format!("session_id={session_id}");
+    }
+    if let Some(pid) = pid {
+        return format!("pid={pid}");
+    }
+    if let Some(name) = name.map(str::trim).filter(|value| !value.is_empty()) {
+        return format!("name={name}");
+    }
+    fallback.to_string()
+}
+
+fn build_pty_run_preview(name: Option<&str>, cmd: &str) -> String {
+    if let Some(name) = name.map(str::trim).filter(|value| !value.is_empty()) {
+        format!("name={name} · {cmd}")
+    } else {
+        cmd.to_string()
+    }
+}
+
+fn build_pty_wait_preview(args: &PtyWaitArgs) -> String {
+    let selector =
+        build_pty_selector_preview(args.session_id, args.pid, args.name.as_deref(), "pty");
+    match args.timeout_secs {
+        Some(timeout_secs) if timeout_secs > 0 => {
+            format!("{selector} · timeout={}s", timeout_secs)
+        }
+        _ => selector,
+    }
+}
+
 fn resolve_exec_command_brief(raw: Option<&str>, cmd: &str) -> String {
     normalize_brief(raw).unwrap_or_else(|| derive_exec_command_brief(cmd))
 }
@@ -7043,7 +17104,10 @@ fn resolve_apply_patch_brief(raw: Option<&str>, patch: &str) -> String {
 fn parse_update_plan_arguments(arguments: &str) -> Result<NormalizedUpdatePlan> {
     let args: UpdatePlanArgs =
         serde_json::from_str(arguments).context("解析 update_plan 参数失败")?;
+    let mode = parse_update_plan_mode(args.mode.as_deref(), args.blueprint.as_deref())?;
     let explanation = normalize_plan_line(args.explanation.as_deref());
+    let decision = normalize_plan_line(args.decision.as_deref());
+    let blueprint = normalize_multiline_plan_text(args.blueprint.as_deref());
     let mut steps = Vec::with_capacity(args.plan.len());
     let mut in_progress_count = 0usize;
     for raw_step in args.plan {
@@ -7058,7 +17122,37 @@ fn parse_update_plan_arguments(arguments: &str) -> Result<NormalizedUpdatePlan> 
     if in_progress_count > 1 {
         anyhow::bail!("update_plan 同时只能有一个 in_progress 步骤");
     }
-    Ok(NormalizedUpdatePlan { explanation, steps })
+    if mode == UpdatePlanMode::Decision && decision.is_none() && explanation.is_none() {
+        anyhow::bail!("update_plan decision 模式需要 decision 或 explanation");
+    }
+    Ok(NormalizedUpdatePlan {
+        mode,
+        explanation,
+        decision,
+        blueprint,
+        steps,
+    })
+}
+
+fn parse_update_plan_mode(raw: Option<&str>, blueprint: Option<&str>) -> Result<UpdatePlanMode> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(
+            if blueprint
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty())
+            {
+                UpdatePlanMode::Blueprint
+            } else {
+                UpdatePlanMode::Plan
+            },
+        );
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "decision" | "decide" | "simple" => Ok(UpdatePlanMode::Decision),
+        "plan" | "todo" | "normal" => Ok(UpdatePlanMode::Plan),
+        "blueprint" | "design" | "doc" => Ok(UpdatePlanMode::Blueprint),
+        other => anyhow::bail!("update_plan.mode 不支持：{other}"),
+    }
 }
 
 fn parse_update_plan_status(raw: &str) -> Result<UpdatePlanStatus> {
@@ -7094,7 +17188,38 @@ fn normalize_plan_line(raw: Option<&str>) -> Option<String> {
     }
 }
 
+fn normalize_multiline_plan_text(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let lines = raw
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trimmed = lines.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn update_plan_mode_label(mode: UpdatePlanMode) -> &'static str {
+    match mode {
+        UpdatePlanMode::Decision => "Decision",
+        UpdatePlanMode::Plan => "Plan",
+        UpdatePlanMode::Blueprint => "Blueprint",
+    }
+}
+
+const UPDATE_PLAN_INPUT_PREVIEW_STEP_LIMIT: usize = 12;
+const UPDATE_PLAN_BLUEPRINT_PREVIEW_LINE_LIMIT: usize = 8;
+
 fn derive_update_plan_brief(args: &NormalizedUpdatePlan) -> String {
+    if args.mode == UpdatePlanMode::Decision
+        && let Some(decision) = args.decision.as_deref().or(args.explanation.as_deref())
+    {
+        return truncate_chars(decision, 24);
+    }
     if let Some(active) = args
         .steps
         .iter()
@@ -7111,22 +17236,52 @@ fn derive_update_plan_brief(args: &NormalizedUpdatePlan) -> String {
 fn build_update_plan_input_preview(args: &NormalizedUpdatePlan) -> String {
     let (pending, in_progress, completed) = update_plan_counts(args);
     let mut lines = vec![format!(
-        "Plan · {} steps · {} pending · {} in_progress · {} completed",
+        "{} · {} steps · {} pending · {} in_progress · {} completed",
+        update_plan_mode_label(args.mode),
         args.steps.len(),
         pending,
         in_progress,
         completed
     )];
+    lines.push(format!("mode: {}", update_plan_mode_label(args.mode)));
     if let Some(explanation) = args.explanation.as_deref() {
         lines.push(format!("说明：{explanation}"));
     }
-    for step in &args.steps {
+    if let Some(decision) = args.decision.as_deref() {
+        lines.push(format!("决策：{decision}"));
+    }
+    if let Some(blueprint) = args.blueprint.as_deref() {
+        lines.push("蓝图：".to_string());
+        let blueprint_lines = blueprint.lines().collect::<Vec<_>>();
+        let total = blueprint_lines.len();
+        lines.extend(
+            blueprint_lines
+                .into_iter()
+                .take(UPDATE_PLAN_BLUEPRINT_PREVIEW_LINE_LIMIT)
+                .map(|line| format!("  {line}")),
+        );
+        if total > UPDATE_PLAN_BLUEPRINT_PREVIEW_LINE_LIMIT {
+            lines.push(format!(
+                "  … 另有 {} 行蓝图已折叠",
+                total.saturating_sub(UPDATE_PLAN_BLUEPRINT_PREVIEW_LINE_LIMIT)
+            ));
+        }
+    }
+    for step in args.steps.iter().take(UPDATE_PLAN_INPUT_PREVIEW_STEP_LIMIT) {
         let status = match step.status {
             UpdatePlanStatus::Pending => "pending",
             UpdatePlanStatus::InProgress => "in_progress",
             UpdatePlanStatus::Completed => "completed",
         };
         lines.push(format!("[{status}] {}", step.step));
+    }
+    if args.steps.len() > UPDATE_PLAN_INPUT_PREVIEW_STEP_LIMIT {
+        lines.push(format!(
+            "[folded] 另有 {} 步已折叠",
+            args.steps
+                .len()
+                .saturating_sub(UPDATE_PLAN_INPUT_PREVIEW_STEP_LIMIT)
+        ));
     }
     lines.join("\n")
 }
@@ -7140,7 +17295,11 @@ fn build_update_plan_output_preview(args: &NormalizedUpdatePlan) -> String {
         .map(|step| step.step.clone())
         .unwrap_or_else(|| "无".to_string());
     [
-        format!("Plan updated · {} steps", args.steps.len()),
+        format!(
+            "{} updated · {} steps",
+            update_plan_mode_label(args.mode),
+            args.steps.len()
+        ),
         format!("当前：{active}"),
         format!(
             "统计：{} pending · {} in_progress · {} completed",
@@ -7939,10 +18098,11 @@ fn write_patch_file_lines(path: &Path, label: &str, lines: &[String]) -> Result<
             path_state_summary(path)
         );
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create parent directory for {label}"))?;
-    }
+    crate::ensure_parent_dir_shared(
+        path,
+        "Failed to write file: target path has no parent directory",
+        format!("Failed to create parent directory for {label}").as_str(),
+    )?;
     fs::write(path, patch_lines_to_text(lines)).map_err(|err| {
         anyhow!(
             "Failed to write file {label}: {err} ({})",
@@ -8515,7 +18675,7 @@ impl CommandOutputSaveReason {
 fn summarize_command_output(
     text: &str,
     max_output_tokens: Option<usize>,
-    history_entry_id: Option<u64>,
+    toolmemory_entry_id: Option<u64>,
     budget: &CommandOutputBudget,
     _family: ExecCommandFamily,
 ) -> Result<CommandOutputSummary> {
@@ -8540,15 +18700,12 @@ fn summarize_command_output(
             COMMAND_OUTPUT_PREVIEW_MAX_LINES.min(budget.inline_lines),
             COMMAND_OUTPUT_PREVIEW_MAX_CHARS.min(budget.inline_chars),
         );
-        let archive_label = history_entry_id
-            .map(|entry_id| format!("entry_id={entry_id}"))
-            .unwrap_or_else(|| "entry_id=pending".to_string());
-        let saved_note = format!(
-            "[HistoryTools archived · {archive_label} · line_range=1-{lines}] {} · {} bytes · {} lines · {} chars",
+        let saved_note = format_tool_output_archive_note(
+            toolmemory_entry_id,
             save_reason.display_text(),
             bytes,
             lines,
-            chars
+            chars,
         );
         let ui_preview = format!("{saved_note}\n{preview}");
         let model_preview = truncate_output(ui_preview.as_str(), max_output_tokens);
@@ -8589,12 +18746,6 @@ fn command_output_save_reason(
     chars: usize,
     budget: &CommandOutputBudget,
 ) -> Option<CommandOutputSaveReason> {
-    if lines > budget.inline_lines || chars > budget.inline_chars {
-        return Some(CommandOutputSaveReason::SelectedBudget(format!(
-            "selected budget: {}",
-            budget.label
-        )));
-    }
     if bytes > COMMAND_OUTPUT_SYSTEM_INLINE_MAX_BYTES {
         return Some(CommandOutputSaveReason::SystemSafety(format!(
             "system safety cap: {bytes} bytes > {COMMAND_OUTPUT_SYSTEM_INLINE_MAX_BYTES}"
@@ -8610,16 +18761,19 @@ fn command_output_save_reason(
             "system safety cap: {chars} chars > {COMMAND_OUTPUT_SYSTEM_INLINE_MAX_CHARS}"
         )));
     }
+    if bytes > budget.inline_chars {
+        return Some(CommandOutputSaveReason::SelectedBudget(format!(
+            "selected budget: {}",
+            budget.label
+        )));
+    }
+    if lines > budget.inline_lines || chars > budget.inline_chars {
+        return Some(CommandOutputSaveReason::SelectedBudget(format!(
+            "selected budget: {}",
+            budget.label
+        )));
+    }
     None
-}
-
-fn prepare_command_output_dir_at(dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir)
-        .with_context(|| format!("创建 commandoutput 目录失败：{}", dir.display()))
-}
-
-fn prepare_command_output_dir_for_family(family: ExecCommandFamily) -> Result<()> {
-    prepare_command_output_dir_at(command_output_dir_for_family(family).as_path())
 }
 
 fn output_group_key(path: &Path) -> Option<String> {
@@ -8730,10 +18884,7 @@ fn truncate_chars_with_ellipsis(text: &str, max_chars: usize) -> String {
 }
 
 fn make_chunk_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+    let nanos = crate::unix_timestamp_nanos_shared();
     format!("{:06x}", (nanos & 0x00ff_ffff) as u64)
 }
 
@@ -8745,60 +18896,70 @@ fn shell_quote(text: &str) -> String {
     format!("'{escaped}'")
 }
 
+fn command_binary_available(name: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {}", shell_quote(name)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn normalize_ssh_key_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        return home_dir().join(rest).to_string_lossy().to_string();
+    }
+    if let Some(rest) = trimmed.strip_prefix("home/") {
+        return home_dir().join(rest).to_string_lossy().to_string();
+    }
+    trimmed.to_string()
+}
+
 fn home_dir() -> PathBuf {
-    std::env::var(HOME_OVERRIDE_ENV)
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(PathBuf::from))
-        .unwrap_or_else(|_| PathBuf::from("."))
+    crate::app_home_dir()
 }
 
-fn looks_like_project_root(path: &Path) -> bool {
-    path.join("Cargo.toml").is_file() && path.join("src/main.rs").is_file()
-}
-
-fn find_project_root_from(start: &Path) -> Option<PathBuf> {
-    start
-        .ancestors()
-        .find(|path| looks_like_project_root(path))
-        .map(Path::to_path_buf)
-}
+// =============================================================================
+// 工具城仓储路由
+// - mcp 仍可保留少量本地包装函数，但 command/media/agent/terminal 根目录
+//   统一回到 crate 级路网注册表。
+// =============================================================================
 
 fn projectying_root() -> PathBuf {
-    if std::env::var_os(HOME_OVERRIDE_ENV).is_some() {
-        return home_dir().join(PROJECTYING_REL_PATH);
-    }
-    if let Ok(cwd) = std::env::current_dir()
-        && let Some(root) = find_project_root_from(&cwd)
-    {
-        return root;
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(parent) = exe.parent()
-        && let Some(root) = find_project_root_from(parent)
-    {
-        return root;
-    }
-    home_dir().join(PROJECTYING_REL_PATH)
-}
-
-fn command_output_dir() -> PathBuf {
-    projectying_root().join(COMMAND_OUTPUT_REL_PATH)
+    crate::app_project_root()
 }
 
 fn multiagent_output_dir() -> PathBuf {
-    projectying_root().join(MULTIAGENT_OUTPUT_REL_PATH)
+    crate::app_output_multiagent_dir()
 }
 
-fn command_output_dir_for_family(family: ExecCommandFamily) -> PathBuf {
+fn terminal_output_dir() -> PathBuf {
+    crate::app_output_terminal_dir()
+}
+
+fn terminal_output_adb_dir() -> PathBuf {
+    crate::app_output_terminal_adb_dir()
+}
+
+fn terminal_output_termux_api_dir() -> PathBuf {
+    crate::app_output_terminal_termuxapi_dir()
+}
+
+fn terminal_output_dir_for_family(family: ExecCommandFamily) -> PathBuf {
     match family {
-        ExecCommandFamily::Generic => command_output_dir(),
-        ExecCommandFamily::Adb => projectying_root().join(COMMAND_OUTPUT_ADB_REL_PATH),
-        ExecCommandFamily::TermuxApi => projectying_root().join(COMMAND_OUTPUT_TERMUX_API_REL_PATH),
+        ExecCommandFamily::Generic => terminal_output_dir(),
+        ExecCommandFamily::Adb => terminal_output_adb_dir(),
+        ExecCommandFamily::TermuxApi => terminal_output_termux_api_dir(),
     }
 }
 
 fn media_dir() -> PathBuf {
-    projectying_root().join(MEDIA_DIR_NAME)
+    crate::app_media_root()
 }
 
 fn agent_log_path(id: &str) -> PathBuf {
@@ -8834,13 +18995,12 @@ fn append_agent_log_line(path: &Path, line: &str) {
     if line.trim().is_empty() {
         return;
     }
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
+    let _ = crate::ensure_parent_dir_shared(
+        path,
+        "Agent log path has no parent directory",
+        "Failed to create agent log directory",
+    );
+    let stamp = crate::unix_timestamp_secs_shared();
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "[{stamp}] {line}");
     }
@@ -8853,9 +19013,11 @@ fn initialize_agent_log(
     agent_type: Option<&str>,
     task_preview: &str,
 ) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
+    let _ = crate::ensure_parent_dir_shared(
+        path,
+        "Agent log path has no parent directory",
+        "Failed to create agent log directory",
+    );
     let header = [
         format!("agent_id: {agent_id}"),
         format!("nickname: {}", nickname.unwrap_or(agent_id)),
@@ -8872,7 +19034,7 @@ fn ensure_media_links() -> Result<()> {
     fs::create_dir_all(&root)
         .with_context(|| format!("创建外连媒体目录失败：{}", root.display()))?;
 
-    for stale in ["pictures", "dcim", "game_space_screenshots"] {
+    for stale in ["pictures", "game_space_screenshots", "screenshots"] {
         let stale_path = root.join(stale);
         if stale_path.exists() || fs::symlink_metadata(&stale_path).is_ok() {
             let _ = fs::remove_file(&stale_path).or_else(|_| fs::remove_dir_all(&stale_path));
@@ -8880,15 +19042,24 @@ fn ensure_media_links() -> Result<()> {
     }
 
     let mappings = [
-        ("camera", "/storage/emulated/0/DCIM/Camera"),
-        ("screenshots", "/storage/emulated/0/Pictures/Screenshots"),
+        (
+            media_dir().join("dcim"),
+            Path::new("/storage/emulated/0/DCIM"),
+        ),
+        (
+            crate::app_media_camera_dir(),
+            Path::new("/storage/emulated/0/DCIM/Camera"),
+        ),
+        (
+            crate::app_media_screenshot_dir(),
+            Path::new("/storage/emulated/0/Pictures/Screenshots"),
+        ),
     ];
-    for (name, target) in mappings {
-        let target_path = Path::new(target);
+    for (link_path, target_path) in mappings {
         if !target_path.exists() {
             continue;
         }
-        upsert_symlink(root.join(name), target_path)?;
+        upsert_symlink(link_path, target_path)?;
     }
 
     let readme = root.join("README.txt");
@@ -8898,13 +19069,15 @@ fn ensure_media_links() -> Result<()> {
         "本目录只维护安卓相机与截图目录的软链接，方便 AI 直接访问照片与最近截图。",
         "",
         "当前映射：",
+        "  - dcim -> /storage/emulated/0/DCIM",
         "  - camera -> /storage/emulated/0/DCIM/Camera",
-        "  - screenshots -> /storage/emulated/0/Pictures/Screenshots",
+        "  - screenshot -> /storage/emulated/0/Pictures/Screenshots",
         "",
-        "相机主目录：/storage/emulated/0/DCIM/Camera",
+        "相册主目录：/storage/emulated/0/DCIM",
+        "相机子目录：/storage/emulated/0/DCIM/Camera",
         "截图主目录：/storage/emulated/0/Pictures/Screenshots",
-        "推荐优先使用：media/screenshots/ （传目录时会自动选择最新截图）",
-        "照片可直接使用：media/camera/",
+        "推荐优先使用：media/screenshot/ （传目录时会自动选择最新截图）",
+        "照片可直接使用：media/dcim/",
         "",
         "如果需要让 AI 真正分析图片内容，请调用 view_image(path=...)。",
     ]
@@ -8957,7 +19130,10 @@ fn default_workdir(cwd: &Path, home: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::io::{Cursor, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::path::Path;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn with_test_home<T>(f: impl FnOnce(PathBuf) -> T) -> T {
         let _guard = home_override_test_lock()
@@ -8980,53 +19156,310 @@ mod tests {
         result
     }
 
-    #[test]
-    fn tool_schema_uses_codex_exec_command_name() {
-        let tools = codex_tools();
-        let names = tools
-            .as_array()
-            .expect("tool array")
-            .iter()
-            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec![
-                "exec_command",
-                "write_stdin",
-                "view_image",
-                "apply_patch",
-                "update_plan",
-                "task_mode",
-                "context_manage",
-                "memory_add",
-                "memory_replace",
-                "memory_check",
-                "memory_read",
-                "request_user_input",
-                "spawn_agent",
-                "send_input",
-                "wait_agent",
-                "list_agent",
-                "resume_agent",
-                "close_agent",
-                "spawn_agents_on_csv",
-                "report_agent_job_result",
-                "pty_list",
-                "pty_kill",
+    fn write_server_ssh_test_config(home_root: &Path, password: &str) {
+        let config_dir = home_root.join(PROJECTYING_REL_PATH).join("config");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        fs::write(
+            config_dir.join("server.json"),
+            serde_json::json!({
+                "providers": [],
+                "server_ssh": {
+                    "host": "203.0.113.10",
+                    "port": 2222,
+                    "user": "root",
+                    "password": password,
+                    "key_path": ""
+                }
+            })
+            .to_string(),
+        )
+        .expect("write server config");
+    }
+
+    fn reset_browser_sessions() {
+        let mut manager = browser_manager()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        manager.sessions.clear();
+        manager.next_id = 0;
+    }
+
+    fn spawn_browser_test_server() -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buffer = [0_u8; 4096];
+                let size = stream.read(&mut buffer).expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                let response = if request.starts_with("POST /submit ") {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nSet-Cookie: sid=abc123; Path=/\r\n\r\n<html><head><title>Submit OK</title></head><body><main><p>posted success</p><a href=\"/detail\">detail</a><form action=\"/done\" method=\"post\"><input name=\"code\"></form></main></body></html>"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nSet-Cookie: sid=abc123; Path=/\r\n\r\n<html><head><title>Browser Test</title></head><body><main><h1>hello world</h1><p>alpha beta gamma</p><a href=\"/next\">next stop</a><form action=\"/submit\" method=\"post\"><input name=\"keyword\"></form></main></body></html>"
+                };
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+                stream.flush().expect("flush response");
+            }
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    fn test_http_request_complete(buffer: &[u8]) -> bool {
+        let Some(header_end) = buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+        else {
+            return false;
+        };
+        let header_text = String::from_utf8_lossy(&buffer[..header_end]);
+        let content_length = header_text
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        buffer.len() >= header_end + content_length
+    }
+
+    fn read_test_http_request(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let size = stream.read(&mut chunk).expect("read request");
+            if size == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..size]);
+            if test_http_request_complete(buffer.as_slice()) {
+                break;
+            }
+        }
+        String::from_utf8_lossy(buffer.as_slice()).to_string()
+    }
+
+    fn draw_image_test_response_body() -> String {
+        let mut image = image::RgbaImage::from_pixel(12, 12, image::Rgba([0, 255, 0, 255]));
+        for y in 4..8 {
+            for x in 4..8 {
+                image.put_pixel(x, y, image::Rgba([255, 0, 0, 255]));
+            }
+        }
+        let mut cursor = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut cursor, ImageFormat::Png)
+            .expect("encode png");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(cursor.into_inner());
+        serde_json::json!({
+            "data": [
+                {
+                    "b64_json": encoded
+                }
             ]
+        })
+        .to_string()
+    }
+
+    fn spawn_draw_image_test_server() -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind image server");
+        let addr = listener.local_addr().expect("local addr");
+        let body = draw_image_test_response_body();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept image request");
+            let request = read_test_http_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write image response");
+            stream.flush().expect("flush image response");
+            request
+        });
+        (format!("http://{}/v1", addr), handle)
+    }
+
+    fn spawn_draw_image_flaky_test_server() -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind image server");
+        listener
+            .set_nonblocking(true)
+            .expect("set nonblocking image server");
+        let addr = listener.local_addr().expect("local addr");
+        let body = draw_image_test_response_body();
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut requests = Vec::new();
+            while Instant::now() < deadline && requests.len() < 2 {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_test_http_request(&mut stream);
+                        requests.push(request);
+                        if requests.len() == 1 {
+                            continue;
+                        }
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("write flaky image response");
+                        stream.flush().expect("flush flaky image response");
+                        return requests.join("\n---\n");
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(err) => panic!("accept flaky image request: {err}"),
+                }
+            }
+            requests.join("\n---\n")
+        });
+        (format!("http://{}/v1", addr), handle)
+    }
+
+    fn draw_image_test_provider(base_url: &str) -> crate::ProviderConfig {
+        crate::ProviderConfig {
+            body: crate::ApiBodyKind::Official,
+            official_kind: Some(crate::OfficialProviderKind::Codex),
+            name: "CODEX".to_string(),
+            base_url: base_url.to_string(),
+            api_key: "sk-test".to_string(),
+            api_keys: vec!["sk-test".to_string()],
+            current_api_key: 0,
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: Some("high".to_string()),
+            reasoning_summary: Some("auto".to_string()),
+            service_tier: None,
+            temperature: 0.0,
+            max_tokens: 0,
+            sse_on: true,
+            timeout_secs: 30,
+            models: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn matrix_tool_schema_keeps_core_tools_expanded_and_execution_tools_closed() {
+        set_tool_persona(crate::PersonaKind::Matrix);
+        set_tool_projection_override(None);
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Matrix, "tool_manage"),
+            ToolProjectionState::Expanded
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Advisor, "tool_manage"),
+            ToolProjectionState::Expanded
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Coding, "tool_manage"),
+            ToolProjectionState::Expanded
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Server, "tool_manage"),
+            ToolProjectionState::Expanded
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Matrix, "context_manage"),
+            ToolProjectionState::Closed
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Matrix, "draw_image"),
+            ToolProjectionState::Expanded
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Matrix, "view_image"),
+            ToolProjectionState::Expanded
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Matrix, "spawn_agent"),
+            ToolProjectionState::Expanded
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Advisor, "context_manage"),
+            ToolProjectionState::Expanded
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Coding, "draw_image"),
+            ToolProjectionState::Expanded
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Coding, "ask_user"),
+            ToolProjectionState::Hidden
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Coding, "pty_run"),
+            ToolProjectionState::Expanded
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Coding, "pty_wait"),
+            ToolProjectionState::Expanded
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Coding, "pty_input"),
+            ToolProjectionState::Closed
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Coding, "pty_list"),
+            ToolProjectionState::Closed
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Coding, "pty_kill"),
+            ToolProjectionState::Closed
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Server, "draw_image"),
+            ToolProjectionState::Expanded
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Matrix, "memory_check"),
+            ToolProjectionState::Expanded
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Matrix, "apply_patch"),
+            ToolProjectionState::Closed
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Matrix, "command"),
+            ToolProjectionState::Closed
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Matrix, "server_split"),
+            ToolProjectionState::Closed
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Coding, "server_split"),
+            ToolProjectionState::Closed
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Server, "server_split"),
+            ToolProjectionState::Expanded
         );
     }
 
     #[test]
-    fn matrix_persona_allows_apply_patch_memory_and_full_context_manage() {
+    fn matrix_persona_keeps_all_supported_tools_visible_but_folded() {
         assert!(tool_allowed_for_persona(
             crate::PersonaKind::Matrix,
             "apply_patch"
         ));
         assert!(tool_allowed_for_persona(
             crate::PersonaKind::Matrix,
-            "toolbox_manage"
+            "tool_manage"
         ));
         assert!(tool_allowed_for_persona(
             crate::PersonaKind::Matrix,
@@ -9034,11 +19467,25 @@ mod tests {
         ));
         assert!(tool_allowed_for_persona(
             crate::PersonaKind::Matrix,
-            "memory_replace"
+            "persona_manage"
+        ));
+        let removed_live_reader = ["output", "read"].join("_");
+        let removed_memory_mutator = ["memory", "replace"].join("_");
+        assert!(!tool_allowed_for_persona(
+            crate::PersonaKind::Matrix,
+            removed_memory_mutator.as_str()
+        ));
+        assert!(!tool_allowed_for_persona(
+            crate::PersonaKind::Matrix,
+            removed_live_reader.as_str()
         ));
         assert!(tool_allowed_for_persona(
             crate::PersonaKind::Matrix,
-            "task_mode"
+            "focus_mode"
+        ));
+        assert!(tool_allowed_for_persona(
+            crate::PersonaKind::Matrix,
+            "browser"
         ));
         assert!(context_manage_allowed_for_persona(
             crate::PersonaKind::Matrix,
@@ -9046,8 +19493,2721 @@ mod tests {
         ));
         assert!(context_manage_allowed_for_persona(
             crate::PersonaKind::Matrix,
-            r#"{"action":"compact","target":"fastcontext","text":"归档"}"#
+            r#"{"action":"summary","target":"fastmemory","section":"event","text":"事件归档"}"#
         ));
+    }
+
+    #[test]
+    fn context_manage_prompt_target_hot_reloads_provider_prompt_for_matrix() {
+        with_test_home(|_| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            let write = execute_context_manage(
+                json!({
+                    "action": "write",
+                    "target": "prompt",
+                    "text": "MCP 热重载提示词"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("prompt write");
+            assert!(write.output_preview.contains("Prompt"));
+            let after_write =
+                crate::context::load_provider_messages().expect("provider messages after write");
+            assert!(
+                after_write
+                    .iter()
+                    .any(|message| message.content.contains("MCP 热重载提示词"))
+            );
+
+            let summary = execute_context_manage(
+                json!({
+                    "action": "summary",
+                    "target": "prompt",
+                    "scope": "all",
+                    "text": "MCP 整段提示词"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("prompt summary");
+            assert!(summary.output_preview.contains("MCP 整段提示词"));
+            let after_summary =
+                crate::context::load_provider_messages().expect("provider messages after summary");
+            assert!(
+                after_summary
+                    .iter()
+                    .any(|message| message.content.contains("MCP 整段提示词"))
+            );
+        });
+    }
+
+    #[test]
+    fn tool_manage_schema_update_hot_reloads_and_reset_restores_default() {
+        with_test_home(|_| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            let original = shared_codex_tools();
+            let command_schema =
+                find_shared_codex_tool_schema(&original, "command").expect("command schema");
+            let mut updated_schema = command_schema.clone();
+            updated_schema["description"] = json!("热重载后的 command schema 描述");
+
+            let update = execute_tool_manage(
+                json!({
+                    "action": "schema_update",
+                    "schema": updated_schema,
+                    "tool_ids": ["command"]
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("schema update");
+            assert!(update.model_output.contains("schema:command"));
+            assert!(
+                update
+                    .output_preview
+                    .contains("热重载后的 command schema 描述")
+            );
+
+            let refreshed = shared_codex_tools();
+            let command_after_update = find_shared_codex_tool_schema(&refreshed, "command")
+                .expect("updated command schema");
+            assert_eq!(
+                command_after_update["description"],
+                json!("热重载后的 command schema 描述")
+            );
+
+            let read = execute_tool_manage(
+                json!({
+                    "action": "schema_get",
+                    "tool_ids": ["command"]
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("schema get");
+            assert!(
+                read.output_preview
+                    .contains("热重载后的 command schema 描述")
+            );
+
+            let reset = execute_tool_manage(
+                json!({
+                    "action": "schema_reset",
+                    "tool_ids": ["command"]
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("schema reset");
+            assert!(reset.model_output.contains("removed:1"));
+
+            let restored = shared_codex_tools();
+            let command_after_reset = find_shared_codex_tool_schema(&restored, "command")
+                .expect("restored command schema");
+            assert_eq!(
+                command_after_reset["description"],
+                command_schema["description"]
+            );
+        });
+    }
+
+    #[test]
+    fn exec_command_alias_follows_command_projection_for_matrix() {
+        with_test_home(|_| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear matrix");
+            let call = FunctionCall {
+                call_id: "call_exec_alias".to_string(),
+                name: "exec_command".to_string(),
+                arguments: json!({"cmd":"pwd"}).to_string(),
+            };
+
+            let closed_err = validate_function_call_access(&call, crate::PersonaKind::Matrix)
+                .expect_err("exec_command alias should stay closed with command");
+            assert!(
+                closed_err
+                    .to_string()
+                    .contains("当前工具投影未开放 `command`")
+            );
+
+            crate::context::tool_manage("open", &["command".to_string()], None, None, None)
+                .expect("open command");
+            validate_function_call_access(&call, crate::PersonaKind::Matrix)
+                .expect("exec_command alias should follow opened command projection");
+        });
+    }
+
+    #[test]
+    fn removed_tool_persona_alias_is_not_accepted_and_matrix_keeps_tool_manage() {
+        assert!(crate::PersonaKind::parse_alias("tool").is_none());
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Matrix, "tool_manage"),
+            ToolProjectionState::Expanded
+        );
+        assert!(tool_allowed_for_persona(
+            crate::PersonaKind::Matrix,
+            "tool_manage"
+        ));
+        let all_names = tool_names(&all_codex_tools());
+        let provider_names = tool_names(&codex_tools_for_provider());
+        let removed_live_reader = ["output", "read"].join("_");
+        let removed_memory_mutator = ["memory", "replace"].join("_");
+        let removed_tool_names = [
+            removed_live_reader,
+            removed_memory_mutator,
+            ["memory", "search"].join("_"),
+            ["resume", "agent"].join("_"),
+            ["spawn", "agents", "on", "csv"].join("_"),
+            ["report", "agent", "job", "result"].join("_"),
+            format!("{}.{}", "multi_tool_use", "parallel"),
+        ];
+        for removed in removed_tool_names {
+            assert!(!all_names.contains(&removed));
+            assert!(!provider_names.contains(&removed));
+        }
+    }
+
+    #[test]
+    fn memory_add_accepts_single_top_level_entry_and_persona_scope() {
+        with_test_home(|_| {
+            set_tool_persona(crate::PersonaKind::Matrix);
+            let add = execute_memory_add(
+                json!({
+                    "target": "datememory",
+                    "persona": "coding",
+                    "date": "2026-05-12",
+                    "title": "Coding 单条写入",
+                    "keywords": ["协议单条", "coding-memory"],
+                    "summary": "验证顶层单条 memory_add 可以被执行层接收。",
+                    "content": "2026-05-12 这天 Coding persona 做了 memory_add 顶层单条写入协议回归。重点确认模型不使用 entries 批量字段时，也能通过 date、title、keywords、summary、content 和 evidence_entry_ids 写入 Coding 来源日记，并在 clear_context=true 时清空对应过渡上下文，方便后续按 coding-memory 关键词检索。",
+                    "evidence_entry_ids": [8, 9],
+                    "clear_context": true
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("top-level memory_add");
+
+            assert!(add.output_preview.contains("MemoryAdd succeeded"));
+            assert!(add.output_preview.contains("DateMemory · Coding"));
+            assert!(add.output_preview.contains("DateMemoryContext · cleared"));
+
+            let check = execute_memory_check(
+                json!({
+                    "target": "datememory",
+                    "persona": "coding",
+                    "date": "2026-05-12",
+                    "keywords": ["coding-memory"],
+                    "limit": 3
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("check coding datememory");
+            assert!(
+                check
+                    .output_preview
+                    .contains("MemoryCheck succeeded · datememory")
+            );
+            assert!(check.output_preview.contains("matched_entry_ids: #1:1"));
+            assert!(check.output_preview.contains("evidence_entry_ids: 8, 9"));
+        });
+    }
+
+    #[test]
+    fn non_matrix_persona_manage_schema_only_exposes_send() {
+        set_tool_persona(crate::PersonaKind::Coding);
+        let tools = codex_tools();
+        let persona_manage = tools
+            .as_array()
+            .expect("tool array")
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("persona_manage"))
+            .expect("persona_manage schema");
+        let action = &persona_manage["parameters"]["properties"]["action"];
+        let actions = action["enum"]
+            .as_array()
+            .expect("action enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(actions, vec!["send"]);
+        assert!(
+            !persona_manage["parameters"]["properties"]
+                .as_object()
+                .expect("properties")
+                .contains_key("include_recent")
+        );
+
+        set_tool_persona(crate::PersonaKind::Matrix);
+        let matrix_tools = codex_tools();
+        let matrix_persona_manage = matrix_tools
+            .as_array()
+            .expect("tool array")
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("persona_manage"))
+            .expect("matrix persona_manage schema");
+        let matrix_actions = matrix_persona_manage["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("matrix action enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(matrix_actions, vec!["observe", "send", "interrupt"]);
+    }
+
+    #[test]
+    fn tool_manage_settings_is_matrix_only() {
+        with_test_home(|_| {
+            set_tool_persona(crate::PersonaKind::Coding);
+            let err =
+                execute_tool_manage(r#"{"action":"settings","default_tool_output_level":"low"}"#)
+                    .expect_err("coding should not manage settings");
+            assert!(err.to_string().contains("Matrix"));
+        });
+    }
+
+    #[test]
+    fn tool_manage_settings_updates_matrix_budgets_and_system_state() {
+        with_test_home(|home_root| {
+            set_tool_persona(crate::PersonaKind::Matrix);
+            let execution = execute_tool_manage(
+                r#"{
+                    "action":"settings",
+                    "default_tool_output_level":"large",
+                    "tool_output_small_kb":44,
+                    "tool_output_normal_kb":88,
+                    "tool_output_large_kb":132,
+                    "name_en":"Ryo",
+                    "name_zh":"萤",
+                    "agent_retention_limit":27,
+                    "permission_mode":"safe",
+                    "terminal_audit_interval_secs":900,
+                    "image_compression_quality":"high",
+                    "image_upload_max_mb":12,
+                    "theme_preset":"cyan"
+                }"#,
+            )
+            .expect("matrix settings");
+            assert!(execution.output_preview.contains("tool_manage:ok"));
+            assert!(execution.output_preview.contains("action:SETTINGS"));
+            assert!(execution.output_preview.contains("target:Matrix"));
+            assert!(
+                execution
+                    .output_preview
+                    .contains("tool_output:default -> Large")
+            );
+            assert!(execution.output_preview.contains("system:name_en -> Ryo"));
+            assert!(execution.output_preview.contains("theme -> Terminal Cyan"));
+
+            let state = crate::settings::SettingsState::new_for_persona(
+                crate::PersonaKind::Matrix,
+                std::sync::mpsc::channel().0,
+            );
+            assert_eq!(state.default_tool_output_level(), CommandOutputLevel::High);
+            assert_eq!(state.user_name_en(), "Ryo");
+            assert_eq!(state.user_name_zh(), "萤");
+            assert_eq!(state.agent_retention_limit(), 27);
+            assert_eq!(state.permission_mode(), PermissionMode::Safe);
+            assert_eq!(state.theme_preset(), crate::ThemePreset::Cyan);
+
+            let matrix_context_path = home_root
+                .join(PROJECTYING_REL_PATH)
+                .join("config/matrix/context.json");
+            let matrix_system_path = home_root
+                .join(PROJECTYING_REL_PATH)
+                .join("config/matrix/system.json");
+            let matrix_theme_path = home_root
+                .join(PROJECTYING_REL_PATH)
+                .join("config/matrix/theme.json");
+
+            let context_value: Value = serde_json::from_str(
+                fs::read_to_string(matrix_context_path.as_path())
+                    .expect("read matrix context")
+                    .as_str(),
+            )
+            .expect("parse matrix context");
+            assert_eq!(
+                context_value["default_tool_output_level"].as_str(),
+                Some("large")
+            );
+            assert_eq!(context_value["tool_output_small_kb"].as_u64(), Some(44));
+            assert_eq!(context_value["tool_output_normal_kb"].as_u64(), Some(88));
+            assert_eq!(
+                context_value["tool_output_large_kb"].as_u64(),
+                Some(sanitize_tool_output_kb(132) as u64)
+            );
+            assert_eq!(
+                context_value["terminal_audit_interval_secs"].as_u64(),
+                Some(900)
+            );
+            assert_eq!(
+                context_value["image_compression_quality"].as_str(),
+                Some("high")
+            );
+            assert_eq!(context_value["image_upload_max_mb"].as_u64(), Some(12));
+
+            let system_value: Value = serde_json::from_str(
+                fs::read_to_string(matrix_system_path.as_path())
+                    .expect("read matrix system")
+                    .as_str(),
+            )
+            .expect("parse matrix system");
+            assert_eq!(system_value["name_en"].as_str(), Some("Ryo"));
+            assert_eq!(system_value["name_zh"].as_str(), Some("萤"));
+            assert_eq!(system_value["agent_retention_limit"].as_u64(), Some(27));
+            assert_eq!(system_value["permission_mode"].as_str(), Some("safe"));
+
+            let theme_value: Value = serde_json::from_str(
+                fs::read_to_string(matrix_theme_path.as_path())
+                    .expect("read matrix theme")
+                    .as_str(),
+            )
+            .expect("parse matrix theme");
+            assert_eq!(theme_value["preset"].as_str(), Some("cyan"));
+        });
+    }
+
+    #[test]
+    fn tool_manage_settings_accepts_line_style_arguments_from_live_provider() {
+        with_test_home(|_| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            let execution = execute_tool_manage(
+                "action: settings_update\n\
+                 default_tool_output_level: large\n\
+                 tool_output_small_kb: 44\n\
+                 tool_output_normal_kb: 88\n\
+                 tool_output_large_kb: 132\n\
+                 name_en: Ryo\n\
+                 name_zh: 萤\n\
+                 permission_mode: safe\n\
+                 brief: 行式设置",
+            )
+            .expect("line-style matrix settings");
+            assert!(execution.output_preview.contains("tool_manage:ok"));
+            assert!(execution.output_preview.contains("action:SETTINGS"));
+            assert!(
+                execution
+                    .output_preview
+                    .contains("tool_output:default -> Large")
+            );
+            assert!(execution.output_preview.contains("system:name_en -> Ryo"));
+        });
+    }
+
+    #[test]
+    fn tool_manage_settings_can_switch_static_persona_model() {
+        with_test_home(|_| {
+            set_tool_persona(crate::PersonaKind::Matrix);
+            let execution = execute_tool_manage(
+                r#"{
+                    "action":"settings",
+                    "persona":"coding",
+                    "provider_index":0,
+                    "model":"matrix-coding-model"
+                }"#,
+            )
+            .expect("coding settings");
+            assert!(execution.output_preview.contains("target:Coding"));
+            assert!(
+                execution
+                    .output_preview
+                    .contains("model=matrix-coding-model")
+            );
+
+            let state = crate::settings::SettingsState::new_for_persona(
+                crate::PersonaKind::Coding,
+                std::sync::mpsc::channel().0,
+            );
+            assert_eq!(state.active_provider_config().model, "matrix-coding-model");
+        });
+    }
+
+    fn write_external_echo_tool(project_root: &Path, tool_name: &str) {
+        let tool_dir = project_root.join("tools/external");
+        fs::create_dir_all(tool_dir.as_path()).expect("create external tools dir");
+        fs::write(
+            tool_dir.join("echo_tool.sh"),
+            "#!/bin/sh\nprintf 'EXTERNAL_OK\\n'\ncat\n",
+        )
+        .expect("write external script");
+        fs::write(
+            tool_dir.join(format!("{tool_name}.tool.json")),
+            json!({
+                "name": tool_name,
+                "description": "Test hot-reload external tool.",
+                "program": "sh",
+                "args": ["tools/external/echo_tool.sh"],
+                "timeout_secs": 3,
+                "kind_label": "External",
+                "action_label": "Run",
+                "brief": "外部工具测试",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": { "type": "string" },
+                        "brief": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }
+            })
+            .to_string(),
+        )
+        .expect("write external manifest");
+    }
+
+    fn tool_names(tools: &Value) -> Vec<String> {
+        tools
+            .as_array()
+            .expect("tool array")
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn external_tool_manifest_is_hot_loaded_closed_then_opened_and_executed() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            let tool_name = "projectying_test_echo";
+            write_external_echo_tool(project_root.as_path(), tool_name);
+
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            set_tool_projection_override(None);
+            crate::context::clear_messages().expect("clear context");
+
+            assert!(tool_names(&all_codex_tools()).contains(&tool_name.to_string()));
+            assert_eq!(
+                default_tool_projection_state(crate::PersonaKind::Matrix, tool_name),
+                ToolProjectionState::Closed
+            );
+            assert_eq!(
+                default_tool_projection_state(crate::PersonaKind::Coding, tool_name),
+                ToolProjectionState::Closed
+            );
+            set_tool_persona(crate::PersonaKind::Coding);
+            assert!(tool_names(&codex_tools()).contains(&tool_name.to_string()));
+            assert!(!tool_names(&codex_tools_for_provider()).contains(&tool_name.to_string()));
+            set_tool_persona(crate::PersonaKind::Matrix);
+            assert!(!tool_names(&codex_tools_for_provider()).contains(&tool_name.to_string()));
+
+            crate::context::tool_manage("open", &[tool_name.to_string()], None, None, None)
+                .expect("open external tool");
+            assert!(tool_names(&codex_tools_for_provider()).contains(&tool_name.to_string()));
+
+            let display = describe_function_call(&FunctionCall {
+                call_id: "call_external_display".to_string(),
+                name: tool_name.to_string(),
+                arguments: r#"{"message":"hello","brief":"运行外部工具"}"#.to_string(),
+            });
+            assert_eq!(display.kind_label, "External");
+            assert_eq!(display.action_label, "Run");
+            assert_eq!(display.brief, "外部工具测试");
+
+            let execution = execute_function_call(
+                &FunctionCall {
+                    call_id: "call_external_exec".to_string(),
+                    name: tool_name.to_string(),
+                    arguments: r#"{"message":"hello","brief":"运行外部工具"}"#.to_string(),
+                },
+                None,
+            );
+            let output =
+                extract_primary_tool_output_text(&execution.output_items).expect("external output");
+            assert!(output.contains("EXTERNAL_OK"));
+            assert!(output.contains("\"message\":\"hello\""));
+            assert_eq!(execution.exit_code, Some(0));
+        });
+    }
+
+    #[test]
+    fn external_tool_manifest_accepts_display_output_policy_and_scheduler() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            let tool_dir = project_root.join("tools/external");
+            fs::create_dir_all(tool_dir.as_path()).expect("create external tools dir");
+            let tool_name = "projectying_display_manifest";
+            fs::write(
+                tool_dir.join(format!("{tool_name}.tool.json")),
+                json!({
+                    "name": tool_name,
+                    "description": "Display manifest test tool.",
+                    "program": "sh",
+                    "display": {
+                        "title": "EchoUI",
+                        "action_label": "Echo",
+                        "brief_template": "外部回声",
+                        "collapsed_fields": ["status", "brief"],
+                        "expanded_sections": ["input", "summary", "refs"],
+                        "input_label": "入参",
+                        "output_label": "回执",
+                        "max_inline_bytes": 4096,
+                        "group_key": "external:{tool_id}",
+                        "chain_mode": "latest",
+                        "default_collapsed": true
+                    },
+                    "output_policy": {
+                        "max_inline_bytes": 4096,
+                        "externalize_over_bytes": 8192,
+                        "preferred_store": "toolmemory"
+                    },
+                    "scheduler": {
+                        "dedupe_key": "external:test",
+                        "single_flight": true,
+                        "deadline_ms": 20000,
+                        "poll_interval_ms": 1000,
+                        "max_retries": 0,
+                        "backoff": "none",
+                        "cancel_scope": "persona",
+                        "cooldown_ms": 30000,
+                        "payload_policy": "replace_not_stack"
+                    }
+                })
+                .to_string(),
+            )
+            .expect("write display manifest");
+
+            let manifest = external_tool_manifest(tool_name).expect("manifest");
+            let display = manifest.display.as_ref().expect("display spec");
+            assert_eq!(display.title, "EchoUI");
+            assert_eq!(display.action_label, "Echo");
+            assert_eq!(display.output_label, "回执");
+            assert_eq!(
+                manifest
+                    .output_policy
+                    .as_ref()
+                    .expect("output policy")
+                    .externalize_over_bytes,
+                8192
+            );
+            assert_eq!(
+                manifest
+                    .scheduler
+                    .as_ref()
+                    .expect("scheduler")
+                    .payload_policy,
+                "replace_not_stack"
+            );
+
+            let call_display = describe_function_call(&FunctionCall {
+                call_id: "call_manifest_display".to_string(),
+                name: tool_name.to_string(),
+                arguments: "{}".to_string(),
+            });
+            assert_eq!(call_display.kind_label, "EchoUI");
+            assert_eq!(call_display.action_label, "Echo");
+            assert_eq!(call_display.brief, "外部回声");
+        });
+    }
+
+    #[test]
+    fn tool_manage_can_create_and_remove_external_tool_manifests() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            let tool_name = "projectying_tool_manage_manifest_demo";
+
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear matrix");
+
+            let create = execute_tool_manage(
+                json!({
+                    "action": "create",
+                    "manifest": {
+                        "name": tool_name,
+                        "description": "Test manifest CRUD tool.",
+                        "program": "python",
+                        "args": ["tools/external/example_echo.py"],
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "input": { "type": "string" }
+                            },
+                            "additionalProperties": true
+                        },
+                        "display": {
+                            "title": "DemoUI",
+                            "action_label": "Run",
+                            "brief_template": "Demo tool",
+                            "collapsed_fields": ["brief", "status"],
+                            "expanded_sections": ["input", "summary"],
+                            "input_label": "Input",
+                            "output_label": "Output",
+                            "default_collapsed": true
+                        },
+                        "output_policy": {
+                            "max_inline_bytes": 4096,
+                            "externalize_over_bytes": 8192,
+                            "preferred_store": "toolmemory"
+                        },
+                        "scheduler": {
+                            "single_flight": true,
+                            "deadline_ms": 30000,
+                            "poll_interval_ms": 1500,
+                            "max_retries": 1,
+                            "backoff": "none",
+                            "cancel_scope": "request",
+                            "cooldown_ms": 60000,
+                            "payload_policy": "replace_not_stack"
+                        }
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("create manifest");
+            assert!(create.output_preview.contains("DemoUI"));
+            assert!(external_tool_manifest(tool_name).is_some());
+
+            let provider_names = tool_names(&codex_tools_for_provider());
+            assert!(!provider_names.contains(&tool_name.to_string()));
+
+            crate::context::tool_manage("open", &[tool_name.to_string()], None, None, None)
+                .expect("open external tool");
+            let state_before_remove: Value = crate::read_json_or_default_shared(
+                project_root.join("context/Matrix/state.json").as_path(),
+            )
+            .expect("read state before remove");
+            assert!(
+                state_before_remove
+                    .pointer("/toolbox/entries")
+                    .and_then(Value::as_array)
+                    .expect("toolbox entries")
+                    .iter()
+                    .any(|entry| entry.get("tool_id").and_then(Value::as_str) == Some(tool_name))
+            );
+
+            let remove = execute_tool_manage(
+                json!({
+                    "action": "remove",
+                    "tool_ids": [tool_name]
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("remove manifest");
+            assert!(remove.output_preview.contains("removed: 1"));
+            assert!(remove.output_preview.contains("toolbox_entries_pruned: 1"));
+            assert!(external_tool_manifest(tool_name).is_none());
+
+            let provider_names_after = tool_names(&codex_tools_for_provider());
+            assert!(!provider_names_after.contains(&tool_name.to_string()));
+            let state_after_remove: Value = crate::read_json_or_default_shared(
+                project_root.join("context/Matrix/state.json").as_path(),
+            )
+            .expect("read state after remove");
+            assert!(
+                !state_after_remove
+                    .pointer("/toolbox/entries")
+                    .and_then(Value::as_array)
+                    .expect("toolbox entries")
+                    .iter()
+                    .any(|entry| entry.get("tool_id").and_then(Value::as_str) == Some(tool_name))
+            );
+        });
+    }
+
+    #[test]
+    fn tool_manage_context_governance_sets_static_persona_and_opens_compact() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear matrix");
+
+            let update = execute_tool_manage(
+                json!({
+                    "action": "context_governance_set",
+                    "persona": "coding",
+                    "context_governance": {
+                        "mode": "summary_compact",
+                        "manage_threshold_kb": 512,
+                        "compact_threshold_kb": 64,
+                        "report_to_matrix": false
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("set coding governance");
+            assert!(
+                update
+                    .model_output
+                    .contains("action:CONTEXT_GOVERNANCE_SET")
+            );
+            assert!(update.model_output.contains("target:Coding"));
+            assert!(update.model_output.contains("mode:summary_compact"));
+            assert!(update.model_output.contains("compact_threshold_kb:64"));
+
+            let applied =
+                crate::context::context_governance_spec_for_persona(crate::PersonaKind::Coding)
+                    .expect("read coding governance");
+            assert_eq!(applied.mode, "summary_compact");
+            assert_eq!(applied.manage_threshold_kb, 512);
+            assert_eq!(applied.compact_threshold_kb, 64);
+            assert!(!applied.report_to_matrix);
+
+            let state: Value = crate::read_json_or_default_shared(
+                project_root.join("context/Coding/state.json").as_path(),
+            )
+            .expect("read coding state");
+            let entries = state
+                .pointer("/toolbox/entries")
+                .and_then(Value::as_array)
+                .expect("toolbox entries");
+            assert!(entries.iter().any(|entry| {
+                entry.get("tool_id").and_then(Value::as_str) == Some("context_compact")
+                    && entry.get("state").and_then(Value::as_str) == Some("expanded")
+            }));
+            assert!(entries.iter().any(|entry| {
+                entry.get("tool_id").and_then(Value::as_str) == Some("context_summary")
+                    && entry.get("state").and_then(Value::as_str) == Some("expanded")
+            }));
+
+            execute_tool_manage(
+                json!({
+                    "action": "context_governance_set",
+                    "persona": "coding",
+                    "mode": "advisor_managed",
+                    "manage_threshold_kb": 256
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("restore coding advisor governance");
+            let restored =
+                crate::context::context_governance_spec_for_persona(crate::PersonaKind::Coding)
+                    .expect("read restored coding governance");
+            assert_eq!(restored.mode, "advisor_managed");
+            assert_eq!(restored.manage_threshold_kb, 256);
+            let restored_state: Value = crate::read_json_or_default_shared(
+                project_root.join("context/Coding/state.json").as_path(),
+            )
+            .expect("read restored coding state");
+            let restored_entries = restored_state
+                .pointer("/toolbox/entries")
+                .and_then(Value::as_array)
+                .expect("restored toolbox entries");
+            assert!(restored_entries.iter().any(|entry| {
+                entry.get("tool_id").and_then(Value::as_str) == Some("context_compact")
+                    && entry.get("state").and_then(Value::as_str) == Some("closed")
+            }));
+            assert!(restored_entries.iter().all(|entry| {
+                entry.get("tool_id").and_then(Value::as_str) != Some("context_summary")
+                    || entry.get("state").and_then(Value::as_str) != Some("expanded")
+            }));
+        });
+    }
+
+    #[test]
+    fn tool_manage_context_governance_accepts_m_suffixed_aliases() {
+        with_test_home(|_home_root| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear matrix");
+
+            let update = execute_tool_manage(
+                "action: context_governance_set\npersona: coding\nmode: summary_compact\ncontext_soft_limit: 0.8M\ncontext_hard_limit: 1.0M\nreport_to_matrix: true",
+            )
+            .expect("set coding governance with m suffix");
+            assert!(update.model_output.contains("manage_threshold_kb:800"));
+            assert!(update.model_output.contains("compact_threshold_kb:1000"));
+
+            let applied =
+                crate::context::context_governance_spec_for_persona(crate::PersonaKind::Coding)
+                    .expect("read coding governance");
+            assert_eq!(applied.mode, "summary_compact");
+            assert_eq!(applied.manage_threshold_kb, 800);
+            assert_eq!(applied.compact_threshold_kb, 1000);
+        });
+    }
+
+    #[test]
+    fn tool_manage_context_governance_sets_role_and_adds_compact_tools() {
+        with_test_home(|_home_root| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear matrix");
+
+            execute_tool_manage(
+                json!({
+                    "action": "role_create",
+                    "role": {
+                        "id": "worker",
+                        "display_name": "工",
+                        "glyph": "工",
+                        "base_persona": "matrix",
+                        "default_tools": ["persona_manage"],
+                        "prompt": "你是自管上下文测试角色。"
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("create worker role");
+
+            let update = execute_tool_manage(
+                json!({
+                    "action": "context_governance_set",
+                    "role_ids": ["worker"],
+                    "mode": "summary_compact",
+                    "compact_threshold_kb": 96,
+                    "manage_threshold_kb": 384
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("set worker governance");
+            assert!(update.model_output.contains("target:role:worker"));
+            assert!(update.model_output.contains("mode:summary_compact"));
+            assert!(update.model_output.contains("compact_threshold_kb:96"));
+
+            let role = crate::roles::find_role("worker")
+                .expect("find worker")
+                .expect("worker exists");
+            assert_eq!(role.context_governance.mode, "summary_compact");
+            assert_eq!(role.context_governance.compact_threshold_kb, 96);
+            assert!(role.default_tools.contains(&"context_compact".to_string()));
+            assert!(role.default_tools.contains(&"context_summary".to_string()));
+            assert!(role.default_tools.contains(&"persona_manage".to_string()));
+
+            execute_tool_manage(
+                json!({
+                    "action": "context_governance_set",
+                    "role_ids": ["worker"],
+                    "mode": "advisor_managed",
+                    "manage_threshold_kb": 256
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("restore worker governance");
+            let restored = crate::roles::find_role("worker")
+                .expect("find restored worker")
+                .expect("worker exists after restore");
+            assert_eq!(restored.context_governance.mode, "advisor_managed");
+            assert!(
+                !restored
+                    .default_tools
+                    .contains(&"context_compact".to_string())
+            );
+            assert!(
+                !restored
+                    .default_tools
+                    .contains(&"context_summary".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn tool_manage_can_create_role_assign_tools_and_queue_role_send() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear matrix");
+
+            let create = execute_tool_manage(
+                json!({
+                    "action": "role_create",
+                    "role": {
+                        "id": "reviewer",
+                        "display_name": "审校",
+                        "glyph": "审",
+                        "base_persona": "coding",
+                        "default_tools": ["memory_check"],
+                        "prompt": "你是审校角色，负责复核实现风险。"
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("create role");
+            assert!(create.output_preview.contains("created: reviewer"));
+            assert!(project_root.join("context/roles.json").exists());
+            assert!(
+                project_root
+                    .join("context/Role_reviewer/prompt.txt")
+                    .exists()
+            );
+            assert!(
+                project_root
+                    .join("memory/Role_reviewer/datememorycontext.json")
+                    .exists()
+            );
+            assert!(
+                crate::roles::visible_role_tabs()
+                    .iter()
+                    .any(|role| role.id == "reviewer" && role.glyph_label == "审")
+            );
+
+            let role_schema = persona_manage_schema();
+            let persona_values = role_schema["parameters"]["properties"]["persona"]["enum"]
+                .as_array()
+                .expect("persona enum")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            assert!(persona_values.contains(&"reviewer"));
+
+            let add_tools = execute_tool_manage(
+                json!({
+                    "action": "role_tool_add",
+                    "role_ids": ["reviewer"],
+                    "tool_ids": ["memory_read", "persona_manage"]
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("add role tools");
+            assert!(add_tools.output_preview.contains("memory_read"));
+            let role = crate::roles::find_role("reviewer")
+                .expect("find role")
+                .expect("role exists");
+            assert!(role.default_tools.contains(&"memory_read".to_string()));
+
+            let send = execute_persona_manage(
+                json!({
+                    "action": "send",
+                    "persona": "reviewer",
+                    "message": "请复核当前实现。",
+                    "brief": "角色复核"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("send to role");
+            assert!(send.output_preview.contains("role:reviewer"));
+            let queue = fs::read_to_string(project_root.join("config/persona-commands.jsonl"))
+                .expect("read persona queue");
+            assert!(queue.contains("\"persona\":\"Coding\""));
+            assert!(queue.contains("\"target_role\":\"reviewer\""));
+
+            let remove = execute_tool_manage(
+                json!({
+                    "action": "role_remove",
+                    "role_ids": ["reviewer"]
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("remove role");
+            assert!(remove.output_preview.contains("removed: reviewer"));
+            assert!(
+                crate::roles::find_role("reviewer")
+                    .expect("find removed")
+                    .is_none()
+            );
+            assert!(!project_root.join("context/_retired_roles").exists());
+            assert!(!project_root.join("memory/_retired_roles").exists());
+            assert!(!project_root.join("context/Role_reviewer").exists());
+            assert!(!project_root.join("memory/Role_reviewer").exists());
+        });
+    }
+
+    #[test]
+    fn tool_manage_can_copy_advisor_and_assign_managed_roles() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear matrix");
+
+            execute_tool_manage(
+                json!({
+                    "action": "role_create",
+                    "role": {
+                        "id": "worker_alpha",
+                        "display_name": "工甲",
+                        "glyph": "工",
+                        "base_persona": "matrix",
+                        "default_tools": ["persona_manage"],
+                        "prompt": "你是工甲。"
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("create worker alpha");
+            execute_tool_manage(
+                json!({
+                    "action": "role_create",
+                    "role": {
+                        "id": "worker_beta",
+                        "display_name": "工乙",
+                        "glyph": "工",
+                        "base_persona": "matrix",
+                        "default_tools": ["persona_manage"],
+                        "prompt": "你是工乙。"
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("create worker beta");
+
+            let too_many = execute_tool_manage(
+                json!({
+                    "action": "role_copy",
+                    "role": {
+                        "copy_from": "advisor",
+                        "managed_role_ids": [
+                            "worker_alpha",
+                            "worker_beta",
+                            "worker_gamma",
+                            "worker_delta",
+                            "worker_epsilon"
+                        ]
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect_err("advisor managed role limit should fail");
+            assert!(format!("{too_many:#}").contains("一个司最多管理 4 个角色上下文"));
+
+            let copied = execute_tool_manage(
+                json!({
+                    "action": "role_copy",
+                    "role": {
+                        "copy_from": "advisor",
+                        "managed_role_ids": ["worker_alpha", "worker_beta"]
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("copy advisor");
+            assert!(copied.output_preview.contains("copied: advisor_a"));
+            assert!(copied.output_preview.contains("source: advisor"));
+            assert!(
+                copied
+                    .output_preview
+                    .contains("managed_roles: worker_alpha, worker_beta")
+            );
+
+            let advisor_a = crate::roles::find_role("advisor_a")
+                .expect("find advisor_a")
+                .expect("advisor_a exists");
+            assert_eq!(advisor_a.base_persona.as_deref(), Some("advisor"));
+            assert_eq!(advisor_a.copy_source.as_deref(), Some("advisor"));
+            assert_eq!(
+                advisor_a.managed_role_ids,
+                vec!["worker_alpha".to_string(), "worker_beta".to_string()]
+            );
+            assert_eq!(advisor_a.display_name, "司 A");
+            assert_eq!(advisor_a.glyph.as_deref(), Some("司"));
+
+            let role_schema = persona_manage_schema();
+            let persona_values = role_schema["parameters"]["properties"]["persona"]["enum"]
+                .as_array()
+                .expect("persona enum")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            assert!(persona_values.contains(&"advisor_a"));
+
+            let send = execute_persona_manage(
+                json!({
+                    "action": "send",
+                    "persona": "advisor_a",
+                    "message": "请检查当前角色上下文分配。",
+                    "brief": "司复刻"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("send to advisor_a");
+            assert!(send.output_preview.contains("role:advisor_a"));
+            let queue = fs::read_to_string(project_root.join("config/persona-commands.jsonl"))
+                .expect("read persona queue");
+            assert!(queue.contains("\"persona\":\"Advisor\""));
+            assert!(queue.contains("\"target_role\":\"advisor_a\""));
+        });
+    }
+
+    #[test]
+    fn tool_manage_copy_limit_stops_after_three_clones_per_source_family() {
+        with_test_home(|_| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear matrix");
+
+            let matrix_err = execute_tool_manage(
+                json!({
+                    "action": "role_copy",
+                    "role": {
+                        "copy_from": "matrix"
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect_err("matrix copy should fail");
+            assert!(format!("{matrix_err:#}").contains("Matrix 只能有一个"));
+
+            for expected in ["server_a", "server_b", "server_c"] {
+                let copied = execute_tool_manage(
+                    json!({
+                        "action": "role_copy",
+                        "role": {
+                            "copy_from": "server"
+                        }
+                    })
+                    .to_string()
+                    .as_str(),
+                )
+                .expect("copy server");
+                assert!(copied.output_preview.contains(expected));
+            }
+
+            let err = execute_tool_manage(
+                json!({
+                    "action": "role_copy",
+                    "role": {
+                        "copy_from": "server"
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect_err("fourth server copy should fail");
+            assert!(format!("{err:#}").contains("最多可复制的上限 3"));
+        });
+    }
+
+    #[test]
+    fn tool_manage_can_create_summary_compact_role_and_route_maintenance_to_itself() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear matrix");
+
+            let create = execute_tool_manage(
+                json!({
+                    "action": "role_create",
+                    "role": {
+                        "id": "scribe",
+                        "display_name": "书记",
+                        "glyph": "书",
+                        "base_persona": "matrix",
+                        "default_tools": ["memory_check"],
+                        "context_governance": {
+                            "mode": "summary_compact",
+                            "manage_threshold_kb": 200,
+                            "compact_threshold_kb": 32,
+                            "report_to_matrix": true
+                        },
+                        "prompt": "你是自管上下文测试角色。"
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("create self compact role");
+            assert!(create.output_preview.contains("created: scribe"));
+            assert!(create.output_preview.contains("context_compact"));
+            assert!(create.output_preview.contains("context_summary"));
+
+            let role = crate::roles::find_role("scribe")
+                .expect("find scribe")
+                .expect("role exists");
+            assert_eq!(role.context_governance.mode, "summary_compact");
+            assert!(role.default_tools.contains(&"context_compact".to_string()));
+            assert!(role.default_tools.contains(&"context_summary".to_string()));
+            assert!(role.default_tools.contains(&"persona_manage".to_string()));
+            assert!(project_root.join("context/Role_scribe/prompt.txt").exists());
+
+            let state: Value = crate::read_json_or_default_shared(
+                project_root
+                    .join("context/Role_scribe/state.json")
+                    .as_path(),
+            )
+            .expect("read scribe state");
+            let toolbox_entries = state
+                .pointer("/toolbox/entries")
+                .and_then(Value::as_array)
+                .expect("toolbox entries");
+            assert!(toolbox_entries.iter().any(|entry| {
+                entry.get("tool_id").and_then(Value::as_str) == Some("context_compact")
+                    && entry.get("state").and_then(Value::as_str) == Some("expanded")
+            }));
+            assert!(toolbox_entries.iter().any(|entry| {
+                entry.get("tool_id").and_then(Value::as_str) == Some("context_summary")
+                    && entry.get("state").and_then(Value::as_str) == Some("expanded")
+            }));
+
+            crate::context::with_dynamic_role_context(&role, || {
+                for index in 0..3 {
+                    let round_id = crate::context::begin_round().expect("begin round");
+                    crate::context::append_round_message(
+                        round_id,
+                        crate::context::ContextRole::User,
+                        None,
+                        format!(
+                            "scribe self compact 压力消息 {index} {}",
+                            "内容".repeat(6000)
+                        )
+                        .as_str(),
+                    )
+                    .expect("append role context");
+                }
+                Ok(())
+            })
+            .expect("populate scribe context");
+
+            let scopes =
+                crate::context::sync_maintenance_requests_all().expect("sync maintenance scopes");
+            let scribe_scope = scopes
+                .iter()
+                .find(|scope| scope.target_role_id.as_deref() == Some("scribe"))
+                .expect("scribe scope");
+            assert!(scribe_scope.self_compact_context);
+            assert!(
+                scribe_scope.requests.is_empty(),
+                "summary/vision self-managed roles should not receive soft-threshold tickets"
+            );
+            assert!(!scopes.iter().any(|scope| {
+                scope.scope_label == "司"
+                    && scope
+                        .requests
+                        .iter()
+                        .any(|request| request.key.contains("scribe:context:summary"))
+            }));
+
+            crate::context::with_dynamic_role_context(&role, || {
+                let contract = role.contract();
+                set_tool_persona(crate::PersonaKind::Matrix);
+                set_tool_dynamic_role_context(
+                    contract.capability.base_persona,
+                    contract.identity.id.as_str(),
+                    contract.identity.header_badge.as_str(),
+                    contract.storage.context_dir.as_str(),
+                );
+                let first_round_id = crate::context::begin_round().expect("begin summary round");
+                crate::context::append_round_message(
+                    first_round_id,
+                    crate::context::ContextRole::User,
+                    None,
+                    "scribe role summary route probe",
+                )
+                .expect("append summary probe");
+                let target_entry_id = crate::context::stable_entry_ids_for_round(first_round_id)
+                    .expect("stable ids for probe round")
+                    .first()
+                    .copied()
+                    .expect("probe entry id");
+                let execution = execute_context_summary(
+                    json!({
+                        "action": "fold",
+                        "persona": "matrix",
+                        "entries": [{
+                            "entry_id": target_entry_id,
+                            "text": "已折叠：保留必要结论"
+                        }],
+                        "reason": "dynamic role base persona should route to current role context"
+                    })
+                    .to_string()
+                    .as_str(),
+                )
+                .expect("fold current role context");
+                assert!(execution.output_preview.contains("Affected entry_ids"));
+                let messages = crate::context::load_provider_messages()
+                    .expect("load role provider messages");
+            assert!(messages
+                    .iter()
+                    .any(|message| message.content.contains("已折叠：保留必要结论")));
+
+                let vision_execution = execute_context_vision(
+                    json!({
+                        "context_percent": "medium",
+                        "persona": "matrix",
+                        "reason": "dynamic role base persona should route context vision to current role context"
+                    })
+                    .to_string()
+                    .as_str(),
+                )
+                .expect("set role context vision");
+                assert!(vision_execution.output_preview.contains("本轮上下文返回阈值"));
+                let vision_messages = crate::context::load_provider_messages()
+                    .expect("load role provider messages after vision");
+                assert!(vision_messages
+                    .iter()
+                    .any(|message| message.content.contains("本轮上下文返回阈值约 67%")));
+
+                let compact_execution = execute_context_compact(
+                    json!({
+                        "mode": "all",
+                        "persona": "matrix",
+                        "text": "角色上下文粗压缩成功",
+                        "reason": "dynamic role base persona should route compact to current role context"
+                    })
+                    .to_string()
+                    .as_str(),
+                )
+                .expect("compact current role context");
+                assert!(compact_execution.output_preview.contains("ContextCompact"));
+                let compact_messages = crate::context::load_provider_messages()
+                    .expect("load role provider messages after compact");
+                assert!(compact_messages
+                    .iter()
+                    .any(|message| message.content.contains("角色上下文粗压缩成功")));
+                Ok(())
+            })
+            .expect("route summary to active dynamic role");
+        });
+    }
+
+    #[test]
+    fn persona_manage_schema_keeps_enabled_roles_beyond_visible_tab_limit() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            let context_root = project_root.join("context");
+            fs::create_dir_all(context_root.as_path()).expect("create context root");
+            let roles = (0..16)
+                .map(|idx| {
+                    json!({
+                        "id": format!("role_{idx:02}"),
+                        "display_name": format!("角色{idx:02}"),
+                        "context_dir": format!("Role_role_{idx:02}"),
+                        "base_persona": "matrix",
+                        "default_tools": ["persona_manage"],
+                        "enabled": true
+                    })
+                })
+                .collect::<Vec<_>>();
+            fs::write(
+                context_root.join("roles.json"),
+                json!({ "version": 1, "roles": roles }).to_string(),
+            )
+            .expect("write roles registry");
+
+            assert_eq!(crate::roles::visible_role_tabs().len(), 15);
+            assert!(
+                crate::roles::visible_role_tabs()
+                    .iter()
+                    .all(|role| role.id != "role_15")
+            );
+
+            let role_schema = persona_manage_schema();
+            let persona_values = role_schema["parameters"]["properties"]["persona"]["enum"]
+                .as_array()
+                .expect("persona enum")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            assert!(persona_values.contains(&"role_15"));
+        });
+    }
+
+    #[test]
+    fn role_reload_refreshes_governance_catalog_for_matrix() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            let context_root = project_root.join("context");
+            fs::create_dir_all(context_root.as_path()).expect("create context root");
+            fs::write(
+                context_root.join("roles.json"),
+                json!({
+                    "version": 1,
+                    "roles": [{
+                        "id": "reviewer",
+                        "display_name": "审",
+                        "glyph": "审",
+                        "context_dir": "Role_reviewer",
+                        "base_persona": "matrix",
+                        "default_tools": ["persona_manage"],
+                        "enabled": true
+                    }]
+                })
+                .to_string(),
+            )
+            .expect("write initial roles registry");
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            assert_eq!(
+                crate::roles::enabled_role_ids(),
+                vec!["reviewer".to_string()]
+            );
+
+            fs::write(
+                context_root.join("roles.json"),
+                json!({
+                    "version": 1,
+                    "roles": [{
+                        "id": "worker",
+                        "display_name": "工",
+                        "glyph": "工",
+                        "context_dir": "Role_worker",
+                        "base_persona": "matrix",
+                        "default_tools": ["persona_manage"],
+                        "enabled": true
+                    }]
+                })
+                .to_string(),
+            )
+            .expect("write replacement roles registry");
+
+            let reload =
+                execute_tool_manage(json!({ "action": "role_reload" }).to_string().as_str())
+                    .expect("reload roles");
+            assert!(reload.model_output.contains("registry_version:1"));
+            assert!(reload.model_output.contains("roles_total:1"));
+            assert!(reload.model_output.contains("enabled_roles:1"));
+            assert!(reload.model_output.contains("visible_tabs:1"));
+            assert!(reload.model_output.contains("hidden_enabled_roles:0"));
+            assert!(reload.model_output.contains("role_ids:worker"));
+            assert!(reload.output_preview.contains("worker"));
+            assert_eq!(crate::roles::enabled_role_ids(), vec!["worker".to_string()]);
+        });
+    }
+
+    #[test]
+    fn role_list_model_output_includes_structured_governance_summary() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            let context_root = project_root.join("context");
+            fs::create_dir_all(context_root.as_path()).expect("create context root");
+            let roles = (0..16)
+                .map(|idx| {
+                    json!({
+                        "id": format!("role_{idx:02}"),
+                        "display_name": format!("角色{idx:02}"),
+                        "glyph": "角",
+                        "context_dir": format!("Role_role_{idx:02}"),
+                        "base_persona": "matrix",
+                        "default_tools": ["persona_manage"],
+                        "enabled": true
+                    })
+                })
+                .collect::<Vec<_>>();
+            fs::write(
+                context_root.join("roles.json"),
+                json!({ "version": 1, "roles": roles }).to_string(),
+            )
+            .expect("write roles registry");
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+
+            let list = execute_tool_manage(json!({ "action": "role_list" }).to_string().as_str())
+                .expect("list roles");
+            let output = list.model_output.as_str();
+            assert!(output.contains("tool_manage:ok"));
+            assert!(output.contains("action:ROLE_LIST"));
+            assert!(output.contains("registry_version:1"));
+            assert!(output.contains("roles_total:16"));
+            assert!(output.contains("enabled_roles:16"));
+            assert!(output.contains("visible_tabs:15"));
+            assert!(output.contains("hidden_enabled_roles:1"));
+            assert!(output.contains(
+                "role_ids:role_00|role_01|role_02|role_03|role_04|role_05|role_06|role_07|role_08|role_09|role_10|role_11|role_12|role_13|role_14|role_15"
+            ));
+            assert!(output.contains("role:role_00 display_name=角色00"));
+            assert!(output.contains("glyph=角"));
+            assert!(output.contains("context_dir=Role_role_00"));
+            assert!(output.contains("memory_dir=Role_role_00"));
+            assert!(output.contains("default_tools=persona_manage"));
+            assert!(output.contains("visible_tab=true"));
+            assert!(output.contains("role:role_15 display_name=角色15"));
+            assert!(output.contains("visible_tab=false"));
+            assert!(output.contains("supports_topbar=false"));
+            assert!(list.output_preview.contains("role_15"));
+        });
+    }
+
+    #[test]
+    fn tool_manage_health_reads_aidebug_health_snapshot() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            let debug_root = project_root.join("Aidebug");
+            fs::create_dir_all(debug_root.as_path()).expect("create aidebug root");
+            fs::write(
+                debug_root.join("health.json"),
+                json!({
+                    "protocol_version": 2,
+                    "ts_ms": 1,
+                    "source_status_ts_ms": 1,
+                    "overall_score": 95,
+                    "overall_state": "DEGRADED",
+                    "chains": [
+                        {
+                            "id": "memory.datememory",
+                            "label": "memory 链路",
+                            "state": "DEGRADED",
+                            "score": 70,
+                            "weight": 15,
+                            "evidence": [
+                                "datememory_context_kb=166",
+                                "datememory_context_limit_kb=200",
+                                "datememory_context_over_limit=true"
+                            ],
+                            "action_hint": "交由司按 datememorycontext 维护 payload 归档，避免盲目 clear"
+                        },
+                        {
+                            "id": "tool.mcp",
+                            "label": "tool 链路",
+                            "state": "PASS",
+                            "score": 100,
+                            "weight": 10,
+                            "evidence": ["ToolOutputEnvelope v1"],
+                            "action_hint": null
+                        },
+                        {
+                            "id": "token.budget",
+                            "label": "token 链路",
+                            "state": "DEGRADED",
+                            "score": 70,
+                            "weight": 10,
+                            "evidence": [
+                                "current_round_input_tokens=40960",
+                                "session_input_tokens=140000",
+                                "active_context_entries=90"
+                            ],
+                            "action_hint": "优先 context summary / 退出 focus / 避免重复轮询与 worker ping"
+                        }
+                    ]
+                })
+                .to_string(),
+            )
+            .expect("write health");
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+
+            let health = execute_tool_manage(json!({ "action": "health" }).to_string().as_str())
+                .expect("read health");
+            assert!(health.model_output.contains("tool_manage:ok"));
+            assert!(health.model_output.contains("action:HEALTH"));
+            assert!(health.model_output.contains("overall_score:95"));
+            assert!(health.model_output.contains("overall_state:DEGRADED"));
+            assert!(health.model_output.contains("memory.datememory"));
+            assert!(health.model_output.contains("state=DEGRADED"));
+            assert!(
+                health
+                    .model_output
+                    .contains("datememory_context_over_limit=true")
+            );
+            assert!(health.model_output.contains("tool.mcp state=PASS"));
+            assert!(health.model_output.contains("token.budget state=DEGRADED"));
+            assert!(
+                health
+                    .model_output
+                    .contains("current_round_input_tokens=40960")
+            );
+            assert!(health.model_output.contains("避免重复轮询与 worker ping"));
+        });
+    }
+
+    #[test]
+    fn dynamic_role_send_opens_assigned_closed_tools_on_base_persona() {
+        with_test_home(|_home_root| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear matrix");
+
+            execute_tool_manage(
+                json!({
+                    "action": "role_create",
+                    "role": {
+                        "id": "matrix_curator",
+                        "display_name": "治理员",
+                        "glyph": "治",
+                        "base_persona": "matrix",
+                        "default_tools": ["context_manage"],
+                        "prompt": "你是治理员角色，只处理明确的上下文治理。"
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("create matrix role");
+            let before = crate::context::projected_toolbox_local_tool_ids_for_persona(
+                crate::PersonaKind::Matrix,
+            )
+            .expect("matrix tools before");
+            assert!(!before.contains("context_manage"));
+
+            let send = execute_persona_manage(
+                json!({
+                    "action": "send",
+                    "persona": "matrix_curator",
+                    "message": "整理这段上下文。",
+                    "brief": "角色治理"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("send to matrix role");
+            assert!(send.output_preview.contains("role:matrix_curator"));
+
+            let after = crate::context::projected_toolbox_local_tool_ids_for_persona(
+                crate::PersonaKind::Matrix,
+            )
+            .expect("matrix tools after");
+            assert!(after.contains("context_manage"));
+        });
+    }
+
+    #[test]
+    fn dynamic_role_assigned_external_tool_opens_base_projection_with_self_managed_toolboxes() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            let tool_name = "projectying_role_echo";
+            write_external_echo_tool(project_root.as_path(), tool_name);
+
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            set_tool_projection_override(None);
+            crate::context::clear_messages().expect("clear matrix");
+
+            execute_tool_manage(
+                json!({
+                    "action": "role_create",
+                    "role": {
+                        "id": "external_worker",
+                        "display_name": "外部工",
+                        "glyph": "外",
+                        "base_persona": "coding",
+                        "default_tools": [tool_name],
+                        "prompt": "你只能使用分配给动态角色的外部工具。"
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("create role with external tool");
+
+            set_tool_persona(crate::PersonaKind::Coding);
+            assert!(tool_names(&codex_tools()).contains(&tool_name.to_string()));
+            assert!(!tool_names(&codex_tools_for_provider()).contains(&tool_name.to_string()));
+
+            set_tool_persona(crate::PersonaKind::Matrix);
+            let send = execute_persona_manage(
+                json!({
+                    "action": "send",
+                    "persona": "external_worker",
+                    "message": "调用你的角色专属外部工具。",
+                    "brief": "外部角色工具"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("send to external role");
+            assert!(send.output_preview.contains("role:external_worker"));
+
+            let opened = crate::context::projected_toolbox_local_tool_ids_for_persona(
+                crate::PersonaKind::Coding,
+            )
+            .expect("coding projected tools");
+            assert!(opened.contains(tool_name));
+            let coding_state = fs::read_to_string(project_root.join("context/Coding/state.json"))
+                .expect("read coding state");
+            assert!(coding_state.contains(tool_name));
+
+            set_tool_persona(crate::PersonaKind::Coding);
+            assert!(tool_names(&codex_tools_for_provider()).contains(&tool_name.to_string()));
+
+            let mut allowed_tool_ids = std::collections::HashSet::new();
+            allowed_tool_ids.insert(tool_name.to_string());
+            set_tool_projection_override(Some(ToolProjectionOverride {
+                allowed_tool_ids,
+                allow_native_web_search: false,
+            }));
+            assert!(tool_names(&codex_tools_for_provider()).contains(&tool_name.to_string()));
+            set_tool_projection_override(None);
+            set_tool_persona(crate::PersonaKind::Matrix);
+        });
+    }
+
+    #[test]
+    fn role_update_moves_context_dir_instead_of_leaving_orphan_dir() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear matrix");
+
+            execute_tool_manage(
+                json!({
+                    "action": "role_create",
+                    "role": {
+                        "id": "dir_mover",
+                        "display_name": "迁移员",
+                        "context_dir": "Role_dir_mover_old",
+                        "base_persona": "coding",
+                        "default_tools": ["memory_check"]
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("create role");
+            let old_dir = project_root.join("context/Role_dir_mover_old");
+            let new_dir = project_root.join("context/Role_dir_mover_new");
+            let old_memory_dir = project_root.join("memory/Role_dir_mover_old");
+            let new_memory_dir = project_root.join("memory/Role_dir_mover_new");
+            assert!(old_dir.exists());
+            assert!(old_memory_dir.exists());
+
+            let update = execute_tool_manage(
+                json!({
+                    "action": "role_update",
+                    "role": {
+                        "id": "dir_mover",
+                        "context_dir": "Role_dir_mover_new"
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("update role dir");
+            assert!(update.output_preview.contains("context/Role_dir_mover_new"));
+            assert!(!old_dir.exists());
+            assert!(new_dir.exists());
+            assert!(!old_memory_dir.exists());
+            assert!(new_memory_dir.exists());
+            let role = crate::roles::find_role("dir_mover")
+                .expect("find role")
+                .expect("role exists");
+            assert_eq!(role.context_dir, "Role_dir_mover_new");
+        });
+    }
+
+    #[test]
+    fn context_manage_and_memory_tools_accept_dynamic_role_scope() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear matrix");
+
+            execute_tool_manage(
+                json!({
+                    "action": "role_create",
+                    "role": {
+                        "id": "reviewer",
+                        "display_name": "审校",
+                        "glyph": "审",
+                        "base_persona": "coding",
+                        "default_tools": ["memory_check"]
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("create role");
+
+            let context_write = execute_context_manage(
+                json!({
+                    "action": "write",
+                    "target": "fastmemory",
+                    "persona": "reviewer",
+                    "section": "surface",
+                    "text": "审校角色独立维护自己的上下文入口"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("context write to role");
+            assert!(
+                context_write
+                    .output_preview
+                    .contains("ContextManage succeeded")
+            );
+            assert!(
+                fs::read_to_string(project_root.join("context/Role_reviewer/fastmemory.json"))
+                    .expect("read role fastmemory")
+                    .contains("审校角色独立维护自己的上下文入口")
+            );
+            assert!(
+                !fs::read_to_string(project_root.join("context/Coding/fastmemory.json"))
+                    .unwrap_or_default()
+                    .contains("审校角色独立维护自己的上下文入口")
+            );
+
+            let add = execute_memory_add(
+                json!({
+                    "target": "datememory",
+                    "persona": "reviewer",
+                    "date": "2026-03-22",
+                    "keywords": ["审校", "动态角色", "治理链路"],
+                    "content": "2026-03-22 审校角色复核了动态角色治理链路，确认 context_manage 与 memory 工具都可以显式指向 reviewer，自身目录与基座 persona 已经隔离。"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("memory add to role");
+            assert!(add.output_preview.contains("reviewer"));
+
+            let role_read = execute_memory_read(
+                json!({
+                    "target": "datememory",
+                    "persona": "reviewer",
+                    "date": "2026-03-22"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("memory read role");
+            assert!(role_read.output_preview.contains("source=reviewer"));
+            assert!(role_read.output_preview.contains("动态角色治理链路"));
+
+            let coding_read = execute_memory_read(
+                json!({
+                    "target": "datememory",
+                    "persona": "coding",
+                    "date": "2026-03-22"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("memory read coding");
+            assert!(coding_read.output_preview.contains("0 entry(s)"));
+        });
+    }
+
+    #[test]
+    fn role_create_always_bootstraps_persona_manage_into_default_tools() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear matrix");
+
+            let create = execute_tool_manage(
+                json!({
+                    "action": "role_create",
+                    "role": {
+                        "id": "worker",
+                        "display_name": "工",
+                        "glyph": "工",
+                        "base_persona": "coding",
+                        "default_tools": ["memory_check"]
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("create role");
+            assert!(create.output_preview.contains("created: worker"));
+
+            let role = crate::roles::find_role("worker")
+                .expect("find role")
+                .expect("role exists");
+            assert!(role.default_tools.contains(&"memory_check".to_string()));
+            assert!(role.default_tools.contains(&"persona_manage".to_string()));
+
+            let state: Value = crate::read_json_or_default_shared(
+                project_root
+                    .join("context/Role_worker/state.json")
+                    .as_path(),
+            )
+            .expect("read role state");
+            let toolbox_ids = state
+                .pointer("/toolbox/entries")
+                .and_then(Value::as_array)
+                .expect("toolbox entries")
+                .iter()
+                .filter_map(|entry| entry.get("tool_id").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            assert!(toolbox_ids.contains(&"memory_check"));
+            assert!(toolbox_ids.contains(&"persona_manage"));
+        });
+    }
+
+    #[test]
+    fn role_tool_remove_keeps_persona_manage_as_required_role_tool() {
+        with_test_home(|_home_root| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear matrix");
+
+            execute_tool_manage(
+                json!({
+                    "action": "role_create",
+                    "role": {
+                        "id": "worker",
+                        "display_name": "工",
+                        "glyph": "工",
+                        "base_persona": "coding",
+                        "default_tools": ["memory_check"]
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("create role");
+
+            let remove = execute_tool_manage(
+                json!({
+                    "action": "role_tool_remove",
+                    "role_ids": ["worker"],
+                    "tool_ids": ["persona_manage", "memory_check"]
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("remove role tools");
+            assert!(
+                remove
+                    .output_preview
+                    .contains("removed: persona_manage, memory_check")
+            );
+
+            let role = crate::roles::find_role("worker")
+                .expect("find role")
+                .expect("role exists");
+            assert!(!role.default_tools.contains(&"memory_check".to_string()));
+            assert!(role.default_tools.contains(&"persona_manage".to_string()));
+        });
+    }
+
+    #[test]
+    fn persona_manage_persona_label_uses_dynamic_role_contract_identity() {
+        with_test_home(|_home_root| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            execute_tool_manage(
+                json!({
+                    "action": "role_create",
+                    "role": {
+                        "id": "ops_bridge",
+                        "display_name": "运营桥",
+                        "glyph": "桥",
+                        "base_persona": "coding",
+                        "default_tools": ["memory_read"]
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("create role");
+
+            assert_eq!(
+                persona_manage_persona_label("ops_bridge"),
+                "运营桥 · ops_bridge"
+            );
+        });
+    }
+
+    #[test]
+    fn non_matrix_cannot_manage_dynamic_roles() {
+        with_test_home(|_home_root| {
+            crate::context::set_persona(crate::PersonaKind::Coding);
+            set_tool_persona(crate::PersonaKind::Coding);
+            let err = execute_tool_manage(
+                json!({
+                    "action": "role_list"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect_err("coding must not manage roles");
+            assert!(format!("{err:#}").contains("只允许 Matrix"));
+        });
+    }
+
+    #[test]
+    fn external_tool_scheduler_deadline_overrides_timeout_secs() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            let tool_dir = project_root.join("tools/external");
+            fs::create_dir_all(tool_dir.as_path()).expect("create external tools dir");
+            let tool_name = "projectying_deadline_manifest";
+            fs::write(
+                tool_dir.join(format!("{tool_name}.tool.json")),
+                json!({
+                    "name": tool_name,
+                    "description": "Deadline manifest test tool.",
+                    "program": "sh",
+                    "args": ["-c", "sleep 2; printf late"],
+                    "timeout_secs": 5,
+                    "scheduler": {
+                        "deadline_ms": 120,
+                        "max_retries": 0,
+                        "payload_policy": "replace_not_stack"
+                    }
+                })
+                .to_string(),
+            )
+            .expect("write deadline manifest");
+
+            let call_display = FunctionCallDisplay {
+                brief: "deadline test".to_string(),
+                kind_label: "External".to_string(),
+                action_label: "Run".to_string(),
+                command_preview: "{}".to_string(),
+            };
+            let started = Instant::now();
+            let output = execute_external_tool(tool_name, "{}", &call_display)
+                .expect("execute deadline tool");
+
+            assert_eq!(output.exit_code, Some(124));
+            assert!(output.output_preview.contains("status: timeout"));
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "scheduler deadline should stop before timeout_secs fallback"
+            );
+        });
+    }
+
+    #[test]
+    fn tool_output_envelope_records_toolmemory_ref_for_archived_output() {
+        let call = FunctionCall {
+            call_id: "call_env".to_string(),
+            name: "memory_read".to_string(),
+            arguments: r#"{"target":"toolmemory"}"#.to_string(),
+        };
+        let display = FunctionCallDisplay {
+            brief: "读取工具记忆".to_string(),
+            kind_label: "Memory".to_string(),
+            action_label: "Read".to_string(),
+            command_preview: "target=toolmemory".to_string(),
+        };
+        let archived = "line one\nline two".to_string();
+        let execution = ExecutedFunctionCall {
+            output_items: build_tool_output_items(call.call_id.as_str(), archived.clone(), vec![]),
+            brief: "读取工具记忆".to_string(),
+            kind_label: "Memory".to_string(),
+            action_label: "Read".to_string(),
+            command_preview: Some("target=toolmemory".to_string()),
+            output_preview: "[Tool output truncated · entry_id=42]".to_string(),
+            exit_code: None,
+            toolmemory_entry_id: Some(42),
+            archived_output: Some(archived),
+        };
+
+        let envelope = build_tool_output_envelope(
+            &call,
+            &display,
+            &execution,
+            crate::PersonaKind::Matrix,
+            10,
+            12,
+            250,
+        );
+
+        assert_eq!(envelope.version, 1);
+        assert_eq!(envelope.tool_id, "memory_read");
+        assert_eq!(envelope.status, ToolRunStatus::Ok);
+        assert_eq!(envelope.display.title, "Memory");
+        assert_eq!(envelope.display.action_label, "Read");
+        assert_eq!(envelope.output_refs.len(), 1);
+        assert_eq!(envelope.output_refs[0].ref_id, "toolmemory:42");
+        assert_eq!(envelope.output_refs[0].entry_id, Some(42));
+        assert_eq!(envelope.output_refs[0].line_count, 2);
+        assert_eq!(envelope.metrics["elapsed_ms"], json!(250));
+    }
+
+    #[test]
+    fn failed_function_call_builds_error_envelope() {
+        let call = FunctionCall {
+            call_id: "call_draw_failed".to_string(),
+            name: "draw_image".to_string(),
+            arguments: r#"{"prompt":"test"}"#.to_string(),
+        };
+        let display = FunctionCallDisplay {
+            brief: "生成测试图".to_string(),
+            kind_label: "Image".to_string(),
+            action_label: "Draw".to_string(),
+            command_preview: "prompt: test".to_string(),
+        };
+        let execution = build_executed_function_failure(
+            call.call_id.as_str(),
+            call.name.as_str(),
+            display.brief.clone(),
+            display.kind_label.clone(),
+            "Failed".to_string(),
+            Some(display.command_preview.clone()),
+            anyhow::anyhow!("upstream image cooldown"),
+        );
+
+        assert_eq!(execution.exit_code, Some(1));
+        assert_eq!(
+            tool_status_from_execution(call.name.as_str(), &execution),
+            ToolRunStatus::Error
+        );
+
+        let envelope = build_tool_output_envelope(
+            &call,
+            &display,
+            &execution,
+            crate::PersonaKind::Matrix,
+            10,
+            12,
+            250,
+        );
+        assert_eq!(envelope.status, ToolRunStatus::Error);
+        assert!(
+            envelope
+                .error
+                .as_deref()
+                .is_some_and(|text| text.contains("upstream image cooldown"))
+        );
+    }
+
+    #[test]
+    fn memory_read_tail_reads_only_latest_external_output() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            let output_dir = project_root.join("memory/output/terminal");
+            fs::create_dir_all(output_dir.as_path()).expect("create output dir");
+            let output_path = output_dir.join("demo.log");
+            let content = (1..=20)
+                .map(|index| format!("line-{index}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(output_path.as_path(), content).expect("write output log");
+
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            let execution = execute_memory_read(
+                json!({
+                    "target": "output",
+                    "path": "memory/output/terminal/demo.log",
+                    "mode": "tail",
+                    "tail_lines": 3,
+                    "max_bytes": 2048
+                })
+                .to_string()
+                .as_str(),
+            );
+            let execution = execution.expect("memory_read output tail");
+            let output = execution.model_output.as_str();
+            assert!(output.contains("memory_read:ok"));
+            assert!(output.contains("mode:tail"));
+            assert!(output.contains("line-18"));
+            assert!(output.contains("line-20"));
+            assert!(!output.contains("line-1\n"));
+            assert!(output.contains("cursor:line:20,byte:"));
+            assert_eq!(execution.exit_code, Some(0));
+        });
+    }
+
+    #[test]
+    fn memory_read_output_since_cursor_returns_incremental_bytes() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            let output_dir = project_root.join("memory/output/multiagent");
+            fs::create_dir_all(output_dir.as_path()).expect("create output dir");
+            fs::write(output_dir.join("agent-1.log"), "alpha\nbeta\ngamma\n")
+                .expect("write output log");
+
+            let result = execute_memory_read(
+                json!({
+                    "target": "output",
+                    "path": "memory/output/multiagent/agent-1.log",
+                    "mode": "since_cursor",
+                    "cursor": "byte:6",
+                    "max_bytes": 2048
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("read since cursor");
+            assert!(result.model_output.contains("beta"));
+            assert!(result.model_output.contains("gamma"));
+            assert!(!result.model_output.contains("alpha\n"));
+            assert!(result.model_output.contains("cursor:line:3,byte:17"));
+        });
+    }
+
+    #[test]
+    fn memory_read_output_rejects_paths_outside_memory_output() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            fs::create_dir_all(project_root.join("src")).expect("create src");
+            fs::write(project_root.join("src/main.rs"), "fn main() {}\n").expect("write source");
+
+            let err = execute_memory_read(
+                json!({
+                    "target": "output",
+                    "path": "src/main.rs",
+                    "mode": "tail"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect_err("source file should be rejected");
+            assert!(format!("{err:#}").contains("memory/output"));
+        });
+    }
+
+    #[test]
+    fn tool_manage_can_target_another_persona_toolbox() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            let tool_name = "projectying_cross_persona_tool";
+            write_external_echo_tool(project_root.as_path(), tool_name);
+
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear matrix");
+            crate::context::tool_manage(
+                "open",
+                &[tool_name.to_string()],
+                Some("coding"),
+                Some("给 Coding 临时开放新外部工具"),
+                None,
+            )
+            .expect("open coding toolbox");
+
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            assert!(
+                !crate::context::projected_toolbox_local_tool_ids()
+                    .expect("matrix projected ids")
+                    .contains(tool_name),
+                "targeted toolbox change must not open the same tool for Matrix"
+            );
+
+            crate::context::set_persona(crate::PersonaKind::Coding);
+            set_tool_persona(crate::PersonaKind::Coding);
+            let coding_state = fs::read_to_string(project_root.join("context/Coding/state.json"))
+                .expect("read coding state");
+            assert!(coding_state.contains(tool_name));
+            assert!(
+                crate::context::projected_toolbox_local_tool_ids()
+                    .expect("coding projected ids")
+                    .contains(tool_name),
+                "targeted toolbox change should open the tool for Coding's provider projection"
+            );
+            assert!(tool_names(&codex_tools_for_provider()).contains(&tool_name.to_string()));
+
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+        });
+    }
+
+    #[test]
+    fn tool_manage_self_service_is_available_to_focus_personas_but_not_cross_persona() {
+        with_test_home(|_| {
+            crate::context::set_persona(crate::PersonaKind::Coding);
+            set_tool_persona(crate::PersonaKind::Coding);
+            set_tool_projection_override(None);
+            crate::context::clear_messages().expect("clear coding");
+
+            assert!(tool_names(&codex_tools_for_provider()).contains(&"tool_manage".to_string()));
+            let before = crate::context::projected_toolbox_local_tool_ids()
+                .expect("coding projected ids before");
+            assert!(!before.contains("pty_input"));
+
+            crate::context::tool_manage("open", &["pty_input".to_string()], None, None, None)
+                .expect("coding opens its own closed tool");
+            let after =
+                crate::context::projected_toolbox_local_tool_ids().expect("coding ids after open");
+            assert!(after.contains("pty_input"));
+            assert!(tool_names(&codex_tools_for_provider()).contains(&"pty_input".to_string()));
+
+            let err = crate::context::tool_manage(
+                "open",
+                &["server_manage".to_string()],
+                Some("server"),
+                None,
+                None,
+            )
+            .expect_err("coding cannot target server toolbox");
+            assert!(format!("{err:#}").contains("只能管理自己的 toolbox"));
+
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+        });
+    }
+
+    #[test]
+    fn provider_projection_uses_active_tool_persona_even_when_context_persona_differs() {
+        with_test_home(|_| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Coding);
+            set_tool_projection_override(None);
+
+            let projection = ProviderToolProjection::current();
+            assert!(
+                projection.allows("command"),
+                "Coding execution should use Coding toolbox projection, not Matrix context projection"
+            );
+
+            set_tool_persona(crate::PersonaKind::Matrix);
+        });
+    }
+
+    #[test]
+    fn server_persona_exposes_server_manage_and_ssh_targets() {
+        set_tool_persona(crate::PersonaKind::Server);
+        set_tool_projection_override(None);
+        let tools = codex_tools();
+        let names = tools
+            .as_array()
+            .expect("tool array")
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"server_manage"));
+        assert!(names.contains(&"server_split"));
+        assert!(!names.contains(&"context_manage"));
+
+        let command = tools
+            .as_array()
+            .expect("tool array")
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("command"))
+            .expect("command tool");
+        assert!(
+            command["parameters"]["properties"]
+                .get("server_id")
+                .is_some()
+        );
+        assert!(
+            command["parameters"]["properties"]
+                .get("server_name")
+                .is_some()
+        );
+
+        let pty_run = tools
+            .as_array()
+            .expect("tool array")
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("pty_run"))
+            .expect("pty_run tool");
+        assert_eq!(
+            pty_run["parameters"]["properties"]["target"]["enum"],
+            json!(["local", "ssh"])
+        );
+        assert!(
+            pty_run["parameters"]["properties"]
+                .get("server_id")
+                .is_some()
+        );
+        assert!(
+            pty_run["parameters"]["properties"]
+                .get("server_name")
+                .is_some()
+        );
+
+        set_tool_persona(crate::PersonaKind::Matrix);
+        let matrix_tools = codex_tools();
+        let matrix_names = matrix_tools
+            .as_array()
+            .expect("tool array")
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(matrix_names.contains(&"server_split"));
+        let matrix_provider_tools = codex_tools_for_provider();
+        let matrix_provider_names = matrix_provider_tools
+            .as_array()
+            .expect("tool array")
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(!matrix_provider_names.contains(&"server_split"));
+        let err = execute_server_split(r#"{"action":"list"}"#)
+            .expect_err("Matrix cannot use server_split");
+        assert!(err.to_string().contains("Server"));
+        set_tool_persona(crate::PersonaKind::Matrix);
+    }
+
+    #[test]
+    fn server_split_creates_queues_and_closes_without_deleting_context() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            set_tool_persona(crate::PersonaKind::Server);
+            set_tool_projection_override(None);
+
+            let create = execute_server_split(
+                json!({
+                    "action": "split_batch",
+                    "count": 2,
+                    "tasks": ["检查 alpha 服务器状态", "检查 beta 服务器日志"],
+                    "server_ids": ["alpha", "beta"]
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("create server split roles");
+            assert!(create.output_preview.contains("server_yu_a"));
+            assert!(create.output_preview.contains("server_yu_b"));
+            assert!(create.output_preview.contains("queued_assignments"));
+
+            let roles = crate::roles::server_split_role_specs();
+            assert_eq!(roles.len(), 2);
+            let role_a = roles
+                .iter()
+                .find(|role| role.id == "server_yu_a")
+                .expect("role A");
+            assert!(role_a.enabled);
+            assert_eq!(role_a.copy_source.as_deref(), Some("server"));
+            let contract = role_a.contract();
+            assert_eq!(contract.capability.base_persona, crate::PersonaKind::Server);
+            assert!(role_a.default_tools.contains(&"server_manage".to_string()));
+            assert!(role_a.default_tools.contains(&"server_split".to_string()));
+            assert!(role_a.default_tools.contains(&"persona_manage".to_string()));
+            assert!(
+                crate::roles::visible_role_tabs()
+                    .iter()
+                    .any(|role| role.id == "server_yu_a" && role.glyph_label == "御A")
+            );
+
+            let queue = fs::read_to_string(project_root.join("config/persona-commands.jsonl"))
+                .expect("read persona queue");
+            assert!(queue.contains("\"target_role\":\"server_yu_a\""));
+            assert!(queue.contains("\"target_role\":\"server_yu_b\""));
+            assert!(queue.contains("server_id: alpha"));
+            assert!(queue.contains("server_id: beta"));
+
+            let close = execute_server_split(
+                json!({
+                    "action": "close",
+                    "split_ids": ["御A"]
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("close role A");
+            assert!(close.output_preview.contains("disabled only"));
+            let roles = crate::roles::server_split_role_specs();
+            let role_a = roles
+                .iter()
+                .find(|role| role.id == "server_yu_a")
+                .expect("closed role A");
+            assert!(!role_a.enabled);
+            assert!(project_root.join("context/Role_server_yu_a").exists());
+            assert!(project_root.join("memory/Role_server_yu_a").exists());
+
+            let send_closed = execute_server_split(
+                json!({
+                    "action": "communicate",
+                    "target": "御A",
+                    "message": "继续检查"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect_err("closed split cannot receive new message");
+            assert!(send_closed.to_string().contains("已关闭"));
+
+            let reopen = execute_server_split(
+                json!({
+                    "action": "split",
+                    "label": "A"
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("reopen A");
+            assert!(reopen.output_preview.contains("reopened"));
+            let role_a = crate::roles::server_split_role_specs()
+                .into_iter()
+                .find(|role| role.id == "server_yu_a")
+                .expect("reopened role A");
+            assert!(role_a.enabled);
+
+            let close_all =
+                execute_server_split(r#"{"action":"close_all"}"#).expect("close all split roles");
+            assert!(close_all.output_preview.contains("active: 0"));
+            set_tool_persona(crate::PersonaKind::Matrix);
+        });
+    }
+
+    #[test]
+    fn server_ssh_status_reports_builtin_askpass_for_password_login() {
+        with_test_home(|root| {
+            write_server_ssh_test_config(root.as_path(), "test-password");
+            set_tool_persona(crate::PersonaKind::Server);
+            let output = server_manage_status_execution("status".to_string()).output_preview;
+            assert!(output.contains("auth:password"));
+            assert!(output.contains("active_password_login:password+builtin_askpass"));
+            assert!(output.contains("builtin askpass helper"));
+            set_tool_persona(crate::PersonaKind::Matrix);
+        });
+    }
+
+    #[test]
+    fn server_ssh_command_uses_builtin_askpass_for_password_login() {
+        with_test_home(|root| {
+            write_server_ssh_test_config(root.as_path(), "test-password");
+            set_tool_persona(crate::PersonaKind::Server);
+            let spec = build_server_ssh_command(Some("printf projectying-server-ok"), None, None)
+                .expect("build server ssh command");
+            assert!(!spec.run_cmd.contains("test-password"));
+            assert!(!spec.display_cmd.contains("test-password"));
+            assert!(spec.run_cmd.contains("ssh "));
+            assert!(spec.run_cmd.contains("NumberOfPasswordPrompts=1"));
+            assert!(
+                spec.env_overrides
+                    .iter()
+                    .any(|(key, value)| key == "SSH_ASKPASS" && !value.is_empty())
+            );
+            assert!(
+                spec.env_overrides
+                    .iter()
+                    .any(|(key, value)| key == "SSH_ASKPASS_REQUIRE" && value == "force")
+            );
+            assert!(
+                spec.env_overrides
+                    .iter()
+                    .any(|(key, value)| key == "DISPLAY" && value == ":0")
+            );
+            assert!(
+                spec.env_overrides
+                    .iter()
+                    .any(|(key, value)| key == SERVER_SSH_ASKPASS_PASSWORD_ENV
+                        && value == "test-password")
+            );
+            assert!(!spec.env_overrides.iter().any(|(key, _)| key == "SSHPASS"));
+            set_tool_persona(crate::PersonaKind::Matrix);
+        });
+    }
+
+    #[test]
+    fn server_registry_upsert_select_and_delete_roundtrip() {
+        with_test_home(|_| {
+            set_tool_persona(crate::PersonaKind::Server);
+            let saved = crate::settings::upsert_server_registry_entry_for_persona(
+                crate::PersonaKind::Server,
+                crate::settings::ServerSshSettings {
+                    id: String::new(),
+                    name: "alpha".to_string(),
+                    host: "192.0.2.20".to_string(),
+                    port: 2222,
+                    user: "root".to_string(),
+                    password: "pw-alpha".to_string(),
+                    key_path: String::new(),
+                    enabled: true,
+                },
+            )
+            .expect("upsert server");
+            assert!(!saved.id.is_empty());
+            let registry =
+                crate::settings::load_server_registry_for_persona(crate::PersonaKind::Server);
+            assert_eq!(registry.servers.len(), 1);
+            assert_eq!(registry.servers[0].password, "pw-alpha");
+            let selected = crate::settings::select_server_registry_entry_for_persona(
+                crate::PersonaKind::Server,
+                saved.id.as_str(),
+            )
+            .expect("select server");
+            assert!(selected.is_some());
+            let registry =
+                crate::settings::load_server_registry_for_persona(crate::PersonaKind::Server);
+            assert_eq!(registry.active_server_id, saved.id);
+            let deleted = crate::settings::delete_server_registry_entry_for_persona(
+                crate::PersonaKind::Server,
+                saved.id.as_str(),
+            )
+            .expect("delete server");
+            assert!(deleted.is_some());
+            let registry =
+                crate::settings::load_server_registry_for_persona(crate::PersonaKind::Server);
+            assert!(registry.servers.is_empty());
+            set_tool_persona(crate::PersonaKind::Matrix);
+        });
+    }
+
+    #[test]
+    fn browser_schema_is_exposed_and_projected_by_persona() {
+        let tools = shared_codex_tools();
+        let browser = tools
+            .as_array()
+            .expect("tool array")
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("browser"))
+            .expect("browser tool");
+        assert!(
+            browser["description"]
+                .as_str()
+                .expect("description")
+                .contains("HTTP session browser")
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Matrix, "browser"),
+            ToolProjectionState::Closed
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Coding, "browser"),
+            ToolProjectionState::Hidden
+        );
+        assert_eq!(
+            default_tool_projection_state(crate::PersonaKind::Server, "browser"),
+            ToolProjectionState::Expanded
+        );
+    }
+
+    #[test]
+    fn browser_create_list_open_read_and_close_work() {
+        with_test_home(|_| {
+            reset_browser_sessions();
+            let (base_url, server) = spawn_browser_test_server();
+
+            let create = execute_browser(r#"{"action":"create","name":"server-probe"}"#)
+                .expect("create browser");
+            assert!(create.output_preview.contains("session_id: br1"));
+
+            let list_before =
+                execute_browser(r#"{"action":"list"}"#).expect("list browser sessions");
+            assert!(list_before.output_preview.contains("server-probe"));
+
+            let open = execute_browser(
+                serde_json::json!({
+                    "action": "open",
+                    "session_id": "br1",
+                    "url": base_url,
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("open browser page");
+            assert_eq!(open.kind_label, "BROWSER");
+            assert!(open.output_preview.contains("Browser Test"));
+            assert!(open.output_preview.contains("next stop"));
+            assert!(open.output_preview.contains("PAGE · Browser Test · 200"));
+            assert!(open.command_preview.contains("OPEN · page request"));
+
+            let read = execute_browser(
+                r#"{"action":"read","session_id":"br1","selector":"main","max_items":4}"#,
+            )
+            .expect("read browser page");
+            assert!(
+                read.output_preview
+                    .contains("READ · Browser Test · 1 selector(s)")
+            );
+            assert!(read.output_preview.contains("selector: main"));
+            assert!(read.output_preview.contains("hello world"));
+
+            let submit = execute_browser(
+                serde_json::json!({
+                    "action": "submit",
+                    "session_id": "br1",
+                    "url": "/submit",
+                    "form": {
+                        "keyword": "route"
+                    }
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect("submit browser form");
+            assert!(submit.output_preview.contains("Submit OK"));
+            assert!(submit.output_preview.contains("posted success"));
+
+            let close =
+                execute_browser(r#"{"action":"close","session_id":"br1"}"#).expect("close browser");
+            assert!(close.output_preview.contains("Session closed"));
+
+            let list_after =
+                execute_browser(r#"{"action":"list"}"#).expect("list browser sessions");
+            assert!(list_after.output_preview.contains("Browser sessions: 0"));
+
+            server.join().expect("join browser server");
+            reset_browser_sessions();
+        });
     }
 
     #[test]
@@ -9060,26 +22220,268 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>();
         assert!(!names.contains(&"multi_tool_use_parallel"));
-        assert!(!names.contains(&"multi_tool_use.parallel"));
+        let removed_parallel = format!("{}.{}", "multi_tool_use", "parallel");
+        assert!(!names.contains(&removed_parallel.as_str()));
     }
 
     #[test]
-    fn exec_command_schema_exposes_line_budget_controls() {
+    fn draw_image_generates_final_image_into_dcim() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            fs::create_dir_all(project_root.as_path()).expect("create project root");
+            crate::context::set_persona(crate::PersonaKind::Coding);
+            crate::context::clear_messages().expect("clear coding context");
+            set_tool_persona(crate::PersonaKind::Coding);
+            set_tool_projection_override(None);
+
+            assert!(tool_names(&codex_tools_for_provider()).contains(&"draw_image".to_string()));
+            let (base_url, server) = spawn_draw_image_test_server();
+            let runtime_ctx = ToolRuntimeContext {
+                provider: draw_image_test_provider(base_url.as_str()),
+                messages: Vec::new(),
+            };
+            let output = execute_draw_image(
+                r#"{"prompt":"A clean app icon for ProjectYing, firefly glow, transparent background","brief":"生成图标","transparent_background":true,"size":"1024x1024","output_dir":"media/generated"}"#,
+                Some(&runtime_ctx),
+            )
+            .expect("draw image request");
+
+            assert_eq!(output.kind_label, "Image");
+            assert_eq!(output.action_label, "Draw");
+            assert!(output.model_output.contains("draw_image:done"));
+            let image_path = output
+                .model_output
+                .lines()
+                .find_map(|line| line.strip_prefix("image_path="))
+                .expect("image path");
+            assert!(image_path.contains("media/dcim/"));
+            assert!(!project_root.join("media/generated/requests").exists());
+            let stored_path = project_root.join(image_path.trim_start_matches("./"));
+            assert!(stored_path.is_file());
+            let metadata = fs::metadata(&stored_path).expect("image metadata");
+            assert!(metadata.len() > 0);
+            let saved = image::open(&stored_path)
+                .expect("open saved image")
+                .to_rgba8();
+            assert_eq!(saved.get_pixel(0, 0).0[3], 0);
+            assert_eq!(saved.get_pixel(5, 5).0[3], 255);
+
+            let request = server.join().expect("join image server");
+            assert!(request.starts_with("POST /v1/images/generations "));
+            assert!(request.contains("gpt-image-2"));
+            assert!(request.contains("#00ff00"));
+        });
+    }
+
+    #[test]
+    fn draw_image_retries_body_read_failure_before_succeeding() {
+        with_test_home(|home_root| {
+            let project_root = home_root.join(PROJECTYING_REL_PATH);
+            fs::create_dir_all(project_root.as_path()).expect("create project root");
+            crate::context::set_persona(crate::PersonaKind::Coding);
+            crate::context::clear_messages().expect("clear coding context");
+            set_tool_persona(crate::PersonaKind::Coding);
+            set_tool_projection_override(None);
+
+            let (base_url, server) = spawn_draw_image_flaky_test_server();
+            let runtime_ctx = ToolRuntimeContext {
+                provider: draw_image_test_provider(base_url.as_str()),
+                messages: Vec::new(),
+            };
+            let output = execute_draw_image(
+                r#"{"prompt":"A clean app icon for ProjectYing, transparent background","brief":"生成图标","transparent_background":true,"size":"1024x1024"}"#,
+                Some(&runtime_ctx),
+            )
+            .expect("draw image request");
+
+            let image_path = output
+                .model_output
+                .lines()
+                .find_map(|line| line.strip_prefix("image_path="))
+                .expect("image path");
+            assert!(image_path.contains("media/dcim/"));
+            let stored_path = project_root.join(image_path.trim_start_matches("./"));
+            assert!(stored_path.is_file());
+
+            let request = server.join().expect("join flaky image server");
+            assert!(request.contains("\n---\n"));
+            assert!(request.matches("POST /v1/images/generations ").count() >= 2);
+        });
+    }
+
+    #[test]
+    fn command_schema_exposes_line_budget_controls() {
+        set_tool_persona(crate::PersonaKind::Coding);
         let tools = codex_tools();
-        let props = tools[0]["parameters"]["properties"]
+        let command = tools
+            .as_array()
+            .expect("tool array")
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("command"))
+            .expect("command schema");
+        let props = command["parameters"]["properties"]
             .as_object()
-            .expect("exec_command properties");
+            .expect("command properties");
         assert_eq!(
             props["output_level"]["enum"]
                 .as_array()
                 .map(|items| items.len()),
             Some(3)
         );
+        assert_eq!(
+            props["target"]["enum"].as_array().map(|items| items.len()),
+            Some(2)
+        );
         assert!(!props.contains_key("max_output_lines"));
+        assert!(
+            props["yield_time_ms"]["description"]
+                .as_str()
+                .expect("yield_time_ms description")
+                .contains("does not use it to decide background promotion")
+        );
+        set_tool_persona(crate::PersonaKind::Matrix);
     }
 
     #[test]
-    fn parse_request_user_input_accepts_ten_questions() {
+    fn command_yield_time_ms_does_not_promote_short_command_to_background() {
+        with_test_home(|_| {
+            let output = execute_command(
+                r#"{"cmd":"sleep 0.2; printf short-done","yield_time_ms":1,"timeout_secs":5}"#,
+            )
+            .expect("command should finish inline");
+
+            assert_eq!(output.exit_code, Some(0));
+            assert_eq!(output.action_label, "Ran");
+            assert!(output.model_output.contains("short-done"));
+            assert!(!output.model_output.contains("Background Command started"));
+        });
+    }
+
+    #[test]
+    fn coding_context_manage_schema_uses_public_surface_experience_fastmemory_and_text() {
+        let tools = coding_codex_tools();
+        let context_manage = tools
+            .as_array()
+            .expect("tool array")
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("context_manage"))
+            .expect("context_manage tool");
+        let description = context_manage["description"]
+            .as_str()
+            .expect("context_manage description");
+        let properties = context_manage["parameters"]["properties"]
+            .as_object()
+            .expect("context_manage properties");
+        let item_ids_description = properties["item_ids"]
+            .get("description")
+            .and_then(Value::as_str)
+            .expect("item_ids description");
+        let entry_start_description = properties["entry_start_id"]
+            .get("description")
+            .and_then(Value::as_str)
+            .expect("entry_start_id description");
+        let section_description = properties["section"]
+            .get("description")
+            .and_then(Value::as_str)
+            .expect("section description");
+        let text_description = properties["text"]
+            .get("description")
+            .and_then(Value::as_str)
+            .expect("text description");
+
+        assert!(description.contains("FastMemory has three sections"));
+        assert!(description.contains("public"));
+        assert!(description.contains("Matrix writes the shared board"));
+        assert!(description.contains("target=fastmemory"));
+        assert!(description.contains("Both `write` and `summary` always require `text`"));
+        assert_eq!(
+            properties["section"]["enum"],
+            json!(["public", "surface", "experience"])
+        );
+        assert!(section_description.contains("public"));
+        assert!(section_description.contains("surface"));
+        assert!(section_description.contains("experience"));
+        assert!(item_ids_description.contains("item_start_id"));
+        assert!(entry_start_description.contains("inclusive start id"));
+        assert!(text_description.contains("Required for both `write` and `summary`"));
+    }
+
+    #[test]
+    fn context_manage_schema_hides_legacy_aliases_from_primary_surface() {
+        let tools = shared_codex_tools();
+        let context_manage = tools
+            .as_array()
+            .expect("tool array")
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("context_manage"))
+            .expect("context_manage tool");
+        let properties = context_manage["parameters"]["properties"]
+            .as_object()
+            .expect("context_manage properties");
+
+        assert_eq!(
+            properties["action"]["enum"],
+            json!(["write", "summary", "replace", "compact"])
+        );
+        assert_eq!(
+            properties["target"]["enum"],
+            json!(["context", "focuscontext", "fastmemory", "prompt"])
+        );
+        assert!(!properties.contains_key("task"));
+        assert!(!properties.contains_key("summary"));
+    }
+
+    #[test]
+    fn context_management_tool_descriptions_include_active_hint() {
+        let tools = shared_codex_tools();
+        let hint = crate::context::CONTEXT_MANAGEMENT_ACTIVE_HINT;
+
+        for tool_name in [
+            "context_manage",
+            "context_compact",
+            "context_summary",
+            "context_vision",
+        ] {
+            let tool = tools
+                .as_array()
+                .expect("tool array")
+                .iter()
+                .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
+                .unwrap_or_else(|| panic!("missing {tool_name} tool"));
+            let description = tool["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing {tool_name} description"));
+            assert!(
+                description.contains(hint),
+                "{tool_name} description: {description}"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_mode_schema_writes_experience_fastmemory_exit_note() {
+        let tools = shared_codex_tools();
+        let focus_mode = tools
+            .as_array()
+            .expect("tool array")
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("focus_mode"))
+            .expect("focus_mode tool");
+        let properties = focus_mode["parameters"]["properties"]
+            .as_object()
+            .expect("focus_mode properties");
+        let fastmemory_text_description = properties["fastmemory_text"]
+            .get("description")
+            .and_then(Value::as_str)
+            .expect("fastmemory_text description");
+
+        assert!(!properties.contains_key("fastmemory_section"));
+        assert!(fastmemory_text_description.contains("fastmemory experience note"));
+        assert!(fastmemory_text_description.contains("reusable lessons"));
+    }
+
+    #[test]
+    fn parse_ask_user_accepts_ten_questions() {
         let arguments = serde_json::json!({
             "questions": (1..=10)
                 .map(|index| serde_json::json!({
@@ -9095,12 +22497,12 @@ mod tests {
                 .collect::<Vec<_>>()
         })
         .to_string();
-        let parsed = parse_request_user_input_arguments(arguments.as_str()).expect("parse args");
+        let parsed = parse_ask_user_arguments(arguments.as_str()).expect("parse args");
         assert_eq!(parsed.questions.len(), 10);
     }
 
     #[test]
-    fn parse_request_user_input_rejects_more_than_ten_questions() {
+    fn parse_ask_user_rejects_more_than_ten_questions() {
         let arguments = serde_json::json!({
             "questions": (1..=11)
                 .map(|index| serde_json::json!({
@@ -9114,12 +22516,12 @@ mod tests {
                 .collect::<Vec<_>>()
         })
         .to_string();
-        let err = parse_request_user_input_arguments(arguments.as_str()).expect_err("too many");
+        let err = parse_ask_user_arguments(arguments.as_str()).expect_err("too many");
         assert!(err.to_string().contains("最多只支持 10 个 question"));
     }
 
     #[test]
-    fn parse_request_user_input_rejects_more_than_three_suggested_options() {
+    fn parse_ask_user_rejects_more_than_three_suggested_options() {
         let arguments = serde_json::json!({
             "questions": [{
                 "id": "mode",
@@ -9134,12 +22536,12 @@ mod tests {
             }]
         })
         .to_string();
-        let err = parse_request_user_input_arguments(arguments.as_str()).expect_err("too many");
+        let err = parse_ask_user_arguments(arguments.as_str()).expect_err("too many");
         assert!(err.to_string().contains("最多只支持 3 个建议选项"));
     }
 
     #[test]
-    fn parse_request_user_input_rejects_duplicate_question_ids() {
+    fn parse_ask_user_rejects_duplicate_question_ids() {
         let arguments = serde_json::json!({
             "questions": [
                 {
@@ -9161,12 +22563,12 @@ mod tests {
             ]
         })
         .to_string();
-        let err = parse_request_user_input_arguments(arguments.as_str()).expect_err("duplicate");
+        let err = parse_ask_user_arguments(arguments.as_str()).expect_err("duplicate");
         assert!(err.to_string().contains("id 重复"));
     }
 
     #[test]
-    fn parse_request_user_input_rejects_header_longer_than_twelve_chars() {
+    fn parse_ask_user_rejects_header_longer_than_twelve_chars() {
         let arguments = serde_json::json!({
             "questions": [{
                 "id": "mode",
@@ -9178,13 +22580,13 @@ mod tests {
             }]
         })
         .to_string();
-        let err = parse_request_user_input_arguments(arguments.as_str()).expect_err("long header");
+        let err = parse_ask_user_arguments(arguments.as_str()).expect_err("long header");
         assert!(err.to_string().contains("header 不能超过 12 个字符"));
     }
 
     #[test]
-    fn request_user_input_response_preview_lists_answers() {
-        let args = parse_request_user_input_arguments(
+    fn ask_user_response_preview_lists_answers() {
+        let args = parse_ask_user_arguments(
             serde_json::json!({
                 "questions": [
                     {
@@ -9229,15 +22631,15 @@ mod tests {
                 ),
             ]),
         };
-        let preview = build_request_user_input_response_preview(&args, &response);
+        let preview = build_ask_user_response_preview(&args, &response);
         assert!(preview.contains("已完成 2/2 项对账"));
         assert!(preview.contains("1. 模式 · 方案B"));
         assert!(preview.contains("2. 范围 · 自定义：只改 ui 和 prompt"));
     }
 
     #[test]
-    fn request_user_input_preview_hides_option_list() {
-        let args = parse_request_user_input_arguments(
+    fn ask_user_preview_hides_option_list() {
+        let args = parse_ask_user_arguments(
             serde_json::json!({
                 "questions": [{
                     "id": "mode",
@@ -9253,7 +22655,7 @@ mod tests {
             .as_str(),
         )
         .expect("args");
-        let preview = build_request_user_input_preview(&args);
+        let preview = build_ask_user_preview(&args);
         assert!(preview.contains("1. 模式 · 这轮怎么走？"));
         assert!(!preview.contains("方案A"));
         assert!(!preview.contains("方案B"));
@@ -9286,12 +22688,35 @@ mod tests {
             30_000,
             true,
         );
-        assert!(preview.contains("#1 is still working, now wait for finish."));
+        assert!(preview.contains("已登记等待：#1。它们结束后会自动回传，无需再次 wait_agent。"));
         assert!(preview.contains("1 已完成 · 1 运行中 · 已等待 30s"));
         assert!(preview.contains("#1 · 运行中"));
         assert!(preview.contains("● Read · ./src/main.rs"));
         assert!(preview.contains("#2 · 已完成"));
         assert!(preview.contains("已确认 3 个目录和 2 个配置文件"));
+    }
+
+    #[test]
+    fn wait_agent_preview_caps_running_event_lines() {
+        let event_lines = (0..20)
+            .map(|index| format!("event line {index}"))
+            .collect::<Vec<_>>();
+        let preview = build_wait_agent_preview(
+            &BTreeMap::from([(
+                "agent-1".to_string(),
+                AgentRuntimeSnapshot {
+                    status: AgentStatusValue::Running,
+                    latest_event: Some("latest".to_string()),
+                    event_lines,
+                },
+            )]),
+            0,
+            true,
+        );
+
+        assert!(!preview.contains("event line 0"));
+        assert!(preview.contains("event line 19"));
+        assert!(preview.lines().count() <= 10);
     }
 
     #[test]
@@ -9309,29 +22734,35 @@ mod tests {
         let line = agent_tool_event_line(
             "context_manage",
             "",
-            "action: compact\ntarget: fastcontext\ntext: 清理历史摘要",
+            "action: summary\ntarget: fastmemory\ntext: 清理记忆",
         );
-        assert_eq!(line, "◌ Manage · FastContext / COMPACT");
+        assert_eq!(line, "◌ Manage · FastMemory / SUMMARY");
     }
 
     #[test]
-    fn agent_tool_event_line_formats_task_mode_scope() {
-        let line = agent_tool_event_line("task_mode", "", "action: enter\nbrief: 修复启动");
-        assert_eq!(line, "◌ Manage · Task / ENTER");
+    fn agent_tool_event_line_formats_focus_mode_scope() {
+        let line = agent_tool_event_line("focus_mode", "", "action: enter\nbrief: 修复启动");
+        assert_eq!(line, "◌ Manage · Focus / ENTER");
     }
 
     #[test]
-    fn context_manage_input_preview_marks_compact_all_scope() {
+    fn context_manage_input_preview_marks_summary_all_scope() {
         let args = ContextManageArgs {
-            action: "compact".to_string(),
+            action: "summary".to_string(),
             target: Some("context".to_string()),
+            persona: None,
+            scope: Some("all".to_string()),
             section: None,
             role: None,
             kind: None,
             round_id: None,
             entry_ids: Vec::new(),
+            entry_start_id: None,
+            entry_end_id: None,
             item_ids: Vec::new(),
-            text: Some("全量压缩标准上下文".to_string()),
+            item_start_id: None,
+            item_end_id: None,
+            text: Some("全量收口标准上下文".to_string()),
             brief: None,
             task: None,
             user_goal: None,
@@ -9349,7 +22780,6 @@ mod tests {
             key_info: None,
             result: None,
             exit_reason: None,
-            fastmemory_section: None,
             fastmemory_text: None,
         };
         let preview = build_context_manage_input_preview(&args);
@@ -9359,7 +22789,48 @@ mod tests {
     }
 
     #[test]
-    fn execute_context_manage_keeps_model_output_compact() {
+    fn execute_context_manage_summary_without_ids_requires_explicit_all_scope() {
+        with_test_home(|_| {
+            crate::context::clear_messages().expect("clear");
+            crate::context::manage_request(crate::context::ContextManageRequest::Write {
+                target: crate::context::ContextTarget::Context,
+                section: None,
+                role: Some(crate::context::ContextRole::System),
+                kind: Some("note".to_string()),
+                round_id: Some(1),
+                text: "需要保留的上下文笔记".to_string(),
+            })
+            .expect("write context");
+
+            let err = execute_context_manage(
+                r#"{
+                    "action":"summary",
+                    "target":"context",
+                    "role":"system",
+                    "kind":"summary",
+                    "text":"误触发整区收口"
+                }"#,
+            )
+            .expect_err("summary without ids must require explicit scope");
+            assert!(err.to_string().contains("scope=\"all\""));
+
+            let ok = execute_context_manage(
+                r#"{
+                    "action":"summary",
+                    "target":"context",
+                    "scope":"all",
+                    "role":"system",
+                    "kind":"summary",
+                    "text":"明确整区收口"
+                }"#,
+            )
+            .expect("summary with explicit all scope");
+            assert!(ok.model_output.contains("Action: SUMMARY"));
+        });
+    }
+
+    #[test]
+    fn execute_context_manage_keeps_model_output_concise() {
         with_test_home(|_| {
             crate::context::clear_messages().expect("clear");
             crate::context::manage_request(crate::context::ContextManageRequest::Write {
@@ -9394,7 +22865,106 @@ mod tests {
     }
 
     #[test]
-    fn execute_context_manage_accepts_task_mode_aliases() {
+    fn execute_context_manage_accepts_line_style_summary_arguments() {
+        with_test_home(|_| {
+            crate::context::clear_messages().expect("clear");
+            crate::context::manage_request(crate::context::ContextManageRequest::Write {
+                target: crate::context::ContextTarget::Context,
+                section: None,
+                role: Some(crate::context::ContextRole::System),
+                kind: Some("note".to_string()),
+                round_id: Some(1),
+                text: "需要压缩的上下文笔记".to_string(),
+            })
+            .expect("write context");
+
+            let execution = execute_context_manage(
+                "action: summary\n\
+                 target: context\n\
+                 role: system\n\
+                 kind: summary\n\
+                 entry_ids: 1\n\
+                 text: 行式收口",
+            )
+            .expect("line-style summary");
+
+            assert!(execution.model_output.contains("Area: Context"));
+            assert!(execution.model_output.contains("Action: SUMMARY"));
+            assert!(execution.output_preview.contains("需要压缩的上下文笔记"));
+            assert!(execution.output_preview.contains("行式收口"));
+        });
+    }
+
+    #[test]
+    fn context_summary_accepts_line_style_and_entry_refs_from_live_provider() {
+        with_test_home(|_| {
+            crate::context::clear_messages().expect("clear");
+            crate::context::manage_request(crate::context::ContextManageRequest::Write {
+                target: crate::context::ContextTarget::Context,
+                section: None,
+                role: Some(crate::context::ContextRole::System),
+                kind: Some("function_call_output".to_string()),
+                round_id: Some(1),
+                text: "需要被 context_summary 折叠的大工具回执".to_string(),
+            })
+            .expect("write context");
+
+            let execution = execute_context_summary(
+                "action: fold\n\
+                 entry_ids: e1\n\
+                 text: 已折叠：保留必要结论\n\
+                 reason: 行式入口兼容",
+            )
+            .expect("line-style context summary");
+
+            assert!(execution.model_output.contains("Action: FOLD"));
+            assert!(execution.model_output.contains("affected_count: 1"));
+            assert!(execution.output_preview.contains("Affected entry_ids"));
+        });
+    }
+
+    #[test]
+    fn context_vision_sets_next_round_visibility_budget() {
+        with_test_home(|_| {
+            crate::context::clear_messages().expect("clear");
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::append_message(
+                crate::context::ContextRole::User,
+                None,
+                "需要快速查看上下文可见度",
+            )
+            .expect("append message");
+            crate::context::tool_manage(
+                "open",
+                &["context_vision".to_string()],
+                None,
+                Some("unit test"),
+                None,
+            )
+            .expect("open context_vision");
+
+            let execution = execute_function_call(
+                &FunctionCall {
+                    call_id: "call_context_vision_1".to_string(),
+                    name: "context_vision".to_string(),
+                    arguments: r#"{"context_percent":"medium","reason":"cross-file reconcile"}"#
+                        .to_string(),
+                },
+                None,
+            );
+            assert!(execution.output_preview.contains("ContextVision"));
+            assert!(execution.output_preview.contains("67"));
+
+            let messages = crate::context::load_provider_messages().expect("provider messages");
+            assert!(messages[0].content.contains("本轮上下文返回阈值约 67%"));
+            assert!(messages[0].content.contains("不是丢失"));
+            assert!(messages[0].content.contains("cross-file reconcile"));
+        });
+    }
+
+    #[test]
+    fn execute_context_manage_accepts_focus_mode_aliases() {
         with_test_home(|_| {
             crate::context::clear_messages().expect("clear");
 
@@ -9413,7 +22983,7 @@ mod tests {
             crate::context::clear_messages().expect("clear before exit alias");
             crate::context::manage_request(crate::context::ContextManageRequest::FocusEnter {
                 brief: "修复上下文工程".to_string(),
-                task: "为 task_exit alias 预置任务模式".to_string(),
+                task: "为 task_exit alias 预置专注模式".to_string(),
                 user_goal: None,
                 reason: None,
                 plan_a: None,
@@ -9427,7 +22997,7 @@ mod tests {
             let exit = execute_context_manage(
                 r#"{
                     "action":"task_exit",
-                    "summary":"任务模式兼容层验证完成"
+                    "summary":"专注模式兼容层验证完成"
                 }"#,
             )
             .expect("execute task exit");
@@ -9437,12 +23007,18 @@ mod tests {
             let preview = build_context_manage_input_preview(&ContextManageArgs {
                 action: "task_enter".to_string(),
                 target: Some("toolcontext".to_string()),
+                persona: None,
+                scope: None,
                 section: None,
                 role: None,
                 kind: None,
                 round_id: None,
                 entry_ids: Vec::new(),
+                entry_start_id: None,
+                entry_end_id: None,
                 item_ids: Vec::new(),
+                item_start_id: None,
+                item_end_id: None,
                 brief: Some("修复".to_string()),
                 text: None,
                 task: Some("验证".to_string()),
@@ -9461,10 +23037,9 @@ mod tests {
                 key_info: None,
                 result: None,
                 exit_reason: None,
-                fastmemory_section: None,
                 fastmemory_text: None,
             });
-            assert!(preview.contains("action: task_enter"));
+            assert!(preview.contains("action: focus_enter"));
             assert_eq!(
                 parse_context_target(Some("toolcontext")).expect("parse toolcontext"),
                 crate::context::ContextTarget::FocusContext
@@ -9473,38 +23048,38 @@ mod tests {
     }
 
     #[test]
-    fn task_mode_tool_executes_enter_and_exit() {
+    fn focus_mode_tool_executes_enter_and_exit() {
         with_test_home(|_| {
             crate::context::clear_messages().expect("clear");
 
-            let enter = execute_task_mode(
+            let enter = execute_focus_mode(
                 r#"{
                     "action":"enter",
                     "brief":"修复上下文工程",
-                    "task":"验证 task_mode 独立入口",
+                    "task":"验证 focus_mode 独立入口",
                     "reason":"需要把计划与执行隔离"
                 }"#,
             )
-            .expect("execute task_mode enter");
+            .expect("execute focus_mode enter");
             assert_eq!(enter.brief, "修复上下文工程");
             assert!(enter.model_output.contains("Area: Task"));
             assert!(enter.model_output.contains("Action: ENTER"));
-            assert!(enter.command_preview.contains("action: task_enter"));
+            assert!(enter.command_preview.contains("action: focus_enter"));
 
             let display = describe_function_call(&FunctionCall {
                 call_id: "task_call".to_string(),
-                name: "task_mode".to_string(),
+                name: "focus_mode".to_string(),
                 arguments: r#"{"action":"enter","brief":"专项排查","task":"调查 API 错误"}"#
                     .to_string(),
             });
-            assert_eq!(display.kind_label, "TASK");
+            assert_eq!(display.kind_label, "FOCUS");
             assert_eq!(display.action_label, "Enter");
             assert_eq!(display.brief, "专项排查");
 
             crate::context::clear_messages().expect("clear before exit");
             crate::context::manage_request(crate::context::ContextManageRequest::FocusEnter {
                 brief: "修复上下文工程".to_string(),
-                task: "预置 task_mode exit".to_string(),
+                task: "预置 focus_mode exit".to_string(),
                 user_goal: None,
                 reason: None,
                 plan_a: None,
@@ -9513,18 +23088,569 @@ mod tests {
                 expected_result: None,
                 exit_condition: None,
             })
-            .expect("prepare task mode");
+            .expect("prepare focus mode");
 
-            let exit = execute_task_mode(
+            let exit = execute_focus_mode(
                 r#"{
                     "action":"exit",
-                    "summary":"task_mode 独立入口验证完成"
+                    "summary":"focus_mode 独立入口验证完成"
                 }"#,
             )
-            .expect("execute task_mode exit");
+            .expect("execute focus_mode exit");
             assert!(exit.model_output.contains("Area: Task"));
             assert!(exit.model_output.contains("Action: EXIT"));
-            assert!(exit.command_preview.contains("action: task_exit"));
+            assert!(exit.command_preview.contains("action: focus_exit"));
+        });
+    }
+
+    #[test]
+    fn focus_mode_accepts_line_style_arguments_from_live_provider() {
+        with_test_home(|_| {
+            crate::context::set_persona(crate::PersonaKind::Coding);
+            set_tool_persona(crate::PersonaKind::Coding);
+            crate::context::clear_messages().expect("clear");
+
+            let enter_focus = execute_function_call(
+                &FunctionCall {
+                    call_id: "call_coding_focus_line_enter".to_string(),
+                    name: "focus_mode".to_string(),
+                    arguments:
+                        "action: focus_enter\nbrief: Coding focus smoke\ntask: Coding focus smoke"
+                            .to_string(),
+                },
+                None,
+            );
+            let enter_output = extract_primary_tool_output_text(&enter_focus.output_items)
+                .expect("coding focus_mode line enter output");
+            assert!(
+                enter_output.contains("Area: Task"),
+                "line-style focus_mode enter should be callable for Coding"
+            );
+            assert!(
+                !enter_focus.output_preview.contains("focus_mode failed"),
+                "line-style focus_mode enter unexpectedly failed: {}",
+                enter_focus.output_preview
+            );
+
+            let exit_focus = execute_function_call(
+                &FunctionCall {
+                    call_id: "call_coding_focus_line_exit".to_string(),
+                    name: "focus_mode".to_string(),
+                    arguments: "action: focus_exit\nsummary: focus smoke complete".to_string(),
+                },
+                None,
+            );
+            let exit_output = extract_primary_tool_output_text(&exit_focus.output_items)
+                .expect("coding focus_mode line exit output");
+            assert!(
+                exit_output.contains("Area: Task"),
+                "line-style focus_mode exit should be callable for Coding"
+            );
+            assert!(
+                !exit_focus.output_preview.contains("focus_mode failed"),
+                "line-style focus_mode exit unexpectedly failed: {}",
+                exit_focus.output_preview
+            );
+        });
+    }
+
+    #[test]
+    fn persona_manage_accepts_line_style_send_arguments_from_live_provider() {
+        with_test_home(|_| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear");
+
+            let send = execute_persona_manage(
+                "action: send\n\
+                 persona: coding\n\
+                 message: 继续测试行式派单兼容层\n\
+                 brief: 行式派单",
+            )
+            .expect("line-style persona_manage send");
+            assert!(send.model_output.contains("persona_manage:queued"));
+            assert!(send.output_preview.contains("persona:"));
+        });
+    }
+
+    #[test]
+    fn memory_tools_accept_line_style_arguments_from_live_provider() {
+        with_test_home(|_| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear");
+
+            let add = execute_memory_add(
+                "target: datememory\n\
+                 persona: coding\n\
+                 date: 2026-05-17\n\
+                 keywords: 行式, 记忆, 兼容, 永久, 测试\n\
+                 content: 这是一次针对 memory_add 行式参数的回归测试。",
+            )
+            .expect("line-style memory add");
+            assert!(add.output_preview.contains("2026-05-17"));
+
+            let read = execute_memory_read(
+                "target: datememory\n\
+                 persona: coding\n\
+                 date: 2026-05-17",
+            )
+            .expect("line-style memory read");
+            assert!(read.output_preview.contains("2026-05-17"));
+        });
+    }
+
+    #[test]
+    fn persona_manage_observe_returns_folded_summary_without_full_tool_output() {
+        with_test_home(|home_root| {
+            crate::context::set_persona(crate::PersonaKind::Coding);
+            set_tool_persona(crate::PersonaKind::Coding);
+            crate::context::clear_messages().expect("clear coding");
+            crate::context::append_message(
+                crate::context::ContextRole::User,
+                None,
+                "请检查 Matrix 调度链路",
+            )
+            .expect("append user");
+            crate::context::append_tool_event(
+                1,
+                "command",
+                "读取大文件",
+                "Run",
+                "cat huge.log",
+                "SECRET_FULL_TOOL_OUTPUT_SHOULD_NOT_APPEAR",
+            )
+            .expect("append folded tool");
+            crate::aidebug::write_persona_dispatch_event(
+                home_root.join(PROJECTYING_REL_PATH).as_path(),
+                json!({
+                    "id": "persona-observe-test",
+                    "phase": "completed",
+                    "status": "completed",
+                    "action": "send",
+                    "source_persona": "Matrix",
+                    "target_persona": "Coding",
+                    "request_id": 7,
+                }),
+            )
+            .expect("write dispatch event");
+
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            let execution = execute_persona_manage(
+                r#"{"action":"observe","persona":"coding","include_recent":4}"#,
+            )
+            .expect("observe coding");
+
+            assert!(execution.model_output.contains("persona: Coding"));
+            assert!(execution.model_output.contains("recent_folded_chat"));
+            assert!(execution.model_output.contains("memory_pressure:"));
+            assert!(execution.model_output.contains("datememory_context_kb:"));
+            assert!(
+                execution
+                    .model_output
+                    .contains("datememory_context_limit_kb:")
+            );
+            assert!(
+                execution
+                    .model_output
+                    .contains("datememory_context_over_limit:")
+            );
+            assert!(execution.model_output.contains("recent_persona_dispatch"));
+            assert!(execution.model_output.contains("persona-observe-test"));
+            assert!(execution.model_output.contains("cat huge.log"));
+            assert!(
+                !execution
+                    .model_output
+                    .contains("SECRET_FULL_TOOL_OUTPUT_SHOULD_NOT_APPEAR")
+            );
+        });
+    }
+
+    #[test]
+    fn persona_manage_send_queues_runtime_command() {
+        with_test_home(|home_root| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            let execution = execute_persona_manage(
+                r#"{
+                    "action":"send",
+                    "persona":"coding",
+                    "message":"Matrix 已接手工具治理，请继续用当前工具施工",
+                    "brief":"工具治理已迁移"
+                }"#,
+            )
+            .expect("queue send");
+            assert!(execution.model_output.contains("persona_manage:queued"));
+
+            let queue = home_root
+                .join(PROJECTYING_REL_PATH)
+                .join("config/persona-commands.jsonl");
+            let data = fs::read_to_string(queue).expect("read queue");
+            assert!(data.contains("\"persona\":\"Coding\""));
+            assert!(data.contains("\"source_persona\":\"Matrix\""));
+            assert!(data.contains("\"action\":\"send\""));
+            assert!(data.contains("\"interrupt_active\":true"));
+            assert!(data.contains("Matrix 已接手工具治理"));
+
+            let dispatch = fs::read_to_string(
+                home_root
+                    .join(PROJECTYING_REL_PATH)
+                    .join("Aidebug/persona_dispatch.jsonl"),
+            )
+            .expect("read dispatch");
+            assert!(dispatch.contains("\"phase\":\"queued\""));
+            assert!(dispatch.contains("\"target_persona\":\"Coding\""));
+            assert!(dispatch.contains("\"source_persona\":\"Matrix\""));
+        });
+    }
+
+    #[test]
+    fn persona_manage_send_allows_focus_persona_to_contact_matrix() {
+        with_test_home(|home_root| {
+            crate::context::set_persona(crate::PersonaKind::Coding);
+            set_tool_persona(crate::PersonaKind::Coding);
+            let execution = execute_persona_manage(
+                r#"{
+                    "action":"send",
+                    "persona":"matrix",
+                    "message":"我需要主控确认计划",
+                    "brief":"请示母体"
+                }"#,
+            )
+            .expect("coding can send to matrix");
+            assert!(execution.model_output.contains("persona_manage:queued"));
+            assert!(execution.model_output.contains("from:Coding"));
+            assert!(execution.model_output.contains("persona:Matrix"));
+
+            let queue = home_root
+                .join(PROJECTYING_REL_PATH)
+                .join("config/persona-commands.jsonl");
+            let data = fs::read_to_string(queue).expect("read queue");
+            assert!(data.contains("\"persona\":\"Matrix\""));
+            assert!(data.contains("\"source_persona\":\"Coding\""));
+            assert!(data.contains("\"interrupt_active\":false"));
+            assert!(data.contains("我需要主控确认计划"));
+        });
+    }
+
+    #[test]
+    fn persona_manage_send_allows_dynamic_role_to_contact_base_persona() {
+        with_test_home(|home_root| {
+            crate::context::set_dynamic_role_context(
+                crate::PersonaKind::Matrix,
+                "worker",
+                "工",
+                "Role_worker",
+            );
+            set_tool_dynamic_role_context(
+                crate::PersonaKind::Matrix,
+                "worker",
+                "工",
+                "Role_worker",
+            );
+            let execution = execute_persona_manage(
+                r#"{
+                    "action":"send",
+                    "persona":"matrix",
+                    "message":"worker self_compact completed",
+                    "brief":"worker压缩汇报"
+                }"#,
+            )
+            .expect("dynamic role can send to its base persona");
+            assert!(execution.model_output.contains("persona_manage:queued"));
+            assert!(execution.model_output.contains("from:Matrix"));
+            assert!(execution.model_output.contains("persona:Matrix"));
+
+            let queue = home_root
+                .join(PROJECTYING_REL_PATH)
+                .join("config/persona-commands.jsonl");
+            let data = fs::read_to_string(queue).expect("read queue");
+            assert!(data.contains("\"persona\":\"Matrix\""));
+            assert!(data.contains("\"source_persona\":\"Matrix\""));
+            assert!(data.contains("\"source_role\":\"worker\""));
+            assert!(data.contains("\"source_role_label\":\"工\""));
+            assert!(data.contains("\"source_role_context_dir\":\"Role_worker\""));
+            assert!(data.contains("worker self_compact completed"));
+        });
+    }
+
+    #[test]
+    fn persona_manage_urgent_send_interrupts_even_from_non_governance_persona() {
+        with_test_home(|home_root| {
+            crate::context::set_persona(crate::PersonaKind::Coding);
+            set_tool_persona(crate::PersonaKind::Coding);
+            let execution = execute_persona_manage(
+                r#"{
+                    "action":"send",
+                    "persona":"matrix",
+                    "priority":"urgent",
+                    "message":"构建方向已经错误，请立即纠偏",
+                    "brief":"紧急纠偏"
+                }"#,
+            )
+            .expect("urgent send");
+            assert!(execution.model_output.contains("priority:urgent"));
+
+            let queue = home_root
+                .join(PROJECTYING_REL_PATH)
+                .join("config/persona-commands.jsonl");
+            let data = fs::read_to_string(queue).expect("read queue");
+            assert!(data.contains("\"persona\":\"Matrix\""));
+            assert!(data.contains("\"source_persona\":\"Coding\""));
+            assert!(data.contains("\"interrupt_active\":true"));
+        });
+    }
+
+    #[test]
+    fn persona_manage_observe_and_interrupt_remain_governance_only() {
+        with_test_home(|_| {
+            crate::context::set_persona(crate::PersonaKind::Coding);
+            set_tool_persona(crate::PersonaKind::Coding);
+            let observe = execute_persona_manage(
+                r#"{"action":"observe","persona":"matrix","include_recent":1}"#,
+            );
+            assert!(observe.is_err());
+            assert!(
+                observe
+                    .err()
+                    .expect("observe error")
+                    .to_string()
+                    .contains("observe 只允许 Matrix")
+            );
+
+            let interrupt = execute_persona_manage(
+                r#"{"action":"interrupt","persona":"matrix","message":"停一下"}"#,
+            );
+            assert!(interrupt.is_err());
+            assert!(
+                interrupt
+                    .err()
+                    .expect("interrupt error")
+                    .to_string()
+                    .contains("interrupt 只允许 Matrix")
+            );
+
+            crate::context::set_persona(crate::PersonaKind::Advisor);
+            set_tool_persona(crate::PersonaKind::Advisor);
+            let observe = execute_persona_manage(
+                r#"{"action":"observe","persona":"matrix","include_recent":1}"#,
+            );
+            assert!(observe.is_ok());
+        });
+    }
+
+    #[test]
+    fn focus_gate_keeps_matrix_focus_mode_callable_without_tool_manage() {
+        with_test_home(|_| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear");
+
+            execute_update_plan(
+                r#"{
+                    "plan":[
+                        {"step":"阅读项目结构","status":"in_progress"},
+                        {"step":"修复问题","status":"pending"}
+                    ]
+                }"#,
+            )
+            .expect("mark focus required");
+            assert!(
+                crate::context::focus_required_summary()
+                    .expect("focus summary")
+                    .is_some()
+            );
+
+            let allowed = crate::context::projected_toolbox_local_tool_ids()
+                .expect("projected ids after focus gate");
+            assert!(
+                allowed.contains("focus_mode"),
+                "focus gate must transiently expose focus_mode in provider schema"
+            );
+            assert!(allowed.contains("tool_manage"));
+            assert!(allowed.contains("command"));
+
+            let command = execute_function_call(
+                &FunctionCall {
+                    call_id: "call_focus_gate_command".to_string(),
+                    name: "command".to_string(),
+                    arguments: r#"{"cmd":"printf focus-gate-ok","timeout_secs":5}"#.to_string(),
+                },
+                None,
+            );
+            let command_output =
+                extract_primary_tool_output_text(&command.output_items).expect("command output");
+            assert!(
+                command_output.contains("focus-gate-ok"),
+                "command should remain callable after update_plan: {command_output}"
+            );
+
+            let enter_focus = execute_function_call(
+                &FunctionCall {
+                    call_id: "call_focus_mode_enter".to_string(),
+                    name: "focus_mode".to_string(),
+                    arguments: r#"{"action":"enter","brief":"修复问题","task":"验证 Matrix 焦点门仍可进入专注模式"}"#.to_string(),
+                },
+                None,
+            );
+            let model_output = extract_primary_tool_output_text(&enter_focus.output_items)
+                .expect("focus_mode model output");
+            assert!(
+                model_output.contains("Area: Task"),
+                "focus_mode should remain callable for Matrix focus recovery"
+            );
+            assert!(
+                !enter_focus.output_preview.contains("focus_mode failed"),
+                "focus_mode recovery call unexpectedly failed: {}",
+                enter_focus.output_preview
+            );
+        });
+    }
+
+    #[test]
+    fn coding_persona_can_enter_and_exit_focus_mode() {
+        with_test_home(|_| {
+            crate::context::set_persona(crate::PersonaKind::Coding);
+            set_tool_persona(crate::PersonaKind::Coding);
+            crate::context::clear_messages().expect("clear");
+
+            let enter_focus = execute_function_call(
+                &FunctionCall {
+                    call_id: "call_coding_focus_mode_enter".to_string(),
+                    name: "focus_mode".to_string(),
+                    arguments: r#"{"action":"enter","brief":"验证 Coding 自管 focus","task":"确认 Coding 可以进入专注模式"}"#.to_string(),
+                },
+                None,
+            );
+            let enter_output = extract_primary_tool_output_text(&enter_focus.output_items)
+                .expect("coding focus_mode enter output");
+            assert!(
+                enter_output.contains("Area: Task"),
+                "focus_mode enter should be callable for Coding"
+            );
+            assert!(
+                !enter_focus.output_preview.contains("focus_mode failed"),
+                "focus_mode enter unexpectedly failed: {}",
+                enter_focus.output_preview
+            );
+
+            let exit_focus = execute_function_call(
+                &FunctionCall {
+                    call_id: "call_coding_focus_mode_exit".to_string(),
+                    name: "focus_mode".to_string(),
+                    arguments: r#"{"action":"exit","brief":"验证 Coding 自管 focus","summary":"Coding 专注模式退出验证"}"#.to_string(),
+                },
+                None,
+            );
+            let exit_output = extract_primary_tool_output_text(&exit_focus.output_items)
+                .expect("coding focus_mode exit output");
+            assert!(
+                exit_output.contains("Area: Task"),
+                "focus_mode exit should be callable for Coding"
+            );
+            assert!(
+                !exit_focus.output_preview.contains("focus_mode failed"),
+                "focus_mode exit unexpectedly failed: {}",
+                exit_focus.output_preview
+            );
+        });
+    }
+
+    #[test]
+    fn focus_gate_allows_matrix_persona_manage_dispatch_after_plan() {
+        with_test_home(|_| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear");
+
+            execute_update_plan(
+                r#"{"plan":[{"step":"指挥 Coding 执行最小探针","status":"in_progress"}]}"#,
+            )
+            .expect("mark focus required");
+            assert!(
+                crate::context::focus_required_summary()
+                    .expect("focus summary")
+                    .is_some()
+            );
+
+            let dispatch = execute_function_call(
+                &FunctionCall {
+                    call_id: "call_persona_manage_send".to_string(),
+                    name: "persona_manage".to_string(),
+                    arguments: r#"{"action":"send","persona":"coding","brief":"T7 APK链路探针","message":"请执行最小 APK 链路探针并极短回报。"}"#.to_string(),
+                },
+                None,
+            );
+            let model_output = extract_primary_tool_output_text(&dispatch.output_items)
+                .expect("persona_manage model output");
+            assert!(
+                !model_output.contains("当前任务已列出计划"),
+                "persona_manage dispatch should not be blocked by focus gate: {model_output}"
+            );
+            assert!(
+                model_output.contains("persona_manage:queued"),
+                "persona_manage should queue the Coding task: {model_output}"
+            );
+        });
+    }
+
+    #[test]
+    fn update_plan_empty_or_all_completed_clears_focus_gate() {
+        with_test_home(|_| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear");
+
+            execute_update_plan(r#"{"plan":[{"step":"执行实战任务","status":"in_progress"}]}"#)
+                .expect("mark focus required");
+            assert!(
+                crate::context::focus_required_summary()
+                    .expect("focus summary")
+                    .is_some()
+            );
+
+            execute_update_plan(r#"{"plan":[]}"#).expect("clear with empty plan");
+            assert!(
+                crate::context::focus_required_summary()
+                    .expect("focus summary after empty")
+                    .is_none()
+            );
+
+            execute_update_plan(r#"{"plan":[{"step":"执行实战任务","status":"in_progress"}]}"#)
+                .expect("mark focus required again");
+            execute_update_plan(r#"{"plan":[{"step":"执行实战任务","status":"completed"}]}"#)
+                .expect("clear with completed plan");
+            assert!(
+                crate::context::focus_required_summary()
+                    .expect("focus summary after completed")
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn update_plan_decision_mode_does_not_force_focus_gate() {
+        with_test_home(|_| {
+            crate::context::set_persona(crate::PersonaKind::Matrix);
+            set_tool_persona(crate::PersonaKind::Matrix);
+            crate::context::clear_messages().expect("clear");
+
+            let execution = execute_update_plan(
+                r#"{
+                    "mode":"decision",
+                    "decision":"任务直白，直接做最小补丁并验证"
+                }"#,
+            )
+            .expect("decision plan");
+            assert_eq!(execution.brief, "任务直白，直接做最小补丁并验证");
+            assert!(execution.command_preview.contains("mode: Decision"));
+            assert!(
+                crate::context::focus_required_summary()
+                    .expect("focus summary")
+                    .is_none(),
+                "decision mode must not force focus gate"
+            );
         });
     }
 
@@ -9546,19 +23672,19 @@ mod tests {
     }
 
     #[test]
-    fn extract_function_call_restores_canonical_parallel_name() {
+    fn extract_function_call_keeps_provider_tool_name() {
         let value = json!({
             "type": "response.output_item.done",
             "item": {
                 "type": "function_call",
                 "call_id": "call_2",
-                "name": "multi_tool_use_parallel",
-                "arguments": "{\"tool_uses\":[]}"
+                "name": "pty_wait",
+                "arguments": "{\"name\":\"build-main\"}"
             }
         });
         let call = extract_function_call(&value).expect("function call");
         assert_eq!(call.call_id, "call_2");
-        assert_eq!(call.name, "multi_tool_use.parallel");
+        assert_eq!(call.name, "pty_wait");
     }
 
     #[test]
@@ -9574,15 +23700,32 @@ mod tests {
     }
 
     #[test]
-    fn resolve_command_output_budget_defaults_to_medium() {
+    fn describe_command_call_marks_ssh_target() {
+        let call = FunctionCall {
+            call_id: "call_ssh".to_string(),
+            name: "command".to_string(),
+            arguments: r#"{"cmd":"uptime","target":"ssh","brief":"检查远程负载"}"#.to_string(),
+        };
+        let display = describe_function_call(&call);
+        assert_eq!(display.kind_label, "Command · SSH");
+        assert_eq!(display.action_label, "Run");
+        assert_eq!(display.brief, "检查远程负载");
+        assert_eq!(display.command_preview, "ssh · uptime");
+    }
+
+    #[test]
+    fn resolve_command_output_budget_defaults_to_normal() {
         let budget = resolve_command_output_budget(
             CommandOutputLevel::Medium,
             &default_tool_output_settings(),
         )
         .expect("budget");
-        assert_eq!(budget.label, "medium (320 lines · 96000 chars)");
-        assert_eq!(budget.inline_lines, COMMAND_OUTPUT_LEVEL_MEDIUM_LINES);
-        assert_eq!(budget.inline_chars, COMMAND_OUTPUT_LEVEL_MEDIUM_CHARS);
+        let expected_chars = COMMAND_OUTPUT_LEVEL_MEDIUM_KB.saturating_mul(1024);
+        let expected_lines = (expected_chars / COMMAND_OUTPUT_BUDGET_CHARS_PER_LINE)
+            .clamp(TOOL_OUTPUT_LINES_MIN, TOOL_OUTPUT_LINES_MAX);
+        assert_eq!(budget.label, "normal (96 KB)");
+        assert_eq!(budget.inline_lines, expected_lines);
+        assert_eq!(budget.inline_chars, expected_chars);
     }
 
     #[test]
@@ -9592,17 +23735,25 @@ mod tests {
             &default_tool_output_settings(),
         )
         .expect("budget");
-        let reason = command_output_save_reason(2_000, 321, 2_000, &medium).expect("save reason");
-        assert_eq!(
-            reason.display_text(),
-            "selected budget: medium (320 lines · 96000 chars)"
-        );
+        let reason = command_output_save_reason(
+            2_000,
+            medium.inline_lines.saturating_add(1),
+            2_000,
+            &medium,
+        )
+        .expect("save reason");
+        assert_eq!(reason.display_text(), "selected budget: normal (96 KB)");
 
-        let char_reason =
-            command_output_save_reason(120_000, 100, 100_000, &medium).expect("char reason");
+        let char_reason = command_output_save_reason(
+            medium.inline_chars.saturating_add(1),
+            100,
+            medium.inline_chars.saturating_add(1),
+            &medium,
+        )
+        .expect("char reason");
         assert_eq!(
             char_reason.display_text(),
-            "selected budget: medium (320 lines · 96000 chars)"
+            "selected budget: normal (96 KB)"
         );
 
         let system_reason = command_output_save_reason(
@@ -9616,16 +23767,17 @@ mod tests {
     }
 
     #[test]
-    fn describe_write_stdin_call_uses_session_preview() {
+    fn describe_pty_wait_call_uses_selector_preview() {
         let call = FunctionCall {
-            call_id: "call_1".to_string(),
-            name: "write_stdin".to_string(),
-            arguments: r#"{"session_id":7,"chars":"pwd\n"}"#.to_string(),
+            call_id: "call_wait".to_string(),
+            name: "pty_wait".to_string(),
+            arguments: r#"{"name":"build-main","timeout_secs":15}"#.to_string(),
         };
         let display = describe_function_call(&call);
-        assert!(display.command_preview.contains("session 7"));
-        assert_eq!(display.brief, "继续操作终端");
-        assert_eq!(display.action_label, "注入中");
+        assert_eq!(display.brief, "等待终端结束");
+        assert_eq!(display.action_label, "等待中");
+        assert!(display.command_preview.contains("name=build-main"));
+        assert!(display.command_preview.contains("timeout=15s"));
     }
 
     #[test]
@@ -9654,7 +23806,7 @@ mod tests {
         let call = FunctionCall {
             call_id: "call_image".to_string(),
             name: "view_image".to_string(),
-            arguments: r#"{"path":"media/screenshots/Screenshot_demo.jpg"}"#.to_string(),
+            arguments: r#"{"path":"media/screenshot/Screenshot_demo.jpg"}"#.to_string(),
         };
         let display = describe_function_call(&call);
         assert_eq!(display.kind_label, "Image");
@@ -9662,96 +23814,7 @@ mod tests {
         assert_eq!(display.brief, "分析截图");
         assert_eq!(
             display.command_preview,
-            "./media/screenshots/Screenshot_demo.jpg"
-        );
-    }
-
-    #[test]
-    fn describe_parallel_tool_call_builds_explore_preview() {
-        let call = FunctionCall {
-            call_id: "call_parallel".to_string(),
-            name: "multi_tool_use.parallel".to_string(),
-            arguments: serde_json::json!({
-                "brief": "并行检查入口",
-                "tool_uses": [
-                    {
-                        "recipient_name": "functions.exec_command",
-                        "parameters": {
-                            "cmd": "rg -n \"render_tool_runs\" src/main.rs",
-                            "brief": "查找渲染入口"
-                        }
-                    },
-                    {
-                        "recipient_name": "functions.memory_read",
-                        "parameters": {
-                            "target": "datememory",
-                            "date": "2026-03-28",
-                            "brief": "读取今日记忆"
-                        }
-                    }
-                ]
-            })
-            .to_string(),
-        };
-        let display = describe_function_call(&call);
-        let payload = serde_json::from_str::<ParallelToolPreviewPayload>(&display.command_preview)
-            .expect("parallel payload");
-        assert_eq!(display.brief, "并行检查入口");
-        assert_eq!(display.kind_label, "Explore");
-        assert_eq!(payload.items.len(), 2);
-        assert_eq!(payload.items[0].action, "Search");
-        assert_eq!(payload.items[1].action, "Read");
-    }
-
-    #[test]
-    fn execute_parallel_tool_runs_children_concurrently() {
-        let previous = current_tool_persona();
-        set_tool_persona(crate::PersonaKind::Coding);
-        let call = FunctionCall {
-            call_id: "call_parallel".to_string(),
-            name: "multi_tool_use.parallel".to_string(),
-            arguments: serde_json::json!({
-                "brief": "并行读取",
-                "tool_uses": [
-                    {
-                        "recipient_name": "functions.exec_command",
-                        "parameters": {
-                            "cmd": "sleep 0.3; printf alpha",
-                            "brief": "读取 alpha"
-                        }
-                    },
-                    {
-                        "recipient_name": "functions.exec_command",
-                        "parameters": {
-                            "cmd": "sleep 0.3; printf beta",
-                            "brief": "读取 beta"
-                        }
-                    }
-                ]
-            })
-            .to_string(),
-        };
-        let started = Instant::now();
-        let execution = execute_function_call(&call, None);
-        set_tool_persona(previous);
-
-        let elapsed = started.elapsed();
-        let payload = serde_json::from_str::<ParallelToolPreviewPayload>(&execution.output_preview)
-            .expect("parallel payload");
-        let model_output = execution
-            .output_items
-            .first()
-            .and_then(|item| item.get("output"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-
-        assert_eq!(payload.items.len(), 2);
-        assert!(model_output.contains("alpha"));
-        assert!(model_output.contains("beta"));
-        assert!(
-            elapsed < Duration::from_millis(1500),
-            "parallel call ran too long: {elapsed:?}"
+            "./media/screenshot/Screenshot_demo.jpg"
         );
     }
 
@@ -9780,6 +23843,38 @@ mod tests {
                 .command_preview
                 .contains("[in_progress] 接入 update_plan 执行链路")
         );
+    }
+
+    #[test]
+    fn describe_update_plan_call_clamps_large_blueprint_preview() {
+        let plan = (0..20)
+            .map(|idx| {
+                serde_json::json!({
+                    "step": format!("步骤 {idx}"),
+                    "status": if idx == 0 { "in_progress" } else { "pending" },
+                })
+            })
+            .collect::<Vec<_>>();
+        let blueprint = (0..16)
+            .map(|idx| format!("蓝图行 {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let call = FunctionCall {
+            call_id: "call_plan_big".to_string(),
+            name: "update_plan".to_string(),
+            arguments: serde_json::json!({
+                "mode": "blueprint",
+                "blueprint": blueprint,
+                "plan": plan,
+            })
+            .to_string(),
+        };
+
+        let display = describe_function_call(&call);
+        assert!(display.command_preview.contains("Blueprint · 20 steps"));
+        assert!(display.command_preview.contains("另有 8 行蓝图已折叠"));
+        assert!(display.command_preview.contains("[folded] 另有 8 步已折叠"));
+        assert!(!display.command_preview.contains("[pending] 步骤 19"));
     }
 
     #[test]
@@ -10019,21 +24114,6 @@ mod tests {
     }
 
     #[test]
-    fn command_output_dirs_route_special_exports_to_dedicated_folders() {
-        with_test_home(|home_root| {
-            let project_root = home_root.join(PROJECTYING_REL_PATH);
-            assert_eq!(
-                command_output_dir_for_family(ExecCommandFamily::Adb),
-                project_root.join(COMMAND_OUTPUT_ADB_REL_PATH)
-            );
-            assert_eq!(
-                command_output_dir_for_family(ExecCommandFamily::TermuxApi),
-                project_root.join(COMMAND_OUTPUT_TERMUX_API_REL_PATH)
-            );
-        });
-    }
-
-    #[test]
     fn parse_codex_patch_accepts_update_add_delete_and_move() {
         let patch = "\
 *** Begin Patch
@@ -10223,14 +24303,14 @@ mod tests {
     fn resolve_view_image_path_directory_picks_latest_image_file() {
         with_test_home(|home_root| {
             let project_root = home_root.join(PROJECTYING_REL_PATH);
-            let shots = project_root.join("media/screenshots");
-            fs::create_dir_all(&shots).expect("create screenshots dir");
+            let shots = project_root.join("media/screenshot");
+            fs::create_dir_all(&shots).expect("create screenshot dir");
             fs::write(shots.join("a.png"), []).expect("write first image");
             std::thread::sleep(std::time::Duration::from_millis(5));
             let latest = shots.join("b.png");
             fs::write(&latest, []).expect("write second image");
             let resolved =
-                resolve_view_image_path("media/screenshots", project_root.as_path()).expect("path");
+                resolve_view_image_path("media/screenshot", project_root.as_path()).expect("path");
             assert_eq!(
                 resolved,
                 fs::canonicalize(latest).expect("canonical latest")
@@ -10335,13 +24415,13 @@ mod tests {
             terminal::TerminalMode::Interactive
         );
         assert_eq!(
-            classify_tty_mode("tail -f log/runtime.txt"),
+            classify_tty_mode("tail -f Aidebug/events.jsonl"),
             terminal::TerminalMode::Interactive
         );
     }
 
     #[test]
-    fn summarize_command_output_archives_large_text_to_historytools_preview() {
+    fn summarize_command_output_archives_large_text_to_toolmemory_preview() {
         with_test_home(|_| {
             let text = (0..340)
                 .map(|index| format!("line-{index}"))
@@ -10360,11 +24440,46 @@ mod tests {
                 ExecCommandFamily::Generic,
             )
             .expect("summary");
-            assert!(summary.model_preview.contains("HistoryTools archived"));
+            assert!(summary.model_preview.contains("Tool output truncated"));
             assert!(summary.model_preview.contains("entry_id=123"));
+            assert!(
+                summary
+                    .model_preview
+                    .contains("memory_check target=toolmemory entry_id=123")
+            );
             assert_eq!(
                 summary.save_reason.as_deref(),
-                Some("selected budget: medium (320 lines · 96000 chars)")
+                Some("selected budget: normal (96 KB)")
+            );
+        });
+    }
+
+    #[test]
+    fn exec_command_model_output_uses_toolmemory_entry_label() {
+        with_test_home(|_| {
+            let tool = execute_exec_command(
+                "call_exec_label",
+                r#"{"cmd":"printf 'line-1\nline-2'","output_level":"low"}"#,
+            )
+            .expect("exec command");
+            assert!(tool.model_output.contains("ToolMemory entry_id:"));
+            assert!(!tool.model_output.contains("HistoryTools entry_id:"));
+        });
+    }
+
+    #[test]
+    fn exec_command_small_output_keeps_toolmemory_but_not_externalized() {
+        with_test_home(|_| {
+            let tool = execute_exec_command(
+                "call_exec_inline",
+                r#"{"cmd":"printf 'ok'","output_level":"low"}"#,
+            )
+            .expect("exec command");
+            assert!(tool.toolmemory_entry_id.is_some());
+            assert!(tool.archived_output.is_none());
+            assert!(
+                tool.model_output
+                    .contains("Output archive reason: (not archived)")
             );
         });
     }
@@ -10394,7 +24509,7 @@ mod tests {
     #[test]
     fn summarize_command_output_high_mode_respects_char_budget() {
         with_test_home(|_| {
-            let text = "x".repeat(COMMAND_OUTPUT_LEVEL_HIGH_CHARS + 1);
+            let text = "x".repeat(COMMAND_OUTPUT_SYSTEM_INLINE_MAX_BYTES + 1);
             let budget = resolve_command_output_budget(
                 CommandOutputLevel::High,
                 &default_tool_output_settings(),
@@ -10408,11 +24523,109 @@ mod tests {
                 ExecCommandFamily::Generic,
             )
             .expect("summary");
-            assert!(summary.model_preview.contains("HistoryTools archived"));
-            assert_eq!(
-                summary.save_reason.as_deref(),
-                Some("selected budget: high (520 lines · 156000 chars)")
+            assert!(summary.model_preview.contains("Tool output truncated"));
+            assert!(
+                summary
+                    .save_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("system safety cap"))
             );
+        });
+    }
+
+    #[test]
+    fn default_tool_budget_clamps_non_exec_outputs_and_archives_full_text() {
+        with_test_home(|home_root| {
+            let config_dir = home_root.join(PROJECTYING_REL_PATH).join("config/matrix");
+            fs::create_dir_all(&config_dir).expect("create config dir");
+            fs::write(
+                config_dir.join("context.json"),
+                r#"{"default_tool_output_level":"low"}"#,
+            )
+            .expect("write context config");
+
+            let text = (0..170)
+                .map(|index| format!("line-{index}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let call = FunctionCall {
+                call_id: "call_memory".to_string(),
+                name: "memory_read".to_string(),
+                arguments: "{}".to_string(),
+            };
+            let execution = apply_default_tool_output_budget(
+                &call,
+                ExecutedFunctionCall {
+                    output_items: build_tool_output_items(
+                        call.call_id.as_str(),
+                        text.clone(),
+                        Vec::new(),
+                    ),
+                    brief: "读取记忆".to_string(),
+                    kind_label: "Memory".to_string(),
+                    action_label: "Read".to_string(),
+                    command_preview: None,
+                    output_preview: text.clone(),
+                    exit_code: None,
+                    toolmemory_entry_id: None,
+                    archived_output: None,
+                },
+            );
+
+            let primary_output =
+                extract_primary_tool_output_text(&execution.output_items).expect("primary output");
+            assert!(primary_output.contains("[Tool output truncated"));
+            assert!(execution.output_preview.contains("[Tool output truncated"));
+            assert!(primary_output.contains("memory_check target=toolmemory"));
+            assert!(execution.toolmemory_entry_id.is_some());
+            assert_eq!(execution.archived_output.as_deref(), Some(text.as_str()));
+        });
+    }
+
+    #[test]
+    fn default_tool_budget_skips_exec_command_family_outputs() {
+        with_test_home(|home_root| {
+            let config_dir = home_root.join(PROJECTYING_REL_PATH).join("config/matrix");
+            fs::create_dir_all(&config_dir).expect("create config dir");
+            fs::write(
+                config_dir.join("context.json"),
+                r#"{"default_tool_output_level":"low"}"#,
+            )
+            .expect("write context config");
+
+            let text = (0..170)
+                .map(|index| format!("line-{index}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let call = FunctionCall {
+                call_id: "call_exec".to_string(),
+                name: "exec_command".to_string(),
+                arguments: r#"{"cmd":"printf test","output_level":"high"}"#.to_string(),
+            };
+            let execution = apply_default_tool_output_budget(
+                &call,
+                ExecutedFunctionCall {
+                    output_items: build_tool_output_items(
+                        call.call_id.as_str(),
+                        text.clone(),
+                        Vec::new(),
+                    ),
+                    brief: "执行命令".to_string(),
+                    kind_label: "Command".to_string(),
+                    action_label: "Run".to_string(),
+                    command_preview: Some("printf test".to_string()),
+                    output_preview: text.clone(),
+                    exit_code: Some(0),
+                    toolmemory_entry_id: None,
+                    archived_output: None,
+                },
+            );
+
+            let primary_output =
+                extract_primary_tool_output_text(&execution.output_items).expect("primary output");
+            assert_eq!(primary_output, text);
+            assert_eq!(execution.output_preview, text);
+            assert!(execution.archived_output.is_none());
         });
     }
 
@@ -10421,7 +24634,7 @@ mod tests {
         with_test_home(|home_root| {
             let dir = home_root
                 .join(PROJECTYING_REL_PATH)
-                .join("log/retention-test");
+                .join("memory/output/retention-test");
             fs::create_dir_all(&dir).expect("create retention dir");
             fs::write(dir.join("a.log"), "a").expect("write a.log");
             fs::write(dir.join("a.status"), "a").expect("write a.status");
@@ -10441,21 +24654,14 @@ mod tests {
     #[test]
     fn prepare_output_dirs_create_adb_and_termux_subdirs() {
         with_test_home(|home_root| {
-            prepare_command_output_dir().expect("prepare command outputs");
             prepare_terminal_output_dir().expect("prepare terminal outputs");
-            let project_root = home_root.join(PROJECTYING_REL_PATH);
-            assert!(project_root.join(COMMAND_OUTPUT_REL_PATH).exists());
-            assert!(project_root.join(COMMAND_OUTPUT_ADB_REL_PATH).exists());
+            assert!(crate::app_output_terminal_dir().exists());
+            assert!(crate::app_output_terminal_adb_dir().exists());
+            assert!(crate::app_output_terminal_termuxapi_dir().exists());
             assert!(
-                project_root
-                    .join(COMMAND_OUTPUT_TERMUX_API_REL_PATH)
-                    .exists()
-            );
-            assert!(project_root.join("log/terminaloutput").exists());
-            assert!(project_root.join("log/terminaloutput/adboutput").exists());
-            assert!(
-                project_root
-                    .join("log/terminaloutput/termuxapioutput")
+                !home_root
+                    .join(PROJECTYING_REL_PATH)
+                    .join("memory/output/command")
                     .exists()
             );
         });
@@ -10482,18 +24688,18 @@ pub mod terminal {
     // terminal（PTY 运行时；内嵌于 mcp.rs）
     //
     // 职责：
-    // - 统一管理 tty=true 的真实 PTY 会话：启动/输出/结束/日志
+    // - 统一管理显式 PTY 工具与兼容层遗留 PTY 会话：启动/输出/结束/日志
     // - 支持两种模式：
     //   - Background：默认隐藏，仅写日志与回传 Done 摘要
-    //   - Interactive：显示面板，可继续 write_stdin 交互
+    //   - Interactive：显示面板，主路径继续 pty_input 交互
     //
     // 上游：
-    // - mcp.rs：解析 exec_command(tty=true) / write_stdin / pty_kill 并调用 terminal::spawn/...
+    // - mcp.rs：解析 pty_run / pty_input / pty_wait / pty_kill；exec_command(tty=true) 只作内部兼容
     // - main.rs：消费 TerminalEvent，驱动 UI 状态与消息回执
     //
     // 下游：
     // - portable_pty：真实 PTY
-    // - 文件系统：`ProjectYing/log/terminaloutput/*`
+    // - 文件系统：`ProjectYing/memory/output/terminal/*`
     //
     // 多源（SSOT）约定：
     // - Done 摘要的截断/预览规则只在这里定义，main 只展示结果。
@@ -10512,19 +24718,16 @@ pub mod terminal {
     use anyhow::{Context, Result, anyhow};
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use serde_json::{Value, json};
 
-    const TERMINAL_LOG_REL_PATH: &str = "log/terminaloutput";
-    const TERMINAL_ADB_LOG_REL_PATH: &str = "log/terminaloutput/adboutput";
-    const TERMINAL_TERMUX_API_LOG_REL_PATH: &str = "log/terminaloutput/termuxapioutput";
-    const LEGACY_TERMINAL_LOG_REL_PATH: &str = "log/terminal";
+    #[cfg(test)]
+    const TERMINAL_LOG_REL_PATH: &str = "memory/output/terminal";
+    #[cfg(test)]
+    const TERMINAL_ADB_LOG_REL_PATH: &str = "memory/output/terminal/adb";
+    #[cfg(test)]
+    const TERMINAL_TERMUX_API_LOG_REL_PATH: &str = "memory/output/terminal/termux-api";
     const TERMINAL_OUTPUT_TAIL_MAX_CHARS: usize = 120_000;
-    const TERMINAL_MODEL_PREVIEW_MAX_CHARS: usize = 20_000;
     const TERMINAL_SCROLLBACK_MAX: u16 = 20_000;
-    const TERMINAL_LOG_PREVIEW_MAX_LINES: usize = super::COMMAND_OUTPUT_LEVEL_LOW_LINES;
-    const TERMINAL_LOG_PREVIEW_MAX_CHARS: usize = 8_000;
-    const TERMINAL_DONE_PREVIEW_HEAD_LINES: usize = 20;
-    const TERMINAL_DONE_PREVIEW_TAIL_LINES: usize = 20;
-    const TERMINAL_DONE_PREVIEW_MAX_CHARS: usize = 6_000;
     const TERMINAL_LOG_SMALL_READ_MAX_BYTES: u64 = 128 * 1024;
     const TERMINAL_LOG_EDGE_READ_BYTES: u64 = 32 * 1024;
     const DEFAULT_YIELD_TIME_MS: u64 = 320;
@@ -10564,6 +24767,7 @@ pub mod terminal {
     #[derive(Debug, Clone)]
     pub enum TerminalEvent {
         Ready {
+            persona: crate::PersonaKind,
             session_id: u64,
             call_id: Option<String>,
             brief: String,
@@ -10576,15 +24780,18 @@ pub mod terminal {
             owner: TerminalOwner,
         },
         Spawned {
+            persona: crate::PersonaKind,
             session_id: u64,
             pid: Option<i32>,
             pgrp: Option<i32>,
         },
         Output {
+            persona: crate::PersonaKind,
             session_id: u64,
             bytes: Vec<u8>,
         },
         Done {
+            persona: crate::PersonaKind,
             session_id: u64,
             brief: String,
             _cmd: String,
@@ -10601,19 +24808,37 @@ pub mod terminal {
             owner: TerminalOwner,
         },
         DoneReport {
+            persona: crate::PersonaKind,
             session_id: u64,
             tool_text: String,
         },
         SnapshotReport {
+            persona: crate::PersonaKind,
             session_id: u64,
             tool_text: String,
         },
     }
 
+    impl TerminalEvent {
+        pub fn persona(&self) -> crate::PersonaKind {
+            match self {
+                TerminalEvent::Ready { persona, .. }
+                | TerminalEvent::Spawned { persona, .. }
+                | TerminalEvent::Output { persona, .. }
+                | TerminalEvent::Done { persona, .. }
+                | TerminalEvent::DoneReport { persona, .. }
+                | TerminalEvent::SnapshotReport { persona, .. } => *persona,
+            }
+        }
+    }
+
     #[derive(Debug, Clone)]
     pub struct ExecRequest {
         pub call_id: Option<String>,
+        pub name: Option<String>,
         pub cmd: String,
+        pub display_cmd: Option<String>,
+        pub env_overrides: Vec<(String, String)>,
         pub brief: String,
         pub workdir: PathBuf,
         pub shell: PathBuf,
@@ -10623,14 +24848,21 @@ pub mod terminal {
         pub report_interval_secs: Option<u64>,
         pub mode: TerminalMode,
         pub owner: TerminalOwner,
+        pub auto_report_events: bool,
+        pub persona: crate::PersonaKind,
     }
 
     #[derive(Debug, Clone)]
-    pub struct WriteStdinRequest {
+    pub struct InputRequest {
         pub session_id: u64,
         pub chars: String,
         pub yield_time_ms: Option<u64>,
-        pub max_output_tokens: Option<usize>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct WaitRequest {
+        pub session_id: u64,
+        pub timeout_secs: Option<u64>,
     }
 
     #[derive(Debug, Clone)]
@@ -10643,7 +24875,9 @@ pub mod terminal {
 
     #[derive(Debug, Clone)]
     pub struct SessionSnapshot {
+        pub persona: crate::PersonaKind,
         pub session_id: u64,
+        pub name: Option<String>,
         pub brief: String,
         pub cmd: String,
         pub workdir: String,
@@ -10654,6 +24888,7 @@ pub mod terminal {
         pub pgrp: Option<i32>,
         pub output_bytes: usize,
         pub output_lines: usize,
+        pub output_chars: usize,
         pub output_tail: String,
         pub running: bool,
         pub exit_code: Option<i32>,
@@ -10662,6 +24897,7 @@ pub mod terminal {
         pub suppressed_done: bool,
         pub mode: TerminalMode,
         pub owner: TerminalOwner,
+        pub auto_report_events: bool,
     }
 
     #[derive(Debug, Clone)]
@@ -10673,7 +24909,9 @@ pub mod terminal {
 
     #[derive(Debug)]
     struct SessionShared {
+        persona: crate::PersonaKind,
         session_id: u64,
+        name: Option<String>,
         brief: String,
         cmd: String,
         workdir: String,
@@ -10684,6 +24922,7 @@ pub mod terminal {
         pgrp: Option<i32>,
         output_bytes: usize,
         output_lines: usize,
+        output_chars: usize,
         output_tail: String,
         running: bool,
         exit_code: Option<i32>,
@@ -10692,6 +24931,7 @@ pub mod terminal {
         suppressed_done: bool,
         mode: TerminalMode,
         owner: TerminalOwner,
+        auto_report_events: bool,
         ctrl_tx: mpsc::Sender<TerminalControl>,
     }
 
@@ -11093,6 +25333,47 @@ pub mod terminal {
             .and_then(|guard| guard.get(&session_id).cloned())
     }
 
+    pub fn resolve_session_selector(
+        session_id: Option<u64>,
+        pid: Option<i32>,
+        name: Option<&str>,
+    ) -> Result<u64> {
+        if let Some(session_id) = session_id {
+            return snapshot_session(session_id)
+                .map(|_| session_id)
+                .ok_or_else(|| anyhow!("session {session_id} 不存在或已清理"));
+        }
+        if let Some(pid) = pid {
+            let mut matches = find_session_ids(|snapshot| snapshot.pid == Some(pid));
+            matches.sort_unstable();
+            matches.dedup();
+            return match matches.as_slice() {
+                [session_id] => Ok(*session_id),
+                [] => Err(anyhow!("找不到 pid={pid} 对应的 PTY 会话")),
+                _ => Err(anyhow!("pid={pid} 命中了多个 PTY 会话，请改用 session_id")),
+            };
+        }
+        if let Some(name) = name.map(str::trim).filter(|value| !value.is_empty()) {
+            let mut matches = find_session_ids(|snapshot| {
+                snapshot
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(name))
+            });
+            matches.sort_unstable();
+            matches.dedup();
+            return match matches.as_slice() {
+                [session_id] => Ok(*session_id),
+                [] => Err(anyhow!("找不到 name={name} 对应的 PTY 会话")),
+                _ => Err(anyhow!(
+                    "name={name} 命中了多个 PTY 会话，请改用 session_id"
+                )),
+            };
+        }
+        Err(anyhow!("需要 session_id / pid / name 之一"))
+    }
+
     // =============================================================================
     // 会话创建站：拉起 PTY、接管输出、等待子进程结束
     // =============================================================================
@@ -11100,12 +25381,23 @@ pub mod terminal {
     pub fn exec_background_command(req: ExecRequest) -> Result<ToolReply> {
         fs::create_dir_all(terminal_log_dir_for_cmd(req.cmd.as_str()))
             .context("创建 terminal 日志目录失败")?;
+        let display_cmd = req.display_cmd.clone().unwrap_or_else(|| req.cmd.clone());
         let running_sessions = REGISTRY
             .get_or_init(|| Mutex::new(BTreeMap::new()))
             .lock()
             .map(|guard| guard.len())
             .unwrap_or(0);
         if running_sessions >= MAX_RUNNING_TERMINALS {
+            write_terminal_scheduler_event(
+                "scheduler.task.skipped",
+                "terminal:capacity".to_string(),
+                json!({
+                    "reason": "max_running_terminals",
+                    "running_sessions": running_sessions,
+                    "max_running_terminals": MAX_RUNNING_TERMINALS,
+                    "payload_policy": "replace_not_stack",
+                }),
+            );
             return Err(anyhow!(
                 "Terminal 同时运行上限为 {MAX_RUNNING_TERMINALS}，请先结束部分会话"
             ));
@@ -11149,6 +25441,9 @@ pub mod terminal {
         builder.env("LANG", "C.UTF-8");
         builder.env("LC_ALL", "C.UTF-8");
         builder.env("TERM_PROGRAM", "ProjectYing");
+        for (key, value) in &req.env_overrides {
+            builder.env(key, value);
+        }
 
         let child = pair
             .slave
@@ -11174,9 +25469,11 @@ pub mod terminal {
         let exit_code_seen = Arc::new(Mutex::new(None::<i32>));
 
         let shared = Arc::new(Mutex::new(SessionShared {
+            persona: req.persona,
             session_id,
+            name: req.name.clone(),
             brief: req.brief.clone(),
-            cmd: req.cmd.clone(),
+            cmd: display_cmd.clone(),
             workdir: path_str(&req.workdir),
             saved_path: saved_path.to_string_lossy().to_string(),
             status_path: status_path.to_string_lossy().to_string(),
@@ -11185,6 +25482,7 @@ pub mod terminal {
             pgrp,
             output_bytes: 0,
             output_lines: 0,
+            output_chars: 0,
             output_tail: String::new(),
             running: true,
             exit_code: None,
@@ -11193,14 +25491,16 @@ pub mod terminal {
             suppressed_done: false,
             mode: req.mode,
             owner: req.owner,
+            auto_report_events: req.auto_report_events,
             ctrl_tx: ctrl_tx.clone(),
         }));
         insert_running_session(shared.clone());
         emit_event(TerminalEvent::Ready {
+            persona: req.persona,
             session_id,
             call_id: req.call_id.clone(),
             brief: req.brief.clone(),
-            cmd: req.cmd.clone(),
+            cmd: display_cmd.clone(),
             cols,
             rows,
             saved_path: saved_path.to_string_lossy().to_string(),
@@ -11209,6 +25509,7 @@ pub mod terminal {
             owner: req.owner,
         });
         emit_event(TerminalEvent::Spawned {
+            persona: req.persona,
             session_id,
             pid,
             pgrp,
@@ -11218,6 +25519,27 @@ pub mod terminal {
             "running",
             shared.lock().ok().as_deref(),
             None,
+        );
+        write_terminal_scheduler_event(
+            "scheduler.task.started",
+            terminal_scheduler_dedupe_key(session_id),
+            json!({
+                "task": "terminal",
+                "persona": req.persona.context_dir_name(),
+                "session_id": session_id,
+                "call_id": req.call_id.as_deref(),
+                "name": req.name.as_deref(),
+                "brief": req.brief.as_str(),
+                "cmd_preview": truncate_with_ellipsis(clean_cmd(display_cmd.as_str()).as_str(), 240),
+                "mode": terminal_mode_label(req.mode),
+                "owner": req.owner.label(),
+                "deadline_ms": terminal_scheduler_deadline_ms(req.timeout_secs),
+                "timeout_secs": req.timeout_secs,
+                "report_interval_secs": req.report_interval_secs,
+                "log": saved_path.to_string_lossy(),
+                "status_file": status_path.to_string_lossy(),
+                "payload_policy": "replace_not_stack",
+            }),
         );
 
         let done_for_ctrl = done.clone();
@@ -11306,7 +25628,9 @@ pub mod terminal {
             });
         }
 
-        if let Some(report_interval_secs) = req.report_interval_secs.filter(|value| *value > 0) {
+        if req.auto_report_events
+            && let Some(report_interval_secs) = req.report_interval_secs.filter(|value| *value > 0)
+        {
             let shared_for_report = shared.clone();
             let done_for_report = done.clone();
             thread::spawn(move || {
@@ -11325,7 +25649,13 @@ pub mod terminal {
                     if !snapshot.running {
                         break;
                     }
+                    write_terminal_scheduler_event(
+                        "scheduler.task.progress",
+                        terminal_scheduler_dedupe_key(session_id),
+                        terminal_scheduler_snapshot_payload(&snapshot),
+                    );
                     emit_event(TerminalEvent::SnapshotReport {
+                        persona: snapshot.persona,
                         session_id,
                         tool_text: format_progress_report_text(&snapshot),
                     });
@@ -11335,7 +25665,11 @@ pub mod terminal {
 
         let shared_for_reader = shared.clone();
         let req_brief = req.brief.clone();
-        let req_cmd = req.cmd.clone();
+        let req_cmd = display_cmd.clone();
+        let req_name = req.name.clone();
+        let req_mode = req.mode;
+        let req_owner = req.owner;
+        let req_auto_report_events = req.auto_report_events;
         let saved_path_clone = saved_path.clone();
         let status_path_clone = status_path.clone();
         let done_for_reader = done.clone();
@@ -11364,6 +25698,7 @@ pub mod terminal {
                         }
                         update_session_output(&shared_for_reader, &chunk);
                         emit_event(TerminalEvent::Output {
+                            persona: req.persona,
                             session_id,
                             bytes: chunk,
                         });
@@ -11422,7 +25757,9 @@ pub mod terminal {
                 .ok()
                 .map(|state| snapshot_from_shared(&state))
                 .unwrap_or(SessionSnapshot {
+                    persona: req.persona,
                     session_id,
+                    name: req_name.clone(),
                     brief: req_brief.clone(),
                     cmd: req_cmd.clone(),
                     workdir: String::new(),
@@ -11433,20 +25770,28 @@ pub mod terminal {
                     pgrp: None,
                     output_bytes: 0,
                     output_lines: 0,
+                    output_chars: 0,
                     output_tail: String::new(),
                     running: false,
                     exit_code: Some(exit_code),
                     timed_out: timed_out_for_reader.load(Ordering::Relaxed),
                     user_exit: user_exit_for_reader.load(Ordering::Relaxed),
                     suppressed_done: false,
-                    mode: req.mode,
-                    owner: req.owner,
+                    mode: req_mode,
+                    owner: req_owner,
+                    auto_report_events: req_auto_report_events,
                 });
             move_to_finished(snapshot.clone());
             remove_running_session(session_id);
             let finished_dir = terminal_log_dir_for_cmd(snapshot.cmd.as_str());
             prune_terminal_log_dir(finished_dir.as_path());
+            write_terminal_scheduler_event(
+                terminal_scheduler_done_event_name(&snapshot),
+                terminal_scheduler_dedupe_key(session_id),
+                terminal_scheduler_snapshot_payload(&snapshot),
+            );
             emit_event(TerminalEvent::Done {
+                persona: snapshot.persona,
                 session_id,
                 brief: req_brief,
                 _cmd: req_cmd,
@@ -11462,8 +25807,9 @@ pub mod terminal {
                 mode: snapshot.mode,
                 owner: snapshot.owner,
             });
-            if !snapshot.suppressed_done {
+            if snapshot.auto_report_events && !snapshot.suppressed_done {
                 emit_event(TerminalEvent::DoneReport {
+                    persona: snapshot.persona,
                     session_id,
                     tool_text: format_done_report_text(&snapshot),
                 });
@@ -11475,9 +25821,11 @@ pub mod terminal {
             thread::sleep(Duration::from_millis(wait_ms));
         }
         let mut snapshot = snapshot_session(session_id).unwrap_or_else(|| SessionSnapshot {
+            persona: req.persona,
             session_id,
+            name: req.name.clone(),
             brief: req.brief.clone(),
-            cmd: req.cmd.clone(),
+            cmd: display_cmd.clone(),
             workdir: path_str(&req.workdir),
             saved_path: saved_path.to_string_lossy().to_string(),
             status_path: status_path.to_string_lossy().to_string(),
@@ -11486,15 +25834,24 @@ pub mod terminal {
             pgrp,
             output_bytes: 0,
             output_lines: 0,
+            output_chars: 0,
             output_tail: String::new(),
             running: true,
             exit_code: None,
             timed_out: false,
             user_exit: false,
             suppressed_done: false,
-            mode: req.mode,
-            owner: req.owner,
+            mode: req_mode,
+            owner: req_owner,
+            auto_report_events: req_auto_report_events,
         });
+        if !req.auto_report_events {
+            snapshot.running = true;
+            snapshot.exit_code = None;
+            snapshot.timed_out = false;
+            snapshot.user_exit = false;
+            return Ok(format_pty_start_reply(snapshot));
+        }
         if req.mode == TerminalMode::Background {
             snapshot.running = true;
             snapshot.exit_code = None;
@@ -11511,24 +25868,59 @@ pub mod terminal {
     }
 
     // =============================================================================
-    // 控制塔：stdin 写入、会话列举、kill、尺寸与键盘输入桥
+    // 控制塔：会话列举、kill、尺寸与键盘输入桥
     // =============================================================================
 
-    pub fn write_stdin(req: WriteStdinRequest) -> Result<ToolReply> {
+    pub fn input_session(req: InputRequest) -> Result<ToolReply> {
         if !req.chars.is_empty() {
             send_input_bytes(req.session_id, req.chars.as_bytes().to_vec())
                 .with_context(|| format!("session {} 不存在或已结束", req.session_id))?;
         }
-        let wait_ms = req.yield_time_ms.unwrap_or(DEFAULT_YIELD_TIME_MS).min(1500);
+        let wait_ms = req.yield_time_ms.unwrap_or(DEFAULT_YIELD_TIME_MS).min(1200);
         if wait_ms > 0 {
             thread::sleep(Duration::from_millis(wait_ms));
         }
-        let mut snapshot = snapshot_session(req.session_id)
+        let snapshot = snapshot_session(req.session_id)
             .with_context(|| format!("session {} 不存在或已结束", req.session_id))?;
-        if let Some(limit) = req.max_output_tokens.filter(|value| *value > 0) {
-            snapshot.output_tail = truncate_tail(&snapshot.output_tail, limit.saturating_mul(4));
+        Ok(format_pty_input_reply(&req, snapshot))
+    }
+
+    pub fn wait_session(req: WaitRequest) -> Result<ToolReply> {
+        let started = Instant::now();
+        let timeout_secs = req.timeout_secs.unwrap_or(0);
+        let dedupe_key = format!("pty_wait:{}", req.session_id);
+        write_terminal_scheduler_event(
+            "scheduler.task.started",
+            dedupe_key.clone(),
+            json!({
+                "task": "pty_wait",
+                "session_id": req.session_id,
+                "deadline_ms": timeout_secs.saturating_mul(1000),
+                "timeout_secs": req.timeout_secs,
+                "payload_policy": "replace_not_stack",
+            }),
+        );
+        loop {
+            let snapshot = snapshot_session(req.session_id)
+                .with_context(|| format!("session {} 不存在或已结束", req.session_id))?;
+            if !snapshot.running {
+                write_terminal_scheduler_event(
+                    "scheduler.task.done",
+                    dedupe_key,
+                    terminal_scheduler_snapshot_payload(&snapshot),
+                );
+                return Ok(format_pty_wait_done_reply(&req, snapshot));
+            }
+            if timeout_secs > 0 && started.elapsed().as_secs() >= timeout_secs {
+                write_terminal_scheduler_event(
+                    "scheduler.task.timeout",
+                    dedupe_key,
+                    terminal_scheduler_snapshot_payload(&snapshot),
+                );
+                return Ok(format_pty_wait_running_reply(&req, snapshot));
+            }
+            thread::sleep(Duration::from_millis(120));
         }
-        Ok(format_write_reply(&req, snapshot))
     }
 
     pub fn spawn_user_terminal() -> Result<ToolReply> {
@@ -11536,7 +25928,10 @@ pub mod terminal {
         let workdir = std::env::current_dir().unwrap_or_else(|_| super::projectying_root());
         exec_background_command(ExecRequest {
             call_id: None,
+            name: None,
             cmd: format!("{shell} -i"),
+            display_cmd: None,
+            env_overrides: Vec::new(),
             brief: "用户终端".to_string(),
             workdir,
             shell: PathBuf::from(shell.clone()),
@@ -11546,6 +25941,8 @@ pub mod terminal {
             report_interval_secs: None,
             mode: TerminalMode::Interactive,
             owner: TerminalOwner::UserLaunched,
+            auto_report_events: true,
+            persona: super::current_tool_persona(),
         })
     }
 
@@ -11585,6 +25982,13 @@ pub mod terminal {
                 pgrp,
                 age
             ));
+            if let Some(name) = snapshot
+                .name
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                lines.push(format!("name: {}", truncate_with_ellipsis(name.trim(), 96)));
+            }
             lines.push(format!("brief: {}", snapshot.brief));
             lines.push(format!(
                 "cmd: {}",
@@ -11592,13 +25996,12 @@ pub mod terminal {
             ));
             lines.push(format!("cwd: {}", snapshot.workdir));
             lines.push(format!("log: {}", snapshot.saved_path));
-            lines.push(format!("status_file: {}", snapshot.status_path));
             lines.push(format!(
-                "stats: {} | {} bytes | {} lines",
-                format_bytes_short(snapshot.output_bytes),
-                snapshot.output_bytes,
-                snapshot.output_lines
+                "log_name: {}",
+                log_file_name(snapshot.saved_path.as_str())
             ));
+            lines.push(format!("status_file: {}", snapshot.status_path));
+            lines.push(format!("stats: {}", format_terminal_stats(&snapshot)));
             if !preview.trim().is_empty() {
                 lines.push("preview:".to_string());
                 lines.extend(preview.lines().map(str::to_string));
@@ -11994,12 +26397,100 @@ pub mod terminal {
         }
     }
 
+    fn terminal_scheduler_dedupe_key(session_id: u64) -> String {
+        format!("terminal:{session_id}")
+    }
+
+    fn terminal_scheduler_deadline_ms(timeout_secs: Option<u64>) -> u64 {
+        timeout_secs
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .saturating_mul(1000)
+    }
+
+    fn terminal_scheduler_done_event_name(snapshot: &SessionSnapshot) -> &'static str {
+        if snapshot.timed_out {
+            "scheduler.task.timeout"
+        } else if snapshot.user_exit {
+            "scheduler.task.cancelled"
+        } else {
+            "scheduler.task.done"
+        }
+    }
+
+    fn terminal_mode_label(mode: TerminalMode) -> &'static str {
+        match mode {
+            TerminalMode::Background => "background",
+            TerminalMode::Interactive => "interactive",
+        }
+    }
+
+    fn terminal_scheduler_snapshot_payload(snapshot: &SessionSnapshot) -> Value {
+        json!({
+            "task": "terminal",
+            "persona": snapshot.persona.context_dir_name(),
+            "session_id": snapshot.session_id,
+            "name": snapshot.name.as_deref(),
+            "brief": snapshot.brief.as_str(),
+            "cmd_preview": truncate_with_ellipsis(clean_cmd(snapshot.cmd.as_str()).as_str(), 240),
+            "mode": terminal_mode_label(snapshot.mode),
+            "owner": snapshot.owner.label(),
+            "running": snapshot.running,
+            "exit_code": snapshot.exit_code,
+            "timed_out": snapshot.timed_out,
+            "user_exit": snapshot.user_exit,
+            "elapsed_ms": snapshot.started_at.elapsed().as_millis() as u64,
+            "output_bytes": snapshot.output_bytes,
+            "output_lines": snapshot.output_lines,
+            "output_chars": snapshot.output_chars,
+            "log": snapshot.saved_path.as_str(),
+            "status_file": snapshot.status_path.as_str(),
+            "cursor": format!("line:{},byte:{}", snapshot.output_lines, snapshot.output_bytes),
+            "payload_policy": "replace_not_stack",
+        })
+    }
+
+    fn write_terminal_scheduler_event(event: &str, dedupe_key: String, extra: Value) {
+        let _ = crate::aidebug::write_tool_event(
+            crate::app_project_root().as_path(),
+            event,
+            json!({
+                "tool_name": "terminal",
+                "dedupe_key": dedupe_key,
+                "single_flight": true,
+                "payload_policy": "replace_not_stack",
+                "extra": extra,
+            }),
+        );
+    }
+
     fn insert_running_session(shared: Arc<Mutex<SessionShared>>) {
         if let Ok(state) = shared.lock()
             && let Ok(mut guard) = REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new())).lock()
         {
             guard.insert(state.session_id, shared.clone());
         }
+    }
+
+    fn find_session_ids(predicate: impl Fn(&SessionSnapshot) -> bool) -> Vec<u64> {
+        let mut out = Vec::new();
+        if let Ok(guard) = REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new())).lock() {
+            for shared in guard.values() {
+                if let Ok(state) = shared.lock() {
+                    let snapshot = snapshot_from_shared(&state);
+                    if predicate(&snapshot) {
+                        out.push(snapshot.session_id);
+                    }
+                }
+            }
+        }
+        if let Ok(guard) = FINISHED.get_or_init(|| Mutex::new(BTreeMap::new())).lock() {
+            for snapshot in guard.values() {
+                if predicate(snapshot) {
+                    out.push(snapshot.session_id);
+                }
+            }
+        }
+        out
     }
 
     fn remove_running_session(session_id: u64) {
@@ -12054,6 +26545,7 @@ pub mod terminal {
             state.output_lines = state
                 .output_lines
                 .saturating_add(bytes.iter().filter(|byte| **byte == b'\n').count());
+            state.output_chars = state.output_chars.saturating_add(chunk.chars().count());
             state.output_tail.push_str(chunk.as_str());
             trim_tail_chars(&mut state.output_tail, TERMINAL_OUTPUT_TAIL_MAX_CHARS);
         }
@@ -12071,7 +26563,9 @@ pub mod terminal {
 
     fn snapshot_from_shared(state: &SessionShared) -> SessionSnapshot {
         SessionSnapshot {
+            persona: state.persona,
             session_id: state.session_id,
+            name: state.name.clone(),
             brief: state.brief.clone(),
             cmd: state.cmd.clone(),
             workdir: state.workdir.clone(),
@@ -12082,6 +26576,7 @@ pub mod terminal {
             pgrp: state.pgrp,
             output_bytes: state.output_bytes,
             output_lines: state.output_lines,
+            output_chars: state.output_chars,
             output_tail: state.output_tail.clone(),
             running: state.running,
             exit_code: state.exit_code,
@@ -12090,6 +26585,7 @@ pub mod terminal {
             suppressed_done: state.suppressed_done,
             mode: state.mode,
             owner: state.owner,
+            auto_report_events: state.auto_report_events,
         }
     }
 
@@ -12144,6 +26640,13 @@ pub mod terminal {
             snapshot.started_at.elapsed().as_millis()
         ));
         lines.push(format!("owner:{}", snapshot.owner.label()));
+        if let Some(name) = snapshot
+            .name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!("name:{}", truncate_with_ellipsis(name.trim(), 96)));
+        }
         if !snapshot.brief.trim().is_empty() {
             lines.push(format!(
                 "brief:{}",
@@ -12155,15 +26658,14 @@ pub mod terminal {
             truncate_with_ellipsis(clean_cmd(snapshot.cmd.as_str()).as_str(), 320).trim_end()
         ));
         lines.push(format!("log:{}", snapshot.saved_path));
-        lines.push(format!("status_file:{}", snapshot.status_path));
         lines.push(format!(
-            "stats:{} | {} bytes | {} lines",
-            format_bytes_short(snapshot.output_bytes),
-            snapshot.output_bytes,
-            snapshot.output_lines
+            "log_name:{}",
+            log_file_name(snapshot.saved_path.as_str())
         ));
+        lines.push(format!("status_file:{}", snapshot.status_path));
+        lines.push(format!("stats:{}", format_terminal_stats(snapshot)));
         lines.push("notice:当前仅回传日志头尾摘要；完整输出请读取 log 路径。".to_string());
-        lines.push("hint:若连续两次自动审计仍无新动作，可自行决策后续操作。".to_string());
+        lines.push("hint:若连续两次自动观察仍无新动作，可自行决策后续操作。".to_string());
         if !preview.trim().is_empty() {
             lines.push("preview:".to_string());
             lines.extend(preview.lines().map(str::to_string));
@@ -12187,6 +26689,13 @@ pub mod terminal {
             snapshot.started_at.elapsed().as_millis()
         ));
         lines.push(format!("owner:{}", snapshot.owner.label()));
+        if let Some(name) = snapshot
+            .name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!("name:{}", truncate_with_ellipsis(name.trim(), 96)));
+        }
         if !snapshot.brief.trim().is_empty() {
             lines.push(format!(
                 "brief:{}",
@@ -12198,13 +26707,12 @@ pub mod terminal {
             truncate_with_ellipsis(clean_cmd(snapshot.cmd.as_str()).as_str(), 320).trim_end()
         ));
         lines.push(format!("log:{}", snapshot.saved_path));
-        lines.push(format!("status_file:{}", snapshot.status_path));
         lines.push(format!(
-            "stats:{} | {} bytes | {} lines",
-            format_bytes_short(snapshot.output_bytes),
-            snapshot.output_bytes,
-            snapshot.output_lines
+            "log_name:{}",
+            log_file_name(snapshot.saved_path.as_str())
         ));
+        lines.push(format!("status_file:{}", snapshot.status_path));
+        lines.push(format!("stats:{}", format_terminal_stats(snapshot)));
         if !preview.trim().is_empty() {
             lines.push("preview:".to_string());
             lines.extend(preview.lines().map(str::to_string));
@@ -12271,8 +26779,7 @@ pub mod terminal {
         }
     }
 
-    fn format_write_reply(req: &WriteStdinRequest, snapshot: SessionSnapshot) -> ToolReply {
-        let status = snapshot_status_label(&snapshot);
+    fn format_pty_start_reply(snapshot: SessionSnapshot) -> ToolReply {
         let preview = build_log_preview(
             snapshot.saved_path.as_str(),
             snapshot.output_tail.as_str(),
@@ -12280,40 +26787,188 @@ pub mod terminal {
             snapshot.output_bytes,
             single_preview_budget(),
         );
-        let input_preview = if req.chars.is_empty() {
-            None
+        let mut lines = vec!["PTY 已启动".to_string()];
+        if !preview.trim().is_empty() {
+            lines.push("preview:".to_string());
+            lines.extend(preview.lines().map(str::to_string));
+        }
+        lines.push(format!("session_id:{}", snapshot.session_id));
+        if let Some(name) = snapshot
+            .name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!("name:{}", truncate_with_ellipsis(name.trim(), 96)));
+        }
+        lines.push(format!("status:{}", snapshot_status_label(&snapshot)));
+        if let Some(pid) = snapshot.pid {
+            lines.push(format!("pid:{pid}"));
+        }
+        if let Some(pgrp) = snapshot.pgrp {
+            lines.push(format!("pgrp:{pgrp}"));
+        }
+        lines.push(format!("log:{}", snapshot.saved_path));
+        lines.push(format!(
+            "log_name:{}",
+            log_file_name(snapshot.saved_path.as_str())
+        ));
+        lines.push(format!("status_file:{}", snapshot.status_path));
+        lines.push(format!("stats:{}", format_terminal_stats(&snapshot)));
+        lines.push(
+            "notice:继续交互用 pty_input；如需登记等待就调用一次 pty_wait；结束后结果会自动回传，无需反复 wait；结束会话用 pty_kill。"
+                .to_string(),
+        );
+        let output_preview = clamp_report_text(lines.join("\n"));
+        ToolReply {
+            command_preview: clean_cmd(&snapshot.cmd),
+            output_preview: output_preview.clone(),
+            model_output: output_preview,
+            exit_code: snapshot.exit_code,
+        }
+    }
+
+    fn format_pty_input_reply(req: &InputRequest, snapshot: SessionSnapshot) -> ToolReply {
+        let input_text = req.chars.trim_end();
+        let mut lines = vec!["PTY 输入已发送".to_string()];
+        lines.push(format!("session_id:{}", snapshot.session_id));
+        if let Some(name) = snapshot
+            .name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!("name:{}", truncate_with_ellipsis(name.trim(), 96)));
+        }
+        lines.push(format!("status:{}", snapshot_status_label(&snapshot)));
+        if !input_text.is_empty() {
+            lines.push(format!("input:{}", truncate_with_ellipsis(input_text, 300)));
+        }
+        lines.push(format!("log:{}", snapshot.saved_path));
+        lines.push(format!(
+            "log_name:{}",
+            log_file_name(snapshot.saved_path.as_str())
+        ));
+        lines.push(format!("status_file:{}", snapshot.status_path));
+        lines.push(format!("stats:{}", format_terminal_stats(&snapshot)));
+        if snapshot.running {
+            lines.push(
+                "notice:如需登记等待就调用一次 pty_wait；结束后结果会自动回传，无需反复 wait。"
+                    .to_string(),
+            );
+        }
+        if let Some(exit_code) = snapshot.exit_code {
+            lines.push(format!("exit_code:{exit_code}"));
+        }
+        let output_preview = clamp_report_text(lines.join("\n"));
+        let command_preview = if input_text.is_empty() {
+            format!("session_id={} · (empty input)", snapshot.session_id)
         } else {
-            Some(req.chars.as_str())
+            format!("session_id={} · {}", snapshot.session_id, input_text)
         };
-        let command_preview = if req.chars.is_empty() {
-            format!("session {} · (wait for terminal output)", req.session_id)
-        } else {
-            format!("session {} · {}", req.session_id, req.chars.trim_end())
-        };
-        let action = super::terminal_interaction_action(req.chars.as_str());
         ToolReply {
             command_preview,
-            output_preview: format_terminal_output_preview(
-                preview.as_str(),
-                &snapshot,
-                status,
-                Some(action),
-                input_preview,
-            ),
-            model_output: format_terminal_model_output(
-                "Terminal interaction",
-                preview.as_str(),
-                &snapshot,
-                status,
-                Some(action),
-                input_preview,
-            ),
+            output_preview: output_preview.clone(),
+            model_output: output_preview,
+            exit_code: snapshot.exit_code,
+        }
+    }
+
+    fn format_pty_wait_running_reply(req: &WaitRequest, snapshot: SessionSnapshot) -> ToolReply {
+        let preview = build_log_preview(
+            snapshot.saved_path.as_str(),
+            snapshot.output_tail.as_str(),
+            snapshot.output_lines,
+            snapshot.output_bytes,
+            single_preview_budget(),
+        );
+        let mut lines = vec!["PTY 仍在运行".to_string()];
+        if !preview.trim().is_empty() {
+            lines.push("preview:".to_string());
+            lines.extend(preview.lines().map(str::to_string));
+        }
+        lines.push(format!("session_id:{}", snapshot.session_id));
+        if let Some(name) = snapshot
+            .name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!("name:{}", truncate_with_ellipsis(name.trim(), 96)));
+        }
+        lines.push(format!("status:{}", snapshot_status_label(&snapshot)));
+        if let Some(timeout_secs) = req.timeout_secs.filter(|value| *value > 0) {
+            lines.push(format!("wait_timeout_secs:{timeout_secs}"));
+        }
+        lines.push(format!("log:{}", snapshot.saved_path));
+        lines.push(format!(
+            "log_name:{}",
+            log_file_name(snapshot.saved_path.as_str())
+        ));
+        lines.push(format!("status_file:{}", snapshot.status_path));
+        lines.push(format!("stats:{}", format_terminal_stats(&snapshot)));
+        lines.push(
+            "notice:已登记等待；会话结束后结果会自动回传，无需再次 pty_wait。如需继续交互可用 pty_input，结束会话可用 pty_kill。"
+                .to_string(),
+        );
+        let output_preview = clamp_report_text(lines.join("\n"));
+        ToolReply {
+            command_preview: format!("session_id={}", snapshot.session_id),
+            output_preview: output_preview.clone(),
+            model_output: output_preview,
+            exit_code: None,
+        }
+    }
+
+    fn format_pty_wait_done_reply(req: &WaitRequest, snapshot: SessionSnapshot) -> ToolReply {
+        let _ = req;
+        let preview = build_done_log_preview(
+            snapshot.saved_path.as_str(),
+            snapshot.output_tail.as_str(),
+            snapshot.output_lines,
+            snapshot.output_bytes,
+        );
+        let mut lines = vec!["PTY 已结束".to_string()];
+        if !preview.trim().is_empty() {
+            lines.push("preview:".to_string());
+            lines.extend(preview.lines().map(str::to_string));
+        }
+        lines.push(format!("session_id:{}", snapshot.session_id));
+        if let Some(name) = snapshot
+            .name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!("name:{}", truncate_with_ellipsis(name.trim(), 96)));
+        }
+        lines.push(format!("status:{}", done_status_label(&snapshot)));
+        if let Some(exit_code) = snapshot.exit_code {
+            lines.push(format!("exit_code:{exit_code}"));
+        }
+        lines.push(format!("log:{}", snapshot.saved_path));
+        lines.push(format!(
+            "log_name:{}",
+            log_file_name(snapshot.saved_path.as_str())
+        ));
+        lines.push(format!("status_file:{}", snapshot.status_path));
+        lines.push(format!("stats:{}", format_terminal_stats(&snapshot)));
+        lines.push("notice:会话记录保留在外部日志；需要再次进入时请重新 pty_run。".to_string());
+        let output_preview = clamp_report_text(lines.join("\n"));
+        ToolReply {
+            command_preview: format!("session_id={}", snapshot.session_id),
+            output_preview: output_preview.clone(),
+            model_output: output_preview,
             exit_code: snapshot.exit_code,
         }
     }
 
     fn path_str(path: &Path) -> String {
         path.to_string_lossy().to_string()
+    }
+
+    fn log_file_name(path: &str) -> String {
+        Path::new(path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(path)
+            .to_string()
     }
 
     fn clean_cmd(text: &str) -> String {
@@ -12343,20 +26998,19 @@ pub mod terminal {
     }
 
     fn terminal_log_dir() -> PathBuf {
-        let project_root = super::projectying_root();
-        let new_dir = project_root.join(TERMINAL_LOG_REL_PATH);
-        let legacy_dir = project_root.join(LEGACY_TERMINAL_LOG_REL_PATH);
-        if !new_dir.exists() && legacy_dir.exists() {
-            let _ = fs::rename(&legacy_dir, &new_dir);
+        super::terminal_output_dir()
+    }
+
+    fn terminal_log_dir_for_family(family: super::ExecCommandFamily) -> PathBuf {
+        match family {
+            super::ExecCommandFamily::Generic => terminal_log_dir(),
+            _ => super::terminal_output_dir_for_family(family),
         }
-        new_dir
     }
 
     pub fn prepare_log_dirs() -> Result<()> {
-        let generic = terminal_log_dir();
-        let adb = super::projectying_root().join(TERMINAL_ADB_LOG_REL_PATH);
-        let termux = super::projectying_root().join(TERMINAL_TERMUX_API_LOG_REL_PATH);
-        for dir in [generic, adb, termux] {
+        for family in super::EXEC_COMMAND_FAMILIES {
+            let dir = terminal_log_dir_for_family(family);
             fs::create_dir_all(&dir)
                 .with_context(|| format!("创建 terminal 输出目录失败：{}", dir.display()))?;
         }
@@ -12364,15 +27018,7 @@ pub mod terminal {
     }
 
     fn terminal_log_dir_for_cmd(cmd: &str) -> PathBuf {
-        match super::classify_exec_command_family(cmd) {
-            super::ExecCommandFamily::Generic => terminal_log_dir(),
-            super::ExecCommandFamily::Adb => {
-                super::projectying_root().join(TERMINAL_ADB_LOG_REL_PATH)
-            }
-            super::ExecCommandFamily::TermuxApi => {
-                super::projectying_root().join(TERMINAL_TERMUX_API_LOG_REL_PATH)
-            }
-        }
+        terminal_log_dir_for_family(super::classify_exec_command_family(cmd))
     }
 
     fn bash_single_quote(text: &str) -> String {
@@ -12430,6 +27076,16 @@ pub mod terminal {
         }
     }
 
+    fn format_terminal_stats(snapshot: &SessionSnapshot) -> String {
+        format!(
+            "{} | {} bytes | {} lines | {} chars",
+            format_bytes_short(snapshot.output_bytes),
+            snapshot.output_bytes,
+            snapshot.output_lines,
+            snapshot.output_chars
+        )
+    }
+
     #[derive(Debug, Clone, Copy)]
     struct PreviewBudget {
         max_lines: usize,
@@ -12437,19 +27093,20 @@ pub mod terminal {
     }
 
     fn single_preview_budget() -> PreviewBudget {
+        let budget = super::runtime_tool_output_settings()
+            .budget_for_level(super::runtime_default_tool_output_level());
         PreviewBudget {
-            max_lines: TERMINAL_LOG_PREVIEW_MAX_LINES,
-            max_chars: TERMINAL_LOG_PREVIEW_MAX_CHARS,
+            max_lines: budget.inline_lines.max(1),
+            max_chars: budget.inline_chars.max(1_000),
         }
     }
 
     fn grouped_preview_budget(total: usize) -> PreviewBudget {
+        let single = single_preview_budget();
         let total = total.max(1);
         PreviewBudget {
-            max_lines: (TERMINAL_LOG_PREVIEW_MAX_LINES / total)
-                .clamp(12, TERMINAL_LOG_PREVIEW_MAX_LINES),
-            max_chars: (TERMINAL_LOG_PREVIEW_MAX_CHARS / total)
-                .clamp(800, TERMINAL_LOG_PREVIEW_MAX_CHARS),
+            max_lines: (single.max_lines / total).clamp(12, single.max_lines.max(12)),
+            max_chars: (single.max_chars / total).clamp(800, single.max_chars.max(800)),
         }
     }
 
@@ -12550,6 +27207,13 @@ pub mod terminal {
         }
         lines.push(format!("session_id:{}", snapshot.session_id));
         lines.push(format!("owner:{}", snapshot.owner.label()));
+        if let Some(name) = snapshot
+            .name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!("name:{}", truncate_with_ellipsis(name.trim(), 96)));
+        }
         lines.push(format!("status:{status}"));
         if let Some(pid) = snapshot.pid {
             lines.push(format!("pid:{pid}"));
@@ -12558,13 +27222,12 @@ pub mod terminal {
             lines.push(format!("pgrp:{pgrp}"));
         }
         lines.push(format!("log:{}", snapshot.saved_path));
-        lines.push(format!("status_file:{}", snapshot.status_path));
         lines.push(format!(
-            "stats:{} | {} bytes | {} lines",
-            format_bytes_short(snapshot.output_bytes),
-            snapshot.output_bytes,
-            snapshot.output_lines
+            "log_name:{}",
+            log_file_name(snapshot.saved_path.as_str())
         ));
+        lines.push(format!("status_file:{}", snapshot.status_path));
+        lines.push(format!("stats:{}", format_terminal_stats(snapshot)));
         if snapshot.running {
             lines.push(format!("notice:{}", super::running_wait_notice_zh()));
         }
@@ -12585,6 +27248,7 @@ pub mod terminal {
         action: Option<&str>,
         input: Option<&str>,
     ) -> String {
+        let preview_budget = single_preview_budget();
         let mut lines = vec![title.to_string()];
         if snapshot.running && action.is_some_and(|value| matches!(value, "启动" | "轮询" | "注入"))
         {
@@ -12594,7 +27258,7 @@ pub mod terminal {
             lines.push("Output preview:".to_string());
             lines.push(truncate_with_ellipsis(
                 preview.trim_end(),
-                TERMINAL_MODEL_PREVIEW_MAX_CHARS,
+                preview_budget.max_chars,
             ));
         } else {
             lines.push("Output preview:".to_string());
@@ -12602,6 +27266,13 @@ pub mod terminal {
         }
         lines.push(format!("Session ID: {}", snapshot.session_id));
         lines.push(format!("Owner: {}", snapshot.owner.label()));
+        if let Some(name) = snapshot
+            .name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(format!("Name: {}", truncate_with_ellipsis(name.trim(), 96)));
+        }
         if let Some(action) = action.filter(|value| !value.trim().is_empty()) {
             lines.push(format!("Action: {action}"));
         }
@@ -12621,13 +27292,12 @@ pub mod terminal {
         lines.push(format!("Command: {}", clean_cmd(&snapshot.cmd)));
         lines.push(format!("Workdir: {}", snapshot.workdir));
         lines.push(format!("Log: {}", snapshot.saved_path));
-        lines.push(format!("Status File: {}", snapshot.status_path));
         lines.push(format!(
-            "Output stats: {} | {} bytes | {} lines",
-            format_bytes_short(snapshot.output_bytes),
-            snapshot.output_bytes,
-            snapshot.output_lines
+            "Log Name: {}",
+            log_file_name(snapshot.saved_path.as_str())
         ));
+        lines.push(format!("Status File: {}", snapshot.status_path));
+        lines.push(format!("Output stats: {}", format_terminal_stats(snapshot)));
         if let Some(exit_code) = snapshot.exit_code {
             lines.push(format!("Process exited with code {exit_code}"));
         }
@@ -12666,6 +27336,7 @@ pub mod terminal {
         total_lines: usize,
         total_bytes: usize,
     ) -> String {
+        let budget = single_preview_budget();
         if total_bytes == 0 {
             return String::new();
         }
@@ -12687,9 +27358,12 @@ pub mod terminal {
         };
         clamp_head_tail_preview_text(
             preview.as_str(),
-            TERMINAL_DONE_PREVIEW_HEAD_LINES,
-            TERMINAL_DONE_PREVIEW_TAIL_LINES,
-            TERMINAL_DONE_PREVIEW_MAX_CHARS,
+            (budget.max_lines / 2).max(1),
+            budget
+                .max_lines
+                .saturating_sub((budget.max_lines / 2).max(1))
+                .max(1),
+            budget.max_chars,
         )
     }
 
@@ -12831,7 +27505,7 @@ pub mod terminal {
     }
 
     fn done_preview_max_lines() -> usize {
-        TERMINAL_DONE_PREVIEW_HEAD_LINES + TERMINAL_DONE_PREVIEW_TAIL_LINES + 1
+        single_preview_budget().max_lines
     }
 
     fn collect_preview_lines(text: &str) -> Vec<String> {
@@ -12928,11 +27602,8 @@ pub mod terminal {
     }
 
     fn clamp_report_text(text: String) -> String {
-        clamp_preview_text(
-            text.trim_end(),
-            TERMINAL_LOG_PREVIEW_MAX_LINES,
-            TERMINAL_LOG_PREVIEW_MAX_CHARS,
-        )
+        let budget = single_preview_budget();
+        clamp_preview_text(text.trim_end(), budget.max_lines, budget.max_chars)
     }
 
     fn trim_tail_chars(text: &mut String, max_chars: usize) {
@@ -13238,7 +27909,9 @@ pub mod terminal {
         #[test]
         fn done_report_formatter_reports_log_paths_and_stats() {
             let text = format_done_report_text(&SessionSnapshot {
+                persona: crate::PersonaKind::Matrix,
                 session_id: 7,
+                name: Some("sample".to_string()),
                 brief: "运行示例任务".to_string(),
                 cmd: "printf hello".to_string(),
                 workdir: "/tmp".to_string(),
@@ -13249,6 +27922,7 @@ pub mod terminal {
                 pgrp: Some(1234),
                 output_bytes: 32,
                 output_lines: 2,
+                output_chars: 5,
                 output_tail: "hello".to_string(),
                 running: false,
                 exit_code: Some(0),
@@ -13257,11 +27931,69 @@ pub mod terminal {
                 suppressed_done: false,
                 mode: TerminalMode::Background,
                 owner: TerminalOwner::AiTool,
+                auto_report_events: true,
             });
             assert!(text.contains("Terminal Done"));
             assert!(text.contains("session_id:7"));
             assert!(text.contains("log:/tmp/session_7.log"));
-            assert!(text.contains("stats:32 B | 32 bytes | 2 lines"));
+            assert!(text.contains("stats:32 B | 32 bytes | 2 lines | 5 chars"));
+        }
+
+        #[test]
+        fn terminal_scheduler_helpers_report_deadline_and_final_event() {
+            assert_eq!(terminal_scheduler_dedupe_key(42), "terminal:42");
+            assert_eq!(terminal_scheduler_deadline_ms(Some(3)), 3000);
+            assert_eq!(terminal_scheduler_deadline_ms(Some(0)), 0);
+            assert_eq!(
+                terminal_scheduler_deadline_ms(None),
+                DEFAULT_TIMEOUT_SECS.saturating_mul(1000)
+            );
+
+            let mut snapshot = SessionSnapshot {
+                persona: crate::PersonaKind::Matrix,
+                session_id: 42,
+                name: Some("sample".to_string()),
+                brief: "运行示例任务".to_string(),
+                cmd: "printf hello".to_string(),
+                workdir: "/tmp".to_string(),
+                saved_path: "/tmp/session_42.log".to_string(),
+                status_path: "/tmp/session_42.status".to_string(),
+                started_at: Instant::now(),
+                pid: Some(1234),
+                pgrp: Some(1234),
+                output_bytes: 32,
+                output_lines: 2,
+                output_chars: 5,
+                output_tail: "hello".to_string(),
+                running: false,
+                exit_code: Some(0),
+                timed_out: false,
+                user_exit: false,
+                suppressed_done: false,
+                mode: TerminalMode::Background,
+                owner: TerminalOwner::AiTool,
+                auto_report_events: true,
+            };
+            assert_eq!(
+                terminal_scheduler_done_event_name(&snapshot),
+                "scheduler.task.done"
+            );
+            snapshot.timed_out = true;
+            assert_eq!(
+                terminal_scheduler_done_event_name(&snapshot),
+                "scheduler.task.timeout"
+            );
+            snapshot.timed_out = false;
+            snapshot.user_exit = true;
+            assert_eq!(
+                terminal_scheduler_done_event_name(&snapshot),
+                "scheduler.task.cancelled"
+            );
+
+            let payload = terminal_scheduler_snapshot_payload(&snapshot);
+            assert_eq!(payload["session_id"], 42);
+            assert_eq!(payload["cursor"], "line:2,byte:32");
+            assert_eq!(payload["payload_policy"], "replace_not_stack");
         }
 
         #[test]
@@ -13269,7 +28001,9 @@ pub mod terminal {
             let text = format_terminal_output_preview(
                 "line1\nline2",
                 &SessionSnapshot {
+                    persona: crate::PersonaKind::Matrix,
                     session_id: 7,
+                    name: Some("sample".to_string()),
                     brief: "运行示例任务".to_string(),
                     cmd: "printf hello".to_string(),
                     workdir: "/tmp".to_string(),
@@ -13280,6 +28014,7 @@ pub mod terminal {
                     pgrp: Some(1234),
                     output_bytes: 32,
                     output_lines: 2,
+                    output_chars: 5,
                     output_tail: "hello".to_string(),
                     running: true,
                     exit_code: None,
@@ -13288,6 +28023,7 @@ pub mod terminal {
                     suppressed_done: false,
                     mode: TerminalMode::Interactive,
                     owner: TerminalOwner::AiTool,
+                    auto_report_events: true,
                 },
                 "running",
                 Some("启动"),
@@ -13303,15 +28039,16 @@ pub mod terminal {
         }
 
         #[test]
-        fn background_command_preview_stays_compact_for_ui() {
+        fn background_command_preview_stays_concise_for_ui() {
             let text = super::super::format_background_command_preview(
                 &super::super::BackgroundCommandSnapshot {
+                    persona: crate::PersonaKind::Matrix,
                     job_id: 9,
                     brief: "后台测试".to_string(),
                     cmd: "sleep 60".to_string(),
                     workdir: "/tmp".to_string(),
-                    saved_path: "/tmp/bg.log".to_string(),
-                    status_path: "/tmp/bg.status".to_string(),
+                    saved_path: "toolmemory:pending".to_string(),
+                    status_path: "memory:runtime".to_string(),
                     started_at: Instant::now(),
                     pid: Some(123),
                     running: true,
@@ -13323,7 +28060,7 @@ pub mod terminal {
                 },
             );
             assert!(text.contains("后台运行中"));
-            assert!(text.contains("log:/tmp/bg.log"));
+            assert!(text.contains("archive:toolmemory:pending"));
             assert!(text.contains("notice:"));
         }
 
@@ -13333,7 +28070,9 @@ pub mod terminal {
                 "Interactive Terminal started",
                 "",
                 &SessionSnapshot {
+                    persona: crate::PersonaKind::Matrix,
                     session_id: 8,
+                    name: Some("sample".to_string()),
                     brief: "运行示例任务".to_string(),
                     cmd: "printf hello".to_string(),
                     workdir: "/tmp".to_string(),
@@ -13344,6 +28083,7 @@ pub mod terminal {
                     pgrp: Some(1234),
                     output_bytes: 0,
                     output_lines: 0,
+                    output_chars: 0,
                     output_tail: String::new(),
                     running: true,
                     exit_code: None,
@@ -13352,6 +28092,7 @@ pub mod terminal {
                     suppressed_done: false,
                     mode: TerminalMode::Interactive,
                     owner: TerminalOwner::AiTool,
+                    auto_report_events: true,
                 },
                 "running",
                 Some("启动"),
@@ -13391,12 +28132,7 @@ pub mod terminal {
                 .map(|index| format!("done-line-{index:02}"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let preview = clamp_head_tail_preview_text(
-                text.as_str(),
-                TERMINAL_DONE_PREVIEW_HEAD_LINES,
-                TERMINAL_DONE_PREVIEW_TAIL_LINES,
-                TERMINAL_DONE_PREVIEW_MAX_CHARS,
-            );
+            let preview = clamp_head_tail_preview_text(text.as_str(), 20, 20, 6_000);
             assert!(preview.contains("done-line-00"));
             assert!(preview.contains("done-line-79"));
             assert!(preview.contains("…<+40 lines>"));
@@ -13432,24 +28168,31 @@ pub mod terminal {
                 let log_dir = root.join(TERMINAL_LOG_REL_PATH);
                 fs::create_dir_all(&log_dir).expect("create log dir");
                 let log_path = log_dir.join("session_done.log");
-                let text = (0..90)
+                let text = (0..400)
                     .map(|index| format!("done-preview-line-{index:02}"))
                     .collect::<Vec<_>>()
                     .join("\n");
                 fs::write(&log_path, &text).expect("write log");
-                let preview =
-                    build_done_log_preview(log_path.to_string_lossy().as_ref(), "", 90, text.len());
+                let preview = build_done_log_preview(
+                    log_path.to_string_lossy().as_ref(),
+                    "",
+                    400,
+                    text.len(),
+                );
                 assert!(preview.contains("done-preview-line-00"));
-                assert!(preview.contains("done-preview-line-89"));
-                assert!(preview.contains("…<+50 lines>"));
-                assert!(preview.chars().count() <= TERMINAL_DONE_PREVIEW_MAX_CHARS);
+                assert!(preview.contains("done-preview-line-399"));
+                assert!(preview.contains("…<+"));
+                assert!(preview.chars().count() <= single_preview_budget().max_chars);
             });
         }
 
         #[test]
-        fn single_preview_budget_defaults_to_low_line_budget() {
+        fn single_preview_budget_defaults_to_selected_tool_budget() {
             let budget = single_preview_budget();
-            assert_eq!(budget.max_lines, crate::mcp::COMMAND_OUTPUT_LEVEL_LOW_LINES);
+            let selected = super::super::runtime_tool_output_settings()
+                .budget_for_level(super::super::runtime_default_tool_output_level());
+            assert_eq!(budget.max_lines, selected.inline_lines.max(1));
+            assert_eq!(budget.max_chars, selected.inline_chars.max(1_000));
         }
 
         #[test]

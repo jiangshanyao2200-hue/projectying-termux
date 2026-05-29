@@ -1,0 +1,2 @@
+persona: matrix
+Aidebug live refresh 2026-05-16. 请只回复：LIVE_REFRESH_OK

@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-matrix-create-observe-role-20260513-1",
+  "text": "【Aidebug 动态角色观察测试】请作为 Matrix 真实调用工具执行，尽量少轮次，不要进入 focus，不要写长期记忆。\n\n任务：\n1. 先尝试清理上一轮临时查看内存工具：用 tool_manage remove 移除 tool_id=phone_memory_info。如果 manifest 已不存在或已经清理过，就把它视为已清理，不要报错循环，不要重建这个工具。无需打开 command；如果不能删脚本也可以忽略，因为本轮重点是工具 manifest/state 收敛。\n2. 新建一个动态角色，并且本轮不要删除它，方便前端观察标签。\n   - action: role_create\n   - role.id: observe_probe\n   - role.display_name: 观\n   - role.glyph: 观\n   - role.base_persona: matrix\n   - role.default_tools: [\"memory_read\"]\n   - role.prompt: 你是临时观察角色，只用于验证动态角色标签和工具分配显示。除非 Matrix 明确派工，否则不主动执行。\n3. 调用 role_list 验证 observe_probe 存在。\n4. 最终简短回复：phone_memory_info 是否已清理、observe_probe 是否已创建、角色工具有哪些。不要删除 observe_probe。"
+}

@@ -1,0 +1,5 @@
+{
+  "persona": "coding",
+  "debug_session_id": "20260523-coding-tetris-timeout-retest",
+  "text": "继续刚才未完成的网页版俄罗斯方块任务。在 /data/data/com.termux/files/home/tetris-web/ 下创建一个可离线直接打开的现代化网页版俄罗斯方块：包含 index.html、style.css、app.js，键盘和触屏控制，计分、等级、暂停、重开、下一块预览、本地最高分。请尽量直接施工，少做长篇思考。执行过程中如果遇到连接/stream/重试问题，让系统自然记录；不要自行归因网络。"
+}

@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-matrix-worker-comm-route-20260515-4",
+  "text": "Aidebug 测试：只验证动态角色 worker 的沟通投递、会话归属和 UI/contract 暴露，不要做代码修改。请按步骤执行并在最终回复中使用固定 marker 汇总：\n\n1. 用可用工具确认当前动态角色 registry 中存在 enabled 的 worker，记录其 display_name/glyph/context_dir/memory_dir/default_tools/visible_tab/supports_topbar。\n2. 用 persona_manage observe worker 观察 worker 当前会话和上下文，记录它是否是独立的 Role_worker 视图/上下文。\n3. 用 persona_manage send 给 worker 发一条短消息：\"Aidebug route check 2026-05-15：请只回复 WORKER_ROUTE_OK，并说明你的当前身份标签。\" 等待或观察 worker 回应。\n4. 关键判断：Matrix 发给 worker 的消息与 worker 回复，应该归属 worker 独立聊天记录/worker 角色窗口；Matrix 页面只应保留调度/工具回执，不应把 worker 正文当成 Matrix 普通聊天正文。\n5. 检查当前可观测字段中是否能支持 UI 统一显示：用户希望 source/name 使用 `worker · 工`，输入状态行 connecting 不应显示成 `工 · ● Connecting ...` 这种重复身份。若工具无法直接验证 UI，请明确写成 NEED_UI_CONFIRM，不要误报 PASS。\n\n最终回复格式必须包含：\nREGISTRY: PASS/FAIL\nOBSERVE_ROUTE: PASS/FAIL\nSEND_ROUTE: PASS/FAIL/PROVIDER_BLOCKED\nSESSION_ISOLATION: PASS/FAIL/NEED_UI_CONFIRM\nLABEL_STATUS_UI: PASS/FAIL/NEED_UI_CONFIRM\nBUGS_FOUND: none 或逐条列出\nEVIDENCE: 简短列出关键工具结果。"
+}

@@ -1,0 +1,5 @@
+{
+  "persona": "coding",
+  "debug_session_id": "live-coding-install-tweb-apk-observe-20260523",
+  "text": "任务：安装并实机验证上次生成的 Android APK，同时把执行过程作为 ProjectYing live 测试。\n\n背景：上次你完成了 android/agentbrowser 的 APK：显示名应为 T-web，首页不应再显示 projectyingbrowser / ProjectYing Browser / Browser Container 标题，图标应为圆形/正常 launcher 图标。现在用户已经启动 ProjectYing，要求通过本次安装任务观察程序运转、status、上下文、工具链和潜在 bug。\n\n执行要求：\n1. 先只读确认现有 APK 与构建状态，优先使用 android/agentbrowser/dist/t-web-debug.apk；如不存在或明显过期，再最小化重建。\n2. 使用 adb 安装到当前可用设备/模拟器。Termux 私有目录不能用设备端 pm install 直接读文件时，应优先用 adb install -r 本机路径。\n3. 安装后启动包名 io.projectying.agentbrowser，验证：应用能启动、label 为 T-web、launcher icon 资源正常、首页标题栏已移除。\n4. 记录关键命令输出与结论；如果遇到设备不可用、安装失败、签名/包名/图标/标题问题，先记录现象、错误原文、疑似原因。只有安装阻塞或 APK 自身阻塞可以做最小修复；ProjectYing 主程序运行态 bug 不要立刻修，先列到笔记。\n5. 执行中主动关注 ProjectYing 的 Aidebug/status.json、health.json、performance.json、events.jsonl：观察请求次数、status 是否准确、toolmemory/context 是否异常膨胀、工具输出是否正确 externalize、失败是否重试。除重大系统性 bug 外，不要暂停任务。\n6. 最后给出简洁报告：安装结果、启动验证、APK 现象、ProjectYing 运行观测、发现的 bug/风险清单、是否需要后续集中处理。\n\n注意：不要删除用户文件，不要做大范围清理。不要修 ProjectYing 主程序 bug；只把发现写入 AI笔记.txt 或项目记忆.md 的本轮测试记录，便于后续集中统一处理。"
+}

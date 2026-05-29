@@ -1,0 +1,5 @@
+{
+  "persona": "coding",
+  "debug_session_id": "20260524-coding-performance-live",
+  "text": "实机性能测试任务：在 /data/data/com.termux/files/home/projectying-perf-demo 下创建一个离线可打开的现代化番茄钟网页，包含 index.html、style.css、app.js。要求触屏和键盘都可操作，有开始/暂停/重置、工作/休息切换、简洁状态显示。请直接施工，少长篇思考；完成后做轻量验证并说明路径。"
+}

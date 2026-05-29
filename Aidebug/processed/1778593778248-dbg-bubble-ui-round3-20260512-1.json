@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-bubble-ui-round3-20260512-1",
+  "text": "【Aidebug 实机测试 · AI 翻译悬浮窗 APK 迭代】请作为 Matrix 主控执行，不要整理上下文，不要写长期记忆；本轮重点观察 persona 调度、Coding 工具调用、APK 构建安装、工具回执是否外导、entries 是否稳定。任务目标：迭代现有工程 `/data/data/com.termux/files/home/AITranslatorOverlay`。请先用 persona_manage 观察 Coding 状态，然后把实现任务交给 Coding；Matrix 过程中可 observe/interrupt，但不要把原始工具 output 复述进聊天。Coding 需要完成：1) 将悬浮主泡泡改为现代圆形泡泡，文字/图形居中，带阴影/渐变/轻动画，支持拖拽和边缘吸附；2) 点击主泡泡后，在周围以圆形泡泡菜单展开三个按钮：`设置`、`翻译`、`关闭`，有平滑缩放/透明度动画；3) `翻译` 进入现有框选/OCR/翻译流程，`设置` 打开设置页，`关闭` 停止服务；4) 设置页和 MainActivity 做基础现代化 UI 改造，不要只是默认 Button 列表；5) 添加 APK 图标。优先测试 draw_image 工具生成图标设计请求；如果宿主没有实际生成位图，Coding 需要用 Android vector drawable 做一个可构建的现代图标兜底；6) API 改为 DeepSeek 标准配置：base URL 默认 `https://api.deepseek.com`，请求路径为 OpenAI-compatible `/chat/completions`，默认模型 `deepseek-v4-flash`，设置页保留 API Key 输入。Airider 源码里的标准配置参考：`AIrider/apk/jdy33-apk/src/com/evai/jdy33/AppSettings.java` 和 `DirectChatClient.java`；如果无法从已安装 Airider 读取真实 key，不要硬编码、不循环重试，把 key 作为用户设置项保留即可；7) 构建 APK 并用 adb 安装到当前设备，必要时启动主 Activity。要求：尽量少轮次完成，命令输出用简洁预算或外导；遇到 API/key 不可用不要重试堆包；最终汇报改动文件、APK 路径、adb 安装结果、UI/功能限制和发现的问题。"
+}

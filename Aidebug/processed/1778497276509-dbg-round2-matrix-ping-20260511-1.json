@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-round2-matrix-ping-20260511-1",
+  "text": "基础连通 ping。严格要求：不要调用任何工具，不要整理上下文，不要写记忆。只回复一行：MATRIX_PING_OK"
+}

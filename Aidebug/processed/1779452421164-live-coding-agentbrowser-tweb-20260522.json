@@ -1,0 +1,5 @@
+{
+  "persona": "coding",
+  "debug_session_id": "live-coding-agentbrowser-tweb-20260522",
+  "text": "Aidebug live APK edit test · Coding. 当前 ProjectYing 已由用户启动，本轮任务用于同时修改 android/agentbrowser APK 与观察 ProjectYing 运行链路稳定性。\n\n目标目录：android/agentbrowser。请先快速审查现有 AndroidManifest、res/drawable、assets/start.html、build.sh 和已有构建产物，不要改动无关工程。\n\n功能修改要求：\n1. APK 显示名称改为 T-web。请确认 AndroidManifest / string / build 脚本中的显示名口径一致；如果当前没有 strings.xml，可用最小改法，但要说明。\n2. 移除 APK 主页顶部显示的 projectyingbrowser 标题栏/标题文字。要求启动页不要再出现 projectyingbrowser 这个大标题或标题栏；保留必要导航/内容即可。\n3. 图标改成圆形风格。当前图标有问题，请改 res/drawable/ic_launcher.xml 或相关资源，让 launcher 图标主体为圆形，颜色简洁，避免尖角/裁切异常。\n4. 构建或至少运行可复现验证：优先执行 android/agentbrowser/build.sh；如果构建环境缺组件，请给出最小阻塞说明。\n\n测试纪律：\n- 这是 ProjectYing 程序测试，请主动保持工具输出短；不要把完整构建日志贴回聊天，必要时只摘要关键错误。\n- 执行中请留意 status/context/tool 输出/重试/失败/请求耗时是否异常；如果看到上下文或日志膨胀，请主动使用上下文管理工具或收敛输出后继续。\n- 最终回复请包含：改动文件、构建/验证结果、是否触发上下文治理、你观察到的 ProjectYing 运行异常或没有异常。\n"
+}

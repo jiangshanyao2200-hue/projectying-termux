@@ -1,0 +1,5 @@
+{
+  "persona": "advisor",
+  "debug_session_id": "advisor-governance-pressure-20260517",
+  "text": "司，本轮是 ProjectYing 全链路压测治理观察，不联系 Server。请你作为全局副脑做治理压测：观察 Matrix、Coding、dynamic roles 的上下文/记忆/共享板状态，检查 datememory 是否需要写日记，检查 context manage 是否按 KB 阈值工作。不要大段复述上下文，只输出：1) 你能看到哪些 persona/role 状态；2) 哪些链路健康，哪些有风险；3) 是否有需要 context_manage/memory_add 的具体目标；4) 发现的问题写清证据。若你执行治理工具，请保持快准狠。"
+}

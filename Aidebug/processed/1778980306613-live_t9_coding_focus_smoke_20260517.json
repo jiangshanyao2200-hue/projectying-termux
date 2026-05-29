@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "live-t9-coding-focus-smoke-20260517",
+  "text": "Aidebug live T9 Coding focus smoke。请由 Matrix 指挥 Coding 做一个最小 live 验证，只测门禁，不扩写产品：1) 让 Coding 自己调用 `focus_mode.enter`，brief/task 只写“Coding focus smoke”；2) 让 Coding 立刻调用 `focus_mode.exit`，summary 只写“focus smoke complete”；3) Coding 极短回报：`focus_mode.enter` 是否成功、`focus_mode.exit` 是否成功、有没有再次出现 `当前 persona CODING 不支持本次任务/上下文管理调用`。不要 build、不要 adb、不要改代码。"
+}

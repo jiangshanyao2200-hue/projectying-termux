@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "live-t12-vision-maintenance-smoke-20260517",
+  "text": "Aidebug live T12 vision maintenance smoke. 只做最小验证，不 build，不 adb，不改代码。任务：1) 对 `vision_probe` 先把 `context_governance` 设为 `vision_compact` 且 threshold 尽量压低（例如 manage_threshold_kb=1 或最接近可用的低值），确认角色仍保持 `context_vision + context_compact` 路由；2) 触发一次维护同步/观察，让它真的出现 pending maintenance；3) 复查维护提示文本必须优先指向 `context_vision + context_compact`，并写明这是模型自管路线；4) 复查工具箱里 `context_system` 仍是折叠抽屉语义，且普通角色没有同时泛滥展开四个上下文工具。最终只回报：ROLE / TOOL / MAINTENANCE / DRAWER 四项 PASS 或 FAIL，并给最小证据。不要扩写别的链路。"
+}

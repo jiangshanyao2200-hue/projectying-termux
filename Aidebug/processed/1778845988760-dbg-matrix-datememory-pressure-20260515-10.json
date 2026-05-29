@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-matrix-datememory-pressure-20260515-10",
+  "text": "Aidebug T10：datememory 压力治理测试。不要修改代码，不要清空笔记，不要批量删除长期记忆。目标是验证 Matrix 是否能识别 datememory context over-limit，并在规则内做最小治理判断。\n\n请严格按步骤执行，并在最终回复中使用固定 marker：\n\n1. 读取当前 status/context/memory 压力状态，记录 `datememory_context_kb`、`datememory_context_limit_kb`、`datememory_context_over_limit`、Matrix active_context_entries。\n2. 检查 Matrix 是否有可用的 memory/context 治理工具。不要盲目清空 datememory；不要删除历史记忆。\n3. 如果 Matrix 无权安全压缩 datememory，请输出 `NEED_ADVISOR`，并说明需要司介入的原因和最小建议动作。\n4. 如果 Matrix 可执行最小维护，只允许写入一条治理摘要/索引类记录，内容必须包含唯一标记 `T10_DATEMEMORY_GOVERNANCE_20260515`，并复查压力状态；不能删除或覆盖既有长期记忆。\n5. observe Matrix，确认治理记录没有造成普通聊天污染；检查 focus/status 是否闭环。\n\n最终回复必须包含：\nDATEMEMORY_PRESSURE_DETECTED: PASS/FAIL\nGOVERNANCE_DECISION: NEED_ADVISOR/MINIMAL_MAINTENANCE/NO_ACTION_NEEDED/FAIL\nNO_DESTRUCTIVE_ACTION: PASS/FAIL\nPRESSURE_RECHECK: PASS/FAIL/NOT_APPLICABLE\nMATRIX_POLLUTION: PASS/FAIL\nFOCUS_STATUS: PASS/FAIL\nBUGS_FOUND: none 或逐条列出\nEVIDENCE: 简短列出关键工具结果。"
+}

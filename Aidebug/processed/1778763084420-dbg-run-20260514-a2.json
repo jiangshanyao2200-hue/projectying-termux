@@ -1,0 +1,1 @@
+{"persona":"matrix","debug_session_id":"dbg-run-20260514-a2","text":"按你刚才的实机测试计划，只执行第 2 项和第 4 项，不改代码。要求：1) 先验证动态角色空闲时默认不显示 ROLE/TOPBAR 顶部状态栏；2) 再验证角色专属工具隔离：让 工（role_tool_probe）执行一次 role_hello_tool，然后确认普通 Coding 常驻工具里不应出现 role_hello_tool。请尽量使用现有工具直接验证，并在结尾只给出精简测试结果：PASS/FAIL + 证据点。"}

@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-matrix-output-recall-20260515-7",
+  "text": "Aidebug T7：验证工具输出回收协议。不要修改代码，不要清空笔记。若发现协议本身不支持当前调用方式，请明确写成 NO_OUTPUT_REF 或 NEED_DA，不要误报为 ProjectYing bug。\n\n请按步骤执行并在最终回复中使用固定 marker：\n\n1. 先查看当前是否有可回收的外部化输出线索，优先从 Aidebug / tool 回执 / memory/output 协议中找具体 ref/path，而不是直接猜目录名。\n2. 尝试一次最小的 `memory_read target=output` 回收；如果需要具体 `path` 或 `ref_id`，请在工具输出中找到后再读取，不要直接传目录 `memory/output`。\n3. 如果当前没有可用 ref/path，尝试制造一个最小外部化输出或明确说明当前没有可回收对象。\n4. 复查 Matrix：确认外部化输出回收尝试不会污染 Matrix 普通聊天正文。\n\n最终回复必须包含：\nOUTPUT_RECALL: PASS/FAIL/NO_OUTPUT_REF/NEED_DA\nMATRIX_POLLUTION: PASS/FAIL\nBUGS_FOUND: none 或逐条列出\nEVIDENCE: 简短列出关键工具结果。"
+}

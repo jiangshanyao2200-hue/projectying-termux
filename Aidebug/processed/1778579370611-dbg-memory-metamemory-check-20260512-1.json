@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-memory-metamemory-check-20260512-1",
+  "text": "调试任务：不要写入新记忆。请只用 memory_check 检查 Coding persona 的 metamemory，参数 target=metamemory, persona=coding, date=2026-05-12, keywords=[]。如果返回 read_hint，再用 memory_read 按 read_hint 读取一个很小范围。最后用一行返回 DBG_MEMORY_METACHECK_OK，并说明是否读到了 Coding metamemory。"
+}

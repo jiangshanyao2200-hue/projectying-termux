@@ -1,0 +1,214 @@
+{
+  "version": 4,
+  "context": {
+    "version": 4,
+    "entries": [
+      {
+        "id": 1,
+        "stable_id": 1,
+        "round_id": 1,
+        "role": "user",
+        "kind": "note",
+        "thinking": null,
+        "text": "Aidebug worker context route test 2026-05-15。用于验证动态角色 worker 的 context 独立路由。",
+        "codex_item_json": "{\"content\":[{\"text\":\"Aidebug worker context route test 2026-05-15。用于验证动态角色 worker 的 context 独立路由。\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"}",
+        "created_at": 1778843296
+      },
+      {
+        "id": 2,
+        "stable_id": 2,
+        "round_id": 2,
+        "role": "user",
+        "kind": "message",
+        "thinking": null,
+        "text": "[persona_manage]\nfrom: Matrix · 萤\ntarget_role: 工 (worker)\nrole_context: context/Role_worker\ntool_projection: already_open\nrole_execution: direct\nrole_guard: do_not_requeue_same_role\nrole_instruction: answer as the target role; do not call persona_manage.send for this same role again\n\n[dynamic role prompt start]\n你是动态角色 worker（工），用于验证 ProjectYing 动态角色规范化链路。除非 Matrix 明确派工，否则不主动执行。\n[dynamic role prompt end]\n\nreason: 验证 Matrix 到动态角色 worker 的沟通投递与会话归属\n\nAidebug route check 2026-05-15：请只回复 WORKER_ROUTE_OK，并说明你的当前身份标签。",
+        "codex_item_json": "{\"content\":[{\"text\":\"[persona_manage]\\nfrom: Matrix · 萤\\ntarget_role: 工 (worker)\\nrole_context: context/Role_worker\\ntool_projection: already_open\\nrole_execution: direct\\nrole_guard: do_not_requeue_same_role\\nrole_instruction: answer as the target role; do not call persona_manage.send for this same role again\\n\\n[dynamic role prompt start]\\n你是动态角色 worker（工），用于验证 ProjectYing 动态角色规范化链路。除非 Matrix 明确派工，否则不主动执行。\\n[dynamic role prompt end]\\n\\nreason: 验证 Matrix 到动态角色 worker 的沟通投递与会话归属\\n\\nAidebug route check 2026-05-15：请只回复 WORKER_ROUTE_OK，并说明你的当前身份标签。\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"}",
+        "created_at": 1778843737
+      },
+      {
+        "id": 3,
+        "stable_id": 3,
+        "round_id": 2,
+        "role": "assistant",
+        "kind": "message",
+        "thinking": null,
+        "text": "WORKER_ROUTE_OK。当前身份标签：动态角色 worker（工）。",
+        "codex_item_json": "{\"content\":[{\"text\":\"WORKER_ROUTE_OK。当前身份标签：动态角色 worker（工）。\",\"type\":\"output_text\"}],\"role\":\"assistant\",\"type\":\"message\"}",
+        "created_at": 1778843742
+      },
+      {
+        "id": 4,
+        "stable_id": 4,
+        "round_id": 3,
+        "role": "user",
+        "kind": "message",
+        "thinking": null,
+        "text": "[persona_manage]\nfrom: Matrix · 萤\ntarget_role: 工 (worker)\nrole_context: context/Role_worker\ntool_projection: already_open\nrole_execution: direct\nrole_guard: do_not_requeue_same_role\nrole_instruction: answer as the target role; do not call persona_manage.send for this same role again\n\n[dynamic role prompt start]\n你是动态角色 worker（工），用于验证 ProjectYing 动态角色规范化链路。除非 Matrix 明确派工，否则不主动执行。\n[dynamic role prompt end]\n\nreason: 验证 Matrix 调度 worker 及回复归属 worker 角色会话\n\nAidebug governance control 2026-05-15：请只回复 WORKER_GOVERNANCE_OK，并说明你看到的身份标签。",
+        "codex_item_json": "{\"content\":[{\"text\":\"[persona_manage]\\nfrom: Matrix · 萤\\ntarget_role: 工 (worker)\\nrole_context: context/Role_worker\\ntool_projection: already_open\\nrole_execution: direct\\nrole_guard: do_not_requeue_same_role\\nrole_instruction: answer as the target role; do not call persona_manage.send for this same role again\\n\\n[dynamic role prompt start]\\n你是动态角色 worker（工），用于验证 ProjectYing 动态角色规范化链路。除非 Matrix 明确派工，否则不主动执行。\\n[dynamic role prompt end]\\n\\nreason: 验证 Matrix 调度 worker 及回复归属 worker 角色会话\\n\\nAidebug governance control 2026-05-15：请只回复 WORKER_GOVERNANCE_OK，并说明你看到的身份标签。\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"}",
+        "created_at": 1778844740
+      },
+      {
+        "id": 5,
+        "stable_id": 5,
+        "round_id": 3,
+        "role": "assistant",
+        "kind": "message",
+        "thinking": null,
+        "text": "WORKER_GOVERNANCE_OK。看到的身份标签：动态角色 worker（工）。",
+        "codex_item_json": "{\"content\":[{\"text\":\"WORKER_GOVERNANCE_OK。看到的身份标签：动态角色 worker（工）。\",\"type\":\"output_text\"}],\"role\":\"assistant\",\"type\":\"message\"}",
+        "created_at": 1778844744
+      },
+      {
+        "id": 6,
+        "stable_id": 6,
+        "round_id": 4,
+        "role": "user",
+        "kind": "note",
+        "thinking": null,
+        "text": "Aidebug governance context 2026-05-15",
+        "codex_item_json": "{\"content\":[{\"text\":\"Aidebug governance context 2026-05-15\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"}",
+        "created_at": 1778844767
+      },
+      {
+        "id": 7,
+        "stable_id": 7,
+        "round_id": 5,
+        "role": "user",
+        "kind": "message",
+        "thinking": null,
+        "text": "[persona_manage]\nfrom: Matrix · 萤\ntarget_role: 工 (worker)\nrole_context: context/Role_worker\ntool_projection: already_open\nrole_execution: direct\nrole_guard: do_not_requeue_same_role\nrole_instruction: answer as the target role; do not call persona_manage.send for this same role again\n\n[dynamic role prompt start]\n你是动态角色 worker（工），用于验证 ProjectYing 动态角色规范化链路。除非 Matrix 明确派工，否则不主动执行。\n[dynamic role prompt end]\n\nreason: 验证 worker 动态角色独立路由与正文隔离\n\nT8 多步调度压力测试短任务。请只在 worker/Role_worker 会话正文中回复固定字符串：T8_WORKER_ROUTE_OK。唯一标记：T8_WORKER_ROUTE_20260515。不要把回复转发到 Matrix 普通聊天正文。",
+        "codex_item_json": "{\"content\":[{\"text\":\"[persona_manage]\\nfrom: Matrix · 萤\\ntarget_role: 工 (worker)\\nrole_context: context/Role_worker\\ntool_projection: already_open\\nrole_execution: direct\\nrole_guard: do_not_requeue_same_role\\nrole_instruction: answer as the target role; do not call persona_manage.send for this same role again\\n\\n[dynamic role prompt start]\\n你是动态角色 worker（工），用于验证 ProjectYing 动态角色规范化链路。除非 Matrix 明确派工，否则不主动执行。\\n[dynamic role prompt end]\\n\\nreason: 验证 worker 动态角色独立路由与正文隔离\\n\\nT8 多步调度压力测试短任务。请只在 worker/Role_worker 会话正文中回复固定字符串：T8_WORKER_ROUTE_OK。唯一标记：T8_WORKER_ROUTE_20260515。不要把回复转发到 Matrix 普通聊天正文。\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"}",
+        "created_at": 1778845703
+      },
+      {
+        "id": 8,
+        "stable_id": 8,
+        "round_id": 5,
+        "role": "assistant",
+        "kind": "message",
+        "thinking": null,
+        "text": "T8_WORKER_ROUTE_OK",
+        "codex_item_json": "{\"content\":[{\"text\":\"T8_WORKER_ROUTE_OK\",\"type\":\"output_text\"}],\"role\":\"assistant\",\"type\":\"message\"}",
+        "created_at": 1778845708
+      },
+      {
+        "id": 9,
+        "stable_id": 9,
+        "round_id": 6,
+        "role": "user",
+        "kind": "note",
+        "thinking": null,
+        "text": "T8 worker context marker for Aidebug multi-step dispatch pressure test: T8_WORKER_CONTEXT_20260515. This note must remain in worker/Role_worker context, not Matrix ordinary chat正文。",
+        "codex_item_json": "{\"content\":[{\"text\":\"T8 worker context marker for Aidebug multi-step dispatch pressure test: T8_WORKER_CONTEXT_20260515. This note must remain in worker/Role_worker context, not Matrix ordinary chat正文。\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"}",
+        "created_at": 1778845737
+      },
+      {
+        "id": 10,
+        "stable_id": 10,
+        "round_id": 7,
+        "role": "user",
+        "kind": "message",
+        "thinking": null,
+        "text": "[persona_manage]\nfrom: Matrix · 萤\ntarget_role: 工 (worker)\nrole_context: context/Role_worker\ntool_projection: already_open\nrole_execution: direct\nrole_guard: do_not_requeue_same_role\nrole_instruction: answer as the target role; do not call persona_manage.send for this same role again\n\n[dynamic role prompt start]\n你是动态角色 worker（工），用于验证 ProjectYing 动态角色规范化链路。除非 Matrix 明确派工，否则不主动执行。\n[dynamic role prompt end]\n\n\nT9_WORKER_RELOAD_ROUTE_20260515\n请仅回复：T9_RELOAD_ROUTE_OK",
+        "codex_item_json": "{\"content\":[{\"text\":\"[persona_manage]\\nfrom: Matrix · 萤\\ntarget_role: 工 (worker)\\nrole_context: context/Role_worker\\ntool_projection: already_open\\nrole_execution: direct\\nrole_guard: do_not_requeue_same_role\\nrole_instruction: answer as the target role; do not call persona_manage.send for this same role again\\n\\n[dynamic role prompt start]\\n你是动态角色 worker（工），用于验证 ProjectYing 动态角色规范化链路。除非 Matrix 明确派工，否则不主动执行。\\n[dynamic role prompt end]\\n\\n\\nT9_WORKER_RELOAD_ROUTE_20260515\\n请仅回复：T9_RELOAD_ROUTE_OK\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"}",
+        "created_at": 1778845890
+      },
+      {
+        "id": 11,
+        "stable_id": 11,
+        "round_id": 7,
+        "role": "assistant",
+        "kind": "message",
+        "thinking": null,
+        "text": "T9_RELOAD_ROUTE_OK",
+        "codex_item_json": "{\"content\":[{\"text\":\"T9_RELOAD_ROUTE_OK\",\"type\":\"output_text\"}],\"role\":\"assistant\",\"type\":\"message\"}",
+        "created_at": 1778845895
+      },
+      {
+        "id": 12,
+        "stable_id": 12,
+        "round_id": 8,
+        "role": "user",
+        "kind": "message",
+        "thinking": null,
+        "text": "[persona_manage]\nfrom: Matrix · 萤\ntarget_role: 工 (worker)\nrole_context: context/Role_worker\ntool_projection: already_open\nrole_execution: direct\nrole_guard: do_not_requeue_same_role\nrole_instruction: answer as the target role; do not call persona_manage.send for this same role again\n\n[dynamic role prompt start]\n你是动态角色 worker（工），用于验证 ProjectYing 动态角色规范化链路。除非 Matrix 明确派工，否则不主动执行。\n[dynamic role prompt end]\n\nreason: 验证 worker 在 health 回归中仍可被 Matrix 调度且回复隔离\n\nT11 health route regression. Unique marker: T11_HEALTH_ROUTE_20260515. Please reply exactly: T11_HEALTH_ROUTE_OK. Do not re-dispatch; answer only as worker session正文.",
+        "codex_item_json": "{\"content\":[{\"text\":\"[persona_manage]\\nfrom: Matrix · 萤\\ntarget_role: 工 (worker)\\nrole_context: context/Role_worker\\ntool_projection: already_open\\nrole_execution: direct\\nrole_guard: do_not_requeue_same_role\\nrole_instruction: answer as the target role; do not call persona_manage.send for this same role again\\n\\n[dynamic role prompt start]\\n你是动态角色 worker（工），用于验证 ProjectYing 动态角色规范化链路。除非 Matrix 明确派工，否则不主动执行。\\n[dynamic role prompt end]\\n\\nreason: 验证 worker 在 health 回归中仍可被 Matrix 调度且回复隔离\\n\\nT11 health route regression. Unique marker: T11_HEALTH_ROUTE_20260515. Please reply exactly: T11_HEALTH_ROUTE_OK. Do not re-dispatch; answer only as worker session正文.\",\"type\":\"input_text\"}],\"role\":\"user\",\"type\":\"message\"}",
+        "created_at": 1778848504
+      },
+      {
+        "id": 13,
+        "stable_id": 13,
+        "round_id": 8,
+        "role": "assistant",
+        "kind": "message",
+        "thinking": null,
+        "text": "T11_HEALTH_ROUTE_OK",
+        "codex_item_json": "{\"content\":[{\"text\":\"T11_HEALTH_ROUTE_OK\",\"type\":\"output_text\"}],\"role\":\"assistant\",\"type\":\"message\"}",
+        "created_at": 1778848508
+      }
+    ]
+  },
+  "focus": {
+    "version": 4,
+    "entries": []
+  },
+  "meta": {
+    "version": 4,
+    "mode": "standard",
+    "next_entry_id": 14,
+    "revision": 14,
+    "next_round_id": 9,
+    "soft_context_bytes": 204800,
+    "hard_context_bytes": 409600,
+    "soft_context_entry_limit": 1000,
+    "hard_context_entry_limit": 1000,
+    "soft_focus_bytes": 204800,
+    "hard_focus_bytes": 409600,
+    "soft_focus_entry_limit": 1000,
+    "hard_focus_entry_limit": 1000,
+    "fastmemory_item_limit": 20,
+    "context_governance": {
+      "mode": "self_compact",
+      "manage_threshold_kb": 200,
+      "compact_threshold_kb": 32,
+      "report_to_matrix": true
+    },
+    "focus_brief": null,
+    "focus_entered_at": null,
+    "focus_required_summary": null,
+    "pending_maintenance": []
+  },
+  "toolbox": {
+    "version": 4,
+    "entries": [
+      {
+        "tool_id": "context_compact",
+        "state": "expanded"
+      },
+      {
+        "tool_id": "context_manage",
+        "state": "closed"
+      },
+      {
+        "tool_id": "context_summary",
+        "state": "expanded"
+      },
+      {
+        "tool_id": "memory_add",
+        "state": "expanded"
+      },
+      {
+        "tool_id": "memory_check",
+        "state": "expanded"
+      },
+      {
+        "tool_id": "memory_read",
+        "state": "expanded"
+      },
+      {
+        "tool_id": "persona_manage",
+        "state": "expanded"
+      }
+    ]
+  }
+}

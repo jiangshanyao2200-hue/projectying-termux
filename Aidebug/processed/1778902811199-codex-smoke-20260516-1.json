@@ -1,0 +1,1 @@
+{"persona":"matrix","debug_session_id":"codex-smoke-20260516-1","text":"Aidebug smoke 测试：请只读当前健康状态，不做修复、不清空记忆、不发送 worker。请用三行以内回答：1) AIDEBUG_SMOKE_OK；2) 当前 overall_score/overall_state；3) 当前最主要 degraded 链路。"}

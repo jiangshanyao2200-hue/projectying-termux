@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-ai-translator-round4-ui-lag-chat-20260513-1",
+  "text": "继续 AITranslatorOverlay APK 实战迭代。本轮请 Matrix 做主控判断，优先调度 Coding · 绫完成开发，不要自己长时间直接编程；你需要观察 Coding 的执行，必要时中途打断纠偏，最后汇总构建/安装/测试结果。\n\n项目路径：/data/data/com.termux/files/home/AITranslatorOverlay\n构建脚本：/data/data/com.termux/files/home/AITranslatorOverlay/build.sh\n当前 APK：/data/data/com.termux/files/home/AITranslatorOverlay/build/ai-translator-overlay.apk\nDeepSeek/OpenAI-compatible 配置沿用上轮本地设置和 Settings 页面字段；禁止在回复、日志摘要、工具摘要里明文回显 API Key。\n\n用户最新验收反馈：\n1. 悬浮泡泡效果能接受，但还不是图标泡泡。需要主泡泡是圆形图标，展开后周围出现圆形图标按钮：设置、翻译、关闭；不要继续用文字按钮作为主要视觉。\n2. 点击截图区域翻译仍然卡顿。请定位是 MediaProjection/区域选择/截图裁剪/OCR/网络翻译/覆盖层绘制哪一段慢，优先用日志和代码审查确认，不要只凭猜测。\n3. App 主界面还没有聊天式历史界面。打开 App 后应有现代化聊天/历史面板，能看到原文、译文、目标语言、时间、状态/错误，支持滚动浏览。\n4. 当前整体效果还不够聪明和完整。请把 UI 基础审美提高到现代移动端工具水平：圆形图标、清晰层级、轻动画、无障碍可点区域、错误状态友好展示。\n\n本轮验收：\n- 图标化圆形泡泡真实落地，不只是改文案。\n- 截图区域翻译链路不闪退，并尽量消除明显卡顿；无法完全消除时必须指出具体慢点和下一步。\n- 主界面有聊天式历史面板。\n- DeepSeek API Test / 翻译失败要显示清晰错误，不要崩溃。\n- 构建通过；adb 在线时自动安装并做最小验证。\n- 最后用简洁报告说明改了哪些文件、构建/安装结果、仍有什么限制。\n\n请先快速审查现有代码状态，再把明确编码任务交给 Coding。"
+}

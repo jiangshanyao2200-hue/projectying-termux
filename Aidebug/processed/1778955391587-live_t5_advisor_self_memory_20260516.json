@@ -1,0 +1,5 @@
+{
+  "persona": "advisor",
+  "debug_session_id": "live-t5-advisor-self-memory-20260516",
+  "text": "Aidebug live T5 · Advisor governance smoke。当前时间锚点：2026-05-16 18:16 UTC。你是司，本轮只做后台治理自检，不要展开普通闲聊。\n\n请按顺序完成：\n1. 调用 memory_add，target=datememory，persona=\"advisor\"，clear_context=false，写入一条 2026-05-16 的详细日记。日记必须包含：18:16 UTC 这个时间锚点、Matrix 测试已完成后切到司治理测试、你需要验证 datememory / fastmemory / context_manage / persona_manage.send 四条链路、当前风险和下一步观察点。内容不少于 120 字，关键词至少包含 Advisor、司、Matrix、datememory、fastmemory、context_manage、persona_manage、Aidebug、2026-05-16。\n2. 调用 context_manage，target=fastmemory，section=experience，action=write，text 写 1 条可复用经验：司作为全局副脑时，日记记录负责事件时间线，fastmemory 只记录稳定治理策略，管理别人上下文时要依赖隔离 snapshot 和低损耗回报 Matrix。\n3. 调用 context_manage，target=context，action=summary，只对你自己的 Advisor 标准 context 做小范围收口；如果不确定范围，只总结本轮新增治理测试条目，不要误压旧的关键维护摘要。\n4. 调用 persona_manage.send 给 Matrix，极短汇报：datememory 已写 / fastmemory 已写 / Advisor context 已收口 / 是否还需要 Matrix 决策。\n5. 最终正文只用 4 行以内汇报实际完成项和失败项，不要粘贴大段日记原文。"
+}

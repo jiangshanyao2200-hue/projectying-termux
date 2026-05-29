@@ -1,0 +1,420 @@
+# 2026-05-18 Matrix 上下文阈值被动化收尾
+
+## 本轮修复
+- 发现 Matrix 的 context threshold 仍会自动生成系统维护批次，导致它收到 `上下文治理阈值已触发` 后只会“思考一下”，但不会形成稳定收口结果。
+- 已改成：静态 Matrix 的 `context` / `focuscontext` 维护只保留被动记录，不再自动排进系统批次；动态角色仍按原规则自管/司管，不受影响。
+- Matrix prompt 也同步改口：当自己的上下文逼近阈值时，优先自己用 `context_summary/context_compact` 收口，不要等系统代发维护批次。
+
+## 验证
+- `cargo test context_maintenance -- --nocapture`
+- `cargo test inactive_dynamic_role_self_compact_is_scanned_and_queued_for_role_target -- --nocapture`
+- `cargo test default_matrix_system_prompt_reflects_settings_driven_output_budgets -- --nocapture`
+- `cargo test --all-targets -q`：531 passed
+- `cargo build --release -q`：通过
+
+## Live 补测
+- 已停止旧 release 进程并启动新 release 实例。
+- 投递：`Aidebug/inbox/1779076972289-live-matrix-passive-context-20260518.json`
+- 已消费到：`Aidebug/processed/1779076991960-1779076972289-live-matrix-passive-context-20260518.json`
+- Matrix 回执：`PASS`。本轮只看到被动 `health/status` 提示，没有进入 `上下文治理阈值已触发` 或 `上下文自管压缩` 系统维护批次。
+
+# 2026-05-18 Live / Test 记录
+
+## Live smoke
+- 投递：`Aidebug/inbox/1779073268846-live-status-tool-smoke-20260518.json`
+- 萤已消费并回执。
+- 只做了 `tool_manage health` 和 `tool_manage list`。
+- 回执关键值：
+  - `roles_total=0`
+  - `visible_tabs=0`
+  - `role_ids=[]`
+  - `current_round_input_count=12`
+  - `active_context_kb=231`
+  - `context_limit_kb=200`
+  - `status_line=● Connecting ..`
+  - `health=BLOCKED`
+  - `tool list` 里出现 `command | view_image | update_plan | focus_mode | ...`
+- 结论：`status_line`、`health`、tool 投影三者不同步，且这些值看起来都是一次性快照，不会自动随本轮动作同步刷新。
+
+## Live 额外暴露
+- 这条 smoke 结束后，萤自己又挂起了 `context:vision_compact` 自管维护票据。
+- 后续状态变成 `● 上下文自管压缩回传中 ...`，说明简单探针也会把当前 Matrix 推进自压缩队列。
+- 这说明当前上下文压力已经很高，普通诊断会和维护请求抢占。
+- 后续状态已回到 idle / `● Ready`，但 `active_context_kb` 仍约 `239/200`；事件流出现 `scheduler.task.skipped reason=esc_cancel`，说明这次维护没有把上下文压力真正降下来。
+
+## 本地测试问题
+- `cargo test --all-targets -q` 失败于：
+  - `provider::tests::codex_tool_request_body_for_matrix_exposes_tool_manage_without_execution_tools`
+- 失败原因：测试里断言 `command` 不应出现在 Matrix tool list，但真实运行态里它出现了。
+- 更关键的是，这个测试没包 `with_test_home`，会吃到真实 home / 运行态状态，属于不稳定、非隔离测试。
+- 需要集中处理：
+  - 先把该测试隔离到 test home；
+  - 再确认 `command` 的默认投影到底该以文档为准还是以当前运行态为准。
+
+## 需要对账
+- `INDEX.md` 仍写着 Matrix 默认 `command/apply_patch/pty` 是 closed。
+- 但 live smoke 看到 `command` 在展开列表里。
+- 这里要么是 runtime state drift，要么是文档过期，要么是默认投影逻辑和持久化状态定义没有对齐。
+
+## 本轮已处理
+- 已修复非隔离单测：给 provider 测试模块补 `with_test_home`，并把 `codex_tool_request_body_for_matrix_exposes_tool_manage_without_execution_tools` 包到临时 home 内。
+- 处理后该测试不再读取真实运行态 home，因此不会被 live toolbox 状态污染。
+- 已修复 `exec_command` 旧别名权限问题：权限层现在把 `exec_command` 按 `command` 做 access/projection 判断；默认仍随 `command` closed，只有 `command` 已打开时旧别名才可通过。
+- 验证：
+  - `cargo test codex_tool_request_body_for_matrix_exposes_tool_manage_without_execution_tools -- --nocapture`：通过
+  - `cargo test exec_command_alias_follows_command_projection_for_matrix -- --nocapture`：通过
+  - `cargo test --all-targets -q`：`531 passed`
+
+## 仍待处理
+- live `status_line / health / tool list` 快照不同步。
+- 简单 live smoke 会触发 Matrix 自管 compact 维护，说明当前上下文压力会抢占普通诊断。
+- Matrix `command` 的默认投影口径需要继续对账：文档写 closed，live 回执里显示 expanded。
+
+# 2026-05-23 绘图链路与 Alt+↑ 窜台修复
+
+## 本轮发现
+- `draw_image` 旧链路只是把请求写到 `media/generated/requests/`，没有真的调用图片 API，也没有把最终图片落到 `media/camera/`。
+- `Alt+↑` 的“回退编辑上一条用户消息”只看 `role == User`，没限制 `source_channel`，所以 Persona / AiDebug 注入成 user 角色的消息也会被误编辑。
+- 角色 `hui` 的 glyph 仍是 emoji，和当前“中文汉字角色名”口径不一致。
+
+## 已处理
+- `draw_image` 改为直接调用 GPT Image 接口，成功后只保存最终图片文件到 `media/camera/`，不再落 request JSON sidecar。
+- `Alt+↑` 现在只会回退当前 tab 里真正的用户消息，Persona / AiDebug 注入消息会被跳过。
+- 角色 `hui` 的 glyph 已改成 `绘`，角色 prompt 也改成默认交付 `media/camera/`。
+
+## 回归
+- 已补 `draw_image` 本地 HTTP 回归：确认会生成真实图片文件、不会再写 `media/generated/requests/`，并且透明背景路径会产出带 alpha 的 PNG。
+- 已补 `Alt+↑` 回归：确认会忽略 Persona / AiDebug user 消息，只编辑当前 tab 的真实用户消息。
+
+## 2026-05-23 续查
+- Codex 本机 `imagegen` skill 的默认链路是直接生成真实位图；项目资产必须保存到项目目录。透明背景优先用纯色 chroma-key 生成后本地去背景，非必要不走 CLI fallback。
+- `draw_image` 现在从模型可见 schema 移除了 `output_dir`，执行层统一保存到 `media/camera/`；即使旧上下文残留 `output_dir:"media/generated"`，也会被执行层忽略。
+- `Coding / Server / 绘 / INDEX.md` 已同步改口：`draw_image` 是真实图片模型生成/编辑并等待最终图片落盘，不是 request JSON 记录器。
+- 动态角色 `绘(hui)` 的结构完整：`context_dir=hui`、可见 tab、`base_persona=matrix`、默认工具 `draw_image/view_image/ask_user/persona_manage`。已把 registry 与 `context/hui/state.json` 的 governance 从旧 `120/80KB` 改为 `800/1000KB`。
+- 角色 schema 已明确 `display_name` 用短中文名，`glyph` 用单个中文/CJK 字，不用 emoji；测试里的数字 glyph 也改为中文 glyph。
+- 短启 release 验证后，`Aidebug/status.json` 显示 `Ctx 55KB / soft 800KB / hard 1000KB`，`Date 187KB / 200KB`，`hui` contract 已是 `manage_threshold_kb=800`、`compact_threshold_kb=1000`。
+- 观察到历史状态里仍有旧的 DCIM/`media/generated` 话术和旧 `draw_image` 回执；这是历史聊天污染，不是新工具执行链路。后续如要彻底消除前台误导，应对 Matrix/hui 历史上下文做一次有边界的 summary/compact，而不是手工改写旧 tool log。
+
+# 2026-05-23 draw_image body-read retry hardening
+- 发现 `draw_image` 的失败不只会卡在 `req.send()`，还会卡在 `response.text()` / `resp.bytes()` 的 body 读取阶段；这类错误以前会直接冒泡，看起来像“没重试”。
+- 已把 `draw_image` 的 JSON / multipart / 下载三条链路都纳入重试，并把最终失败信息改成按尝试轮次展开，方便看出实际重试次数。
+- 角色 prompt 也补了统一约束：调用 `draw_image` 前先把视觉需求压缩成短结构化 brief，只保留主体、构图、风格、尺寸、文字、透明背景和硬约束，不要整段聊天原文直塞。
+- 已补一条本地 flaky-server 回归，覆盖首轮 body 读失败、第二轮成功的情况，避免以后再把 body 读错误误判成“没重试”。
+
+# 2026-05-23 Context / ToolMemory 收口
+
+## 本轮规则
+- active context 只保留关键信息摘要，不再落 raw `function_call` / `function_call_output` JSON。
+- toolmemory 继续保存原始 tool 轨迹、raw call JSON、raw output JSON、command/output 归档，用于后续精读回查。
+- 老旧 context 在加载时统一修复成摘要 message，避免历史 raw tool JSON 重新混进 provider 输入。
+
+## 验证
+- `cargo test load_provider_messages_repairs_legacy_raw_tool_codex_items_to_summary_messages -- --nocapture`
+- `cargo test append_codex_tool_replay_summarizes_tool_items_for_provider -- --nocapture`
+- `cargo test toolmemory_persists_rows_in_sqlite -- --nocapture`
+- `cargo test codex_context_replay_compacts_image_payloads_after_visual_round -- --nocapture`
+- `cargo test tool_event_metamemory_carries_context_entry_ids -- --nocapture`
+- `cargo check --all-targets`
+- `cargo test --all-targets -q`：`564 passed`
+2026-05-23 T-web install/launch live test
+- APK: android/agentbrowser/dist/t-web-debug.apk
+- package: io.projectying.agentbrowser
+- label: T-web
+- install: adb install -r success
+- launch: monkey launcher success; current focus on MainActivity
+- ui: no projectyingbrowser / ProjectYing Browser / Browser Container text found in dumped UI
+- icon: badging points to mipmap-anydpi-v26/ic_launcher.xml, launcher resources present
+- ProjectYing status: Aidebug/status.json active_request=true; events show provider latency and ui.tick_slow warnings; tool schema chars high in performance logs
+- risk: did not observe crash in adb logcat tail; still need follow-up if app UI content needs deeper visual QA
+
+# 2026-05-23 Matrix / 绘 draw_image live smoke
+- Matrix 通过 Aidebug inbox 成功消费 `live-matrix-image-smoke-20260523`，最终生成 `media/camera/draw-1779556404-1.png`（1024x1536，约 2.5MB）。
+- Matrix 首次直接调用 `draw_image` 被 focus gate 拦截：`当前任务已列出计划，后续复杂执行必须先进入专注模式`；模型随后自动 `focus_enter -> draw_image -> focus_exit`，最终成功。待评估：`draw_image` 这种单工具生图是否应豁免复杂执行 gate，或由工具层明确返回 failed 状态而不是普通 ok 回执。
+- `media/camera` 是 symlink 到 `/storage/emulated/0/DCIM/Camera`；排查文件时需要 `find -L media/camera`，否则普通 `find media` 不会列出相册里的图片，容易误判没有落盘。
+- 动态角色 `绘(hui)` 通过 `config/persona-commands.jsonl` 路由成功，status 暴露 `active_request_role_id=hui`，请求体约 17KB、工具 schema 约 9KB，明显小于 Matrix 常规请求。
+- `绘` 第二版直接调用 `draw_image`，未触发 focus gate，约 49.5s 成功生成 `media/camera/draw-1779556614-2.png`（1024x1536，约 2.6MB）。
+- status 细节：动态角色请求运行中会显示 `active_request_role_id=hui` 与 4.3K tokens；请求结束后顶层 `current_round_input_tokens/active_context_kb` 回到当前 Matrix tab 的 19.9K/92KB，`persona_usage` 仍只列内置 persona。后续如要复盘动态角色完成态，status 可能需要保留 last role request snapshot 或把动态角色纳入 usage 列表。
+- 排障易错点：persona command 队列真实路径是 `config/persona-commands.jsonl`，不是 `config/runtime/persona-commands.jsonl`；`config/runtime/` 目录名容易误导人工排查，后续可考虑统一命名或补 README。
+
+# 2026-05-23 Coding Tetris live test
+- 通过 Aidebug 投递 `live-coding-tetris-home-20260523` 给 Coding，任务是在 `/data/data/com.termux/files/home/tetris-web/` 创建可离线打开的网页版俄罗斯方块。
+- 初始请求：`estimated_input_tokens=11420`、`message_chars=14319`、`local_tool_schema_chars=30354`、`body_chars=45679`；约 3.0s 收到 headers，约 3.3s 收到 SSE first event，约 5.0s 首个模型 chunk。
+- Coding 首先调用 `update_plan`，随后在旧 AIChat focus 任务中反复 semantic idle。后来成功 `focus_exit` 旧 AIChat 任务，再 `focus_enter` 新 Tetris 任务。
+- 进入 Tetris focus 后卡在 Responses `round=3`：每次 POST 同一轮 `body_chars=47979`，均能收到 HTTP 200、`text/event-stream` 和 SSE first event，但 60s 内没有模型进展，触发 `SSE stream semantic idle timeout after 60s without model progress`。
+- 最终失败事件：`连续重连失败：5/5`，错误正文同时写 `第1-6次：SSE stream semantic idle timeout...`。这里存在口径不一致：UI/status 显示 5 次重连，最终错误又统计成 1-6 次。
+- 状态观测：运行中 `status_line` 从 `Connecting` 到 `Reconnecting 1/5..5/5`；`active_request_observation=tooling`、`active_request_tool_runs=3`、`active_request_thinking_chars=0`、`active_request_text_chars=0`；失败后回到 `Ready`。
+- 结果：`/data/data/com.termux/files/home/tetris-web` 没有创建任何文件，Coding 在真正施工前耗尽重连。
+- 上下文观测：失败后 Coding `current_input_tokens` 从运行中的约 11.9K 回到 9.5K，`active_context_kb` 从 47KB 回到 42KB；说明 focus/context 写入有一定回落，但这次没有完成真实工作。
+- 工具投影核对：Coding 当前同时暴露 `focus_mode` 与 `context_summary`；`context_manage` hidden、`context_compact/context_vision` closed。若“一个角色只能选择一套上下文管理体系”作为硬规则，Coding 这里需要明确 `focus_mode` 与 `context_summary` 是否属于同一体系，或关闭其中之一避免模型策略冲突。
+- 主要问题：工具 round 后 provider 能连通但无模型进展，重试只是在同一 round 重发，无法恢复到可施工状态；需要检查 Responses tool replay / function_call_output 拼接、semantic progress 判定、以及重试后是否应改变提示或降级为明确失败，而不是长时间空转。
+- 次要问题：`request_count` 仍显示 Coding 为 4，本轮多次 provider round / reconnect 没有映射成用户可理解的本次请求尝试次数；这和此前 `4.1W/1` 观察属于同一类 status 计数语义问题。
+
+## 继续复现
+- 用户反馈展开系统 error 看不到重试记录，直观看仍像“没有重试”。第二轮通过 Aidebug 投递 `live-coding-tetris-continue-20260523`，要求 Coding 继续 Tetris 并尽量直接施工。
+- 第二轮输入更小：`estimated_input_tokens=9571`、`message_count=5`、`message_chars=7584`、`local_tool_schema_chars=30354`、首轮 `body_chars=38282`；约 1.8s headers、2.0s SSE first event、3.3s first chunk。
+- Coding 仍先调用 `update_plan`，然后卡在 `round=1/body_chars=38662`。每次重连都能收到 HTTP 200、`text/event-stream` 和 SSE first event，但没有模型进展，也没有调用 `command/apply_patch`，`/data/data/com.termux/files/home/tetris-web` 仍未创建文件。
+- 第二轮事件日志明确存在 `request.retrying attempt=1..5/max_attempts=5`，所以底层有重试；但最终 `request.failed` 只把错误折成 `连续重连失败：5/5\n第1-6次：...`，前台 system error 展开态若不展示 retry 明细，会让用户误判为“没重试”。
+- 计数口径继续混乱：用户可见 retry 是 1/5..5/5；provider phase 的 `attempt` 在重连后仍显示 `attempt=2`；最终失败又写 `第1-6次`。需要统一为一个 request-level retry ledger，并把每次 retry 的时间、round、body size、失败原因和是否收到 headers/first_event 展示到系统错误卡展开态。
+- 结论：这不是简单网络断开，也不是上一轮旧 focus 污染；更像 Responses tool round replay 后，provider 只发事件心跳/空事件但没有语义进展，ProjectYing 的重试策略只是重复同一个不可恢复 round，最终失败。
+
+# 2026-05-23 SSE timeout / retry 全链路修复
+- 默认 API timeout 已统一改为 240s；当前 `config/{matrix,coding,server,advisor}` 与 `config/lastgood/*` 里的旧 60s 也同步更新，避免恢复 lastgood 后退回短超时。
+- SSE timeout 语义改为 transport idle：用户设置的 timeout 对流式请求表示“连续无任何 stream bytes 的最长等待”，不是整次请求总时长，也不是“无模型语义 delta”。非 SSE 仍按一次完整请求总时长处理。
+- 关键修复：SSE client 现在同时设置 `connect_timeout(timeout)` 和 `timeout(timeout)`。reqwest blocking 会把 `timeout()` 传给 `Response::read()`，每次底层 read 单独计时；只要服务端持续发送 SSE 字节或心跳，就不会因为总时长被误杀，真正停流才进入重试。
+- SSE reader 现在在读到任意行字节时刷新 stream activity，包括 heartbeat/comment 行；旧的 `semantic idle timeout after 60s without model progress` 逻辑已废弃。
+- 重试上限统一为 5 次重连；最终错误统一写 `连续重连失败：5/5` + `重试明细`，包含初始尝试和每次重试，前台 system error 展开后应能看到完整 ledger。
+- Codex provider 不再强制 SSE；API 设置里的 SSE 开关现在对 Codex 也生效。SSE off 会走非流式请求，是否被上游接受由用户自行判断。
+- 已补本地 TCP 回归：服务端返回 `text/event-stream` headers 后不发 body，客户端必须在 provider idle timeout 内结束读等待，而不是等服务端关闭。
+
+## 验证
+- `cargo fmt --manifest-path Cargo.toml`
+- `cargo test sse_client_timeout_applies_to_idle_body_reads --manifest-path Cargo.toml`
+- `cargo test request_reconnect_budget_defaults_to_five_retries --manifest-path Cargo.toml`
+- `cargo test retry_failure_message_lists_each_retry_attempt --manifest-path Cargo.toml`
+- `cargo test request_failure_notice_keeps_summary_and_attempt_lines --manifest-path Cargo.toml`
+- `cargo test sse_reader_treats_heartbeat_as_stream_activity --manifest-path Cargo.toml`
+- `cargo test sse_reader_times_out_only_without_stream_bytes --manifest-path Cargo.toml`
+- `cargo test codex_request_variants_respect_non_stream_setting --manifest-path Cargo.toml`
+- `cargo test codex_provider_respects_sse_off_for_non_stream_mode --manifest-path Cargo.toml`
+- `cargo test stream_timeout_uses_provider_idle_setting_directly --manifest-path Cargo.toml`
+- `cargo check --all-targets --manifest-path Cargo.toml`
+- `cargo test tool_manage_can_create_role_assign_tools_and_queue_role_send --manifest-path Cargo.toml`
+- `cargo test --all-targets -q`：`572 passed`
+
+## 顺手修复
+- 全量测试暴露一条旧断言仍期待 `_retired_roles` 归档目录；已改为符合现行规则：删除动态角色后直接清理 `context/Role_*`、`memory/Role_*`，不再保留 `_retired_roles`。
+
+# 2026-05-23 draw_image DCIM root / Coding timeout retest
+- 用户反馈 `media/camera -> /storage/emulated/0/DCIM/Camera` 下的生成图相册不显示；按新规则改为默认落到 `media/dcim -> /storage/emulated/0/DCIM`，不再默认写 Camera 子目录。
+- `draw_image` schema、`resolve_draw_image_output_dir`、媒体 README 映射说明与回归测试已同步改成 `media/dcim`。当前运行中的旧进程需要重启/重载后才会使用新默认路径。
+- 已手动创建当前工作区 `media/dcim` 软链接，并把刚才生成的 `draw-1779561754-2.png` 从 `/storage/emulated/0/DCIM/Camera/` 复制到 `/storage/emulated/0/DCIM/` 根目录。
+- 通过 Aidebug 投递 `20260523-coding-tetris-timeout-retest` 给 Coding 复测俄罗斯方块任务。首轮请求 headers 约 1.45s、first SSE event 约 1.68s、first chunk 约 3.0s；第一轮 SSE 持续约 112s 后正常结束并进入工具调用，未复现旧的 60s semantic idle timeout。
+- Coding 成功创建 `/data/data/com.termux/files/home/tetris-web/index.html`、`style.css`、`app.js`；最终 `request.completed`，总耗时约 138s，`final_text_chars=539`，`final_thinking_chars=755`，未出现 `request.retrying` / `request.failed`。
+- 观察到一个残余状态问题：请求已经收到 thinking chunk 并进入 tool round 时，status 仍长时间显示 `Connecting`，虽然 `active_request_observation=tooling` 是对的。后续应把 status_line 在 first chunk / tool activity 后切到 Thinking/Tooling/Streaming，而不是继续显示 Connecting。
+
+## 验证
+- `cargo test draw_image_generates_final_image_into_dcim --manifest-path Cargo.toml`
+- `cargo test draw_image_retries_body_read_failure_before_succeeding --manifest-path Cargo.toml`
+- `node --check /data/data/com.termux/files/home/tetris-web/app.js`
+- `cargo check --all-targets --manifest-path Cargo.toml`
+
+# 2026-05-23 tool externalized marker semantics
+- 用户测试发现工具标题里的 `↗` 外导箭头语义过宽：所有工具都会写 toolmemory，但并不是所有工具回执都超阈值外置。
+- 已收窄语义：`toolmemory_entry_id` 只表示工具记录存在；`archived_output` 才表示回执因预算/安全阈值被截断并需要外置读完整内容。UI 继续按 `archived_output.is_some()` 加 `↗`，因此小输出不再显示箭头。
+- 修复点：`command` 同步完成路径以前无论 `Output archive reason` 是否为 `(not archived)` 都设置 `archived_output=Some(merged)`；现在只有 `output_summary.save_reason.is_some()` 时才设置。
+- 预期：普通短命令、短工具回执不会显示 `↗`；超出预算的 command / 非 command 大输出仍显示 `↗`，并继续发 `tool.output.externalized` / toolmemory refs。
+
+## 验证
+- `cargo test build_tool_run_from_done_does_not_mark_plain_toolmemory_receipts --manifest-path Cargo.toml`
+- `cargo test exec_command_small_output_keeps_toolmemory_but_not_externalized --manifest-path Cargo.toml`
+- `cargo test build_tool_run_from_done_marks_archived_receipts --manifest-path Cargo.toml`
+- `cargo test summarize_command_output_archives_large_text_to_toolmemory_preview --manifest-path Cargo.toml`
+- `cargo check --all-targets --manifest-path Cargo.toml`
+
+# 2026-05-23 cold start idle guard / no auto-continue
+- 用户明确要求：重启后 Matrix 不能继续执行之前的任务，刚打开程序应保持空闲，等待用户新指令。
+- 启动链路已收口：`run_loop -> queue_startup_tasks()` 不再发启动问候模型请求，也不 reload provider / validate provider；只标记 `startup_greeting_announced=true` 并记录 `startup.idle_no_autorun`。重启后不会因为“上次在做什么”的问候拉起 Matrix 请求。
+- App 新增 `app_started_at_ms`。所有外部自动入口必须按启动时间过滤，避免把上个进程留下的文件当成本次用户意图。
+- `config/persona-commands.jsonl`：如果队列文件 mtime 早于本次启动，整队列删除并记录 `persona_command.stale_queue_skipped`；如果混合队列里单条 `created_at_ms` 早于启动，则跳过该条并记录 `persona_command.stale_request_skipped`。
+- `Aidebug/inbox`：`DebugInboxMessage` 增加 `created_at_ms`，JSON 可显式传入，否则使用文件 mtime。早于启动的 inbox 文件会移动到 `Aidebug/failed`，写入原因并记录 `aidebug.inbox_stale_skipped`，不会投递给 Matrix/Coding/Server。
+- 浏览器桥接 `server_call_request.json`：按 payload `created_at` 或文件 mtime 判断，`created_at` 同时兼容秒/毫秒时间戳；早于启动的旧投递直接删除并记录 `agentbrowser.server_call_stale_skipped`，避免打开 ProjectYing 后自动拉起 Server。
+- 当前实机目录核对：`Aidebug/inbox` 为空，`config/persona-commands.jsonl` 不存在。
+
+## 验证
+- `cargo test before_app_start --manifest-path Cargo.toml`
+- `cargo test startup_greeting --manifest-path Cargo.toml`
+- `cargo check --all-targets --manifest-path Cargo.toml`
+
+# 2026-05-23 cold start notice / HELP page
+- 冷启动仍不自动发 Matrix 请求，但第一次真正发给模型的用户请求会追加一次轻量系统提示：`[sys:cold_start_notice] 用户刚启动 Project 萤，可以简短总结之前大概做了什么，但不要自动继续或执行冷启动前的旧任务；只有用户本次明确提出新指令才行动。`
+- 该提示只注入一次，不持久写入 context，避免后续请求反复携带冷启动语义。
+- `/` 命令菜单新增 `HELP`，所有角色可用；Matrix 下菜单为 `SETTING / HELP / TERMINAL / QUIT`，其他角色与动态角色为 `SETTING / HELP`。
+- 新增本地 Help 页面，不走模型请求。进入后包含 4 个栏目：`1 程序说明`、`2 键位说明`、`3 常见问题`、`4 联系我们`；支持 `↑↓` 或数字 `1-4` 切换，`Esc` 返回。
+- 联系我们：QQ群 `1072327662`。
+
+## 验证
+- `cargo test help --manifest-path Cargo.toml`
+- `cargo test cold_start --manifest-path Cargo.toml`
+- `cargo check --all-targets --manifest-path Cargo.toml`
+
+# 2026-05-24 release preflight / remove hui role
+- 发布前按用户要求移除动态角色 `绘(hui)`。
+- 已更新 `context/roles.json` 为 `roles: []`，并删除角色运行目录 `context/hui` 与角色记忆目录 `memory/hui`。
+- 核对 `find context memory config -maxdepth 2 -iname '*hui*' -o -iname '*绘*' -o -iname '*Role_hui*'`：无角色目录残留。Matrix 历史上下文里对“绘”的旧聊天记录未清理，避免改写历史对话。
+- release 二进制：`target/release/projectying`，大小约 18M。
+
+## 验证
+- `cargo fmt --manifest-path Cargo.toml`
+- `cargo test --all-targets -q --manifest-path Cargo.toml`：`578 passed`
+- `cargo check --all-targets --manifest-path Cargo.toml`
+- `cargo build --release --manifest-path Cargo.toml`
+- `./target/release/projectying --help`
+
+# 2026-05-24 live performance test / Aidebug hot path trim
+- 通过 Aidebug 给 Coding 连续投递两轮实机任务：
+  - `20260524-coding-performance-live`：创建 `/data/data/com.termux/files/home/projectying-perf-demo` 离线番茄钟网页。
+  - `20260524-coding-performance-followup`：给番茄钟增加深浅色切换并验证。
+- 第一轮结果：请求成功完成，约 75.6s，4 个 responses/tool round，首包约 5.8s，`final_thinking_chars=374`，不是过度思考导致；但有 13 次 `ui.tick_slow`，约 190-295ms。
+- 第二轮结果：请求成功完成，约 62.1s，6 个 responses/tool round，无 `request.failed` / `request.retrying`；仍有 16 次 `ui.tick_slow`，约 168-506ms，慢点集中在 provider phase、tool envelope、apply_patch 与 flow UI applied。
+- 结论：本轮没有复现网络中断，主要性能瓶颈是运行时在主 tick 内同步写 Aidebug JSONL / performance / health，并且长 thinking/display 的状态统计存在重复全量 `chars().count()` 风险。
+- 已修复：
+  - `events.jsonl` 上限从 8MiB/保留 4MiB 调整为 4MiB/保留 1MiB，并手动把当前事件文件裁剪到约 1MiB，避免旧进程下一次触发大文件裁剪卡顿。
+  - `ui.tick` / `ui.draw` 慢帧不再落到 `events.jsonl`，只进入 `performance.json`。
+  - `tool.envelope.created` 不再写完整 envelope，只保留工具名、状态、摘要、预览、ref/artifact 数量和耗时，减少工具大输入对调试日志的放大。
+  - `performance.json` 普通快照节流从 250ms 放宽到 1000ms；重要请求/工具完成事件仍即时写。
+  - `health.json` 从每次 status 写入改为 5s 节流，`status.json` 仍保持约 1s 更新。
+  - `ChatMessage` 增加 thinking/plan/display 字符计数缓存，status 和活跃请求观测不再每次全量扫描长思考文本。
+  - 非命令模式下 palette 已空时不再每 tick 重复清空。
+- 注意：当前用户正在运行的 PID 仍是补丁前二进制；已完成 `cargo build --release --manifest-path Cargo.toml`，重启 ProjectYing 后新补丁才会生效，需要再做一轮 Aidebug 性能复测。
+
+## 验证
+- `cargo fmt --manifest-path Cargo.toml`
+- `cargo check --manifest-path Cargo.toml --all-targets`
+- `cargo test --manifest-path Cargo.toml status_title_tests --quiet`：`6 passed`
+- `cargo build --release --manifest-path Cargo.toml`
+
+# 2026-05-24 full performance retest / main-loop throttling
+- 用户重启后继续全面性能测试。空闲基线正常：新进程 PID `16548`，RSS 约 13.5MB，CPU 约 1.6%；`performance.json` 空闲无慢帧，`events.jsonl` 不再写 `ui.tick`，说明上一轮 Aidebug JSONL 收敛已生效。
+- Matrix 短请求测试 `20260524-matrix-short-perf`：
+  - 不调用工具，仅回复一句话。
+  - 约 6.1s 完成；headers 约 4.65s，first SSE event 约 4.99s，first chunk 约 5.76s；无失败无重试。
+  - 仍出现一次 `ui.tick_slow=679ms`，发生在 Aidebug 投递/请求启动瞬间；Matrix tool schema 约 49,966 chars。
+- Coding 工具链测试 `20260524-coding-toolchain-perf`：
+  - 在 `/data/data/com.termux/files/home/projectying-perf-demo` 加 `prefers-reduced-motion` 和版本号 `v0.2`。
+  - 约 43.9s 完成，5 个 responses/tool round，10 个工具完成事件；无失败无重试。
+  - 思考约 444 chars，正文约 353 chars；不是过度思考问题。
+  - RSS 约 15-19MB，CPU 采样约 4-5%。
+  - 仍出现多次 `ui.tick_slow`，约 187-514ms；慢点集中在请求启动、首包/流式边界、工具完成、context_summary/focus/command 回执处理附近。
+- 结论：日志大文件问题已明显收敛，但主循环仍会被同步工作阻塞。主要剩余来源：
+  - 请求启动阶段同步写 context、加载 provider messages、组装工具 schema。
+  - 请求运行中每 3 秒上下文维护扫描可能穿插进主 tick。
+  - 普通工具完成后强制 `sync_context_runtime_state_force()`，会重复读取 context view/status stats。
+  - StreamChunk 当前允许一帧内批量吞完，可能在高频 chunk 时放大停顿。
+- 已继续修复：
+  - `on_tick` 每帧最多处理 32 个模型输出，或 18ms 到预算即让出下一帧，避免一帧吞太多 stream chunk。
+  - 请求运行期间跳过周期性上下文维护扫描，等空闲或完成后再扫。
+  - 普通工具完成后改为节流版 `sync_context_runtime_state()`；只有 `context_manage/context_summary/context_vision/focus_mode/persona_manage/memory_*` 这类改变上下文/治理状态的工具才强制同步。
+- 注意：上述二次主循环补丁已构建 release，但当前用户界面的 PID 仍是补丁前启动的运行进程，需要再次重启后才能复测这批主循环优化。
+
+## 验证
+- `cargo fmt --manifest-path Cargo.toml`
+- `cargo check --manifest-path Cargo.toml --all-targets`
+- `cargo build --release --manifest-path Cargo.toml`
+
+# 2026-05-26 ProjectYing live observe / Server task
+- 观察入口：`Aidebug/status.json`、`health.json`、`performance.json`、`events.jsonl`。
+- 本轮 Server 请求 `debug_session_id=persona-1779759920619-1`、`request_id=3` 成功完成，无 `request.failed` / `request.retrying`；`health.json` 为 `PASS`，结束后 `status_line=● Ready`。
+- 发现 Aidebug 观测面 bug：`events.jsonl` 的同一批 `tool.done` 事件包含 `toolmemory_entry_id=2392/2393/2394`，但 `performance.json.recent_tools` 对应 `server#3#...` 记录为 `toolmemory_entry_id:null`。
+- 根因线索：`Aidebug/aidebug.rs::observe_tool_done()` 写 `recent_tools` 时用 `value_opt_string(data, "toolmemory_entry_id")`，而事件里的 id 是数字，导致性能快照丢失 toolmemory 追踪 id。
+- 影响：性能快照和 `tool.output_chars` 告警无法直接跳转/对账 toolmemory，排查大工具回执时仍需回查 `events.jsonl`。
+- 额外观察：本轮有 info/warn 级 `ui.tick_slow` 与 `network.first_event_slow`，但请求完成且没有硬失败，暂不按功能 bug 记录。
+
+# 2026-05-26 ProjectYing live observe / Server context visibility
+- 继续观察 Server / 御 的上下文整理方式：最近没有真正调用 `context_summary`、`context_compact` 或 `context_manage`，但有显式 `focus_mode` 进入/退出任务，以及 `codex replay compacted` 的请求体压缩。
+- `context/Server/state.json` 里实际治理口径是 `manage_threshold_kb=160`、`compact_threshold_kb=120`，而 `status.json` 仍主要展示全局 `800/1000KB` 口径；当前 `active_context_kb=160`，正好压在线上。
+- 这会造成“看不到御在整理上下文，但上下文像是一直被整理”的错觉：真正发生的是任务级 `focus_mode` 收口和 provider 回放压缩，前台未把 Server 的实际 context_governance 触发点讲清楚。
+- 影响：观察者很难仅靠 `status/health` 判断 Server 为什么持续被收口，建议后续把 `context_governance` 的实际阈值和触发原因直接暴露到状态快照里。
+
+# 2026-05-26 ProjectYing live observe / context governance projection fix
+- 继续核对投影链后，确认静态 persona 的工具流缺口来自 `toolbox` 投影层，没有把 `context/<Persona>/state.json` 里的 `meta.context_governance` 反映到前端工具状态。
+- 已修复源码投影逻辑：builtin persona 现在会读取本地 state 里的 governance mode，并按 `summary_compact -> context_summary/context_compact`、`vision_compact -> context_vision/context_compact` 自动展开对应工具。
+- 这次对账里，Server 的 `context_governance=summary_compact` 终于能在投影里看到 `context_compact`，Matrix 的 `vision_compact` 也能看到 `context_vision/context_compact`；不再只显示一半工具。
+- 同步补了回归：静态 persona state 里即使把相关工具存成 closed，投影也必须按治理模式展开。
+- 注意：当前正在运行的旧 ProjectYing 进程仍会按旧逻辑刷新 `Aidebug/tool_projection_snapshot.json`，所以需要用新构建重启后，前端 UI / Aidebug 快照才会稳定显示新投影。
+- 结论：前端“看不到御在整理上下文”的一部分，是因为状态文件和工具投影没对齐，不是上下文真的没在收口。
+
+# 2026-05-26 ProjectYing live observe / frontend bottom status cleanup
+- 观察到 Server 角色下方 STATUS 泄露了内部资源/调试状态：`SERVER FOCUS`、`g5.5`、`IDLE`、`rM tF`、`Tool NORMAL`、TOKEN / Ctx / Date 等。这些信息属于 Aidebug 观测链路，不应该直接显示给普通前端用户。
+- 排查链路确认不是 Server 专属问题：底部状态由 `ui::draw_bottom_status()` 统一渲染，原先直接调用全局 `App::status_resource_line()`，因此 builtin persona 和动态角色都会受影响。
+- 已处理：新增前端专用 `App::bottom_status_line()`，底部 STATUS 对用户侧保持空白；保留 `status_resource_line()` 作为内部资源状态格式化，供 Aidebug/测试/后续诊断继续使用。
+- 范围：Server、Matrix/Coding/Advisor 等 builtin persona，以及新建动态角色统一走同一条底部渲染路径；输入状态栏和顶部状态栏不受这次清理影响。
+- 注意：当前正在运行的旧 ProjectYing 进程仍是旧二进制，需要重启后才会看到底部 STATUS 清理效果。
+
+## 验证
+- `cargo fmt --manifest-path Cargo.toml --check`
+- `cargo test --manifest-path Cargo.toml bottom_status_line_hides_aidebug_resource_details_from_frontend -- --nocapture`：`1 passed`
+- `cargo test --manifest-path Cargo.toml bottom_status_resource_line_reports_usage_and_pressure -- --nocapture`：`1 passed`
+- `cargo test --manifest-path Cargo.toml dynamic_role_input_status_does_not_duplicate_identity_on_connection_state -- --nocapture`：`1 passed`
+- `cargo build --release --manifest-path Cargo.toml`
+
+# 2026-05-26 ProjectYing live observe / Matrix-Coding provider smoke
+- 通过 `Aidebug/inbox/20260526-matrix-coding-provider-smoke.json` 投递 `debug_session_id=dbg-20260526-matrix-coding-provider-smoke`，要求 Matrix 同时派发 Server / Coding，并观察回流。
+- 运行态证据显示 Coding provider 切换已经生效：本轮 `request_id=7`、`debug_session_id=persona-1779774397457-5` 的 `request.sent` 为 `provider=大猫`，请求 URL 为 `https://api.rainp.xyz/v1/responses`，headers 返回 `200`，不再走旧的 `https://api.xiaojiu.one/responses`。
+- Server 链路也完成：`request_id=6`、`provider=大猫`，结论是当前没有 pending 堆积，`system_request_dispatch_state=idle`，但有历史 `failed_requests=2` 与 network/UI slow 告警。
+- Matrix 调度链路可用：Matrix 发出了 Server/Coding 任务，随后 `persona_manage.observe` 两边；Coding 也用 `persona_manage.send` urgent 回传给 Matrix，Matrix 生成了 `request_id=8` 并完成合并回执。
+- 新发现的观测问题：`Aidebug/latest_reply.txt` 是全局最近回复，本轮 Matrix 最终回执先完成后，又被后续 Coding 收口回复覆盖成 `persona: Coding`；多角色协作时不能只靠 `latest_reply.txt` 判断 Matrix 最终结论，建议后续增加按 persona 的 latest reply 或按 `debug_session_id` 查询。
+- 新发现的协作问题：Coding/Matrix 的最终文字结论混入了旧的 `coding#3`/`xiaojiu.one` provider.auth 证据；但本轮实时请求已经在 `rainp.xyz` 上成功启动。说明当前回流缺少“按 persona_manage dispatch id / request_id 锚定当前任务”的生命周期状态，容易把历史故障当成本轮故障。
+- 后续最小增强方向：给 `persona_manage.send` 的 queued id 暴露 `queued -> delivered -> running(request_id/provider/url) -> completed/failed` 状态，并让 observe/AI 调试按 dispatch id 读取，避免 Matrix 只靠折叠聊天和历史日志判断。
+
+# 2026-05-26 ProjectYing source fix / Matrix dispatch lifecycle
+- 已在源码层补齐 Matrix 调度观测闭环：`persona_manage.send/interrupt` 排队时写入 `Aidebug/persona_dispatch.jsonl`，运行时继续记录 `queued / requeued / delivered / running / completed / failed / skipped`，并带上 dispatch id、request_id、provider/model、source/target persona、动态 role 字段、错误分类等调试字段。
+- `persona_manage.observe` 现在会在折叠聊天下追加 `recent_persona_dispatch` 摘要，Matrix/司可以低成本看到某个 persona 或动态 role 最近派单是否真正启动、完成或失败，不必只靠全局 events 和历史聊天推断。
+- 已处理 `Aidebug/latest_reply.txt` 覆盖问题：保留全局 latest reply 兼容入口，同时新增 `Aidebug/latest_reply/<Persona>.txt` 分角色最近回执，避免 Coding/Server 后完成时覆盖 Matrix 最终结论。
+- 前端 UI 没有新增这些内部字段；AIDEBUG 账本和 per-persona latest reply 都只走 Aidebug 文件链路与 observe 工具输出，继续避免把调试状态泄露到底部 STATUS。
+- 验证：`cargo check --all-targets` 通过；新增/更新测试通过：`latest_reply_keeps_global_and_per_persona_files`、`persona_dispatch_observation_filters_persona_and_role`、`persona_manage_send_queues_runtime_command`、`persona_manage_observe_returns_folded_summary_without_full_tool_output`、`persona_command_send_is_consumed_by_target_persona_runtime`。
+- 源码备份：`/data/data/com.termux/files/home/AItermux/projectying-backups/projectying-source-20260526-060257-matrix-dispatch.tar.gz`。
+
+# 2026-05-27 Server 御网络分裂工具
+- 新增 Server-only MCP 工具 `server_split`：Server/分裂御可 `list/status`、`split/create`、`split_batch/create_batch`、`send/communicate`、`close/close_batch/close_all`。
+- 分裂御落在现有动态角色体系，不新建独立孤岛：role id 固定为 `server_yu_a` 到 `server_yu_j`，最多 10 个；显示标签支持 `御A`、`御B`，base_persona=Server，copy_source=server，默认继承 Server 展开的工具（含 `server_manage`、`server_split`、`persona_manage` 等）。
+- 创建时支持 `task/message/server_id/server_name/items` 直接派送任务；派送和 communicate 复用 `persona_manage` 的 target_role 队列，因此进入现有 dynamic role runtime、Aidebug dispatch ledger 和 per-role 上下文链路。
+- “不断连”处理：`close` 不删除 context/memory，不调用 role_remove，只把分裂御设为 disabled；重新 split 同一槽位会复用并 re-enable，避免关闭动作破坏已有上下文和运行态产物。关闭状态下拒绝新 communicate，防止消息退回 Server 本体造成串流。
+- Server prompt 已同步说明 `server_split` 使用场景：多服务器防御/管理、互相配合调试、创建时派单、关闭保留上下文。
+- 验证：
+  - `cargo test server_persona_exposes_server_manage_and_ssh_targets --manifest-path Cargo.toml -- --nocapture`
+  - `cargo test system_prompt_requires_server_management_and_ssh_rules --manifest-path Cargo.toml -- --nocapture`
+  - `cargo test server_split_creates_queues_and_closes_without_deleting_context --manifest-path Cargo.toml -- --nocapture`
+  - `cargo test dynamic_role --manifest-path Cargo.toml -- --nocapture`
+  - `cargo check --all-targets --manifest-path Cargo.toml`
+  - `cargo build --release --manifest-path Cargo.toml`
+
+# 2026-05-27 底部资源阈值栏修复
+- 用户纠正：底部那条不是普通 `STATUS`，而是资源阈值/上下文压力栏，应继续显示 `Per / TOKEN / Ctx / Date` 等信息。
+- 排查确认：`status_resource_line()` 没被删，仍保留完整资源线；但两份源码备份里的 `bottom_status_line()` 都已经返回整行空白，导致前端底部资源栏消失。
+- 已把前端底部恢复为资源阈值线：显示 `✲ Per ... TOKEN ... Ctx ... Date ...`，但继续过滤 `SERVER FOCUS / g5.5 / IDLE / rM tF / Tool NORMAL` 这些用户不需要看的内部状态字段。
+- 同步把底栏背景改回可识别的 panel 色块，保证栏位本身仍可见。
+- GitHub 核对：本地 `HEAD` 与本地缓存的 `origin/main` 都是 `8d89b103ba4c6a4357534083ab0ebcfa870147c2`；但 `git fetch origin --prune` 返回 `Repository not found`，GitHub 实时远端不可验证，可能是仓库私有、改名或 remote URL 失效。
+- 运行态核对：当前正在跑的 `projectying` 进程还挂着旧的已删除二进制，`/proc/26494/exe -> .../target/release/projectying (deleted)`，其二进制时间戳是 `17:06`；最新 release 文件时间戳是 `17:24`。也就是说，虽然源码和 release 已更新，但旧进程还没重启，UI 还不会立刻切到最新版本。
+- 验证：
+  - `cargo test bottom_status_line_shows_resource_metrics_without_aidebug_resource_details --manifest-path Cargo.toml -- --nocapture`
+  - `cargo test bottom_status_resource_line_reports_usage_and_pressure --manifest-path Cargo.toml -- --nocapture`
+  - `cargo check --all-targets --manifest-path Cargo.toml`
+  - `cargo build --release --manifest-path Cargo.toml`
+
+# 2026-05-27 角色输入框状态栏统一收口
+- 用户确认：所有角色状态栏应和 Matrix 走一致的前端路线，但每个角色保留自己的状态；角色输入框状态栏不要显示调试/内部字段。
+- 已处理：`ui::status_height()` 和 `ui::draw_input_status()` 统一只消费 `App::input_status_lines()`，避免 Settings/Help/Main 各自绕一条渲染入口。
+- 已校正：Help 页也通过统一入口调用 `help_status_line()`，保留原本随帮助分区变化的状态文本。
+- 已处理：动态角色输入状态不再额外拼 `工 ·` 这类身份前缀；角色身份由标签/头部展示，输入框状态栏只显示标准 `● Ready`、连接、工具调用、用户可读操作结果等状态。
+- 已处理：`App::input_status_lines()` 增加前端过滤，误进入输入状态栏的 Aidebug/debug_session 文字、完整内部资源诊断行（含 `TOKEN/Ctx/Date`、`Tool Normal` 等）会被隐藏并回退为 `● Ready`。Aidebug 信息仍保留在 Aidebug 文件链路，不向用户前端状态栏暴露。
+- 底部资源阈值栏保持显示 `Per / TOKEN / Ctx / Date`，并继续不显示 `SERVER FOCUS / g5.5 / IDLE / rM tF / Tool NORMAL`。
+- 验证：
+  - `cargo test dynamic_role_input_status_uses_standard_status_route --manifest-path Cargo.toml -- --nocapture`
+  - `cargo test bottom_status_line_ --manifest-path Cargo.toml -- --nocapture`
+  - `cargo test input_status_lines_hide_internal_debug_and_resource_statuses --manifest-path Cargo.toml -- --nocapture`
+  - `cargo test dynamic_role_status_bars_use_standard_frontend_routes --manifest-path Cargo.toml -- --nocapture`
+  - `cargo test dynamic_role_view_surfaces_its_own_topbar_and_standard_status --manifest-path Cargo.toml -- --nocapture`
+  - `cargo check --all-targets --manifest-path Cargo.toml`
+  - `cargo fmt --manifest-path Cargo.toml --check`
+  - `cargo build --release --manifest-path Cargo.toml`
+
+# 2026-05-27 全角色 tool_manage / server_split 投影收口
+- 用户要求：`server_split` 进入 toolbox，非 Server 默认折叠，只对 Server 展开；其它角色也要能自助 `tool_manage`，不必再经 Matrix 多转一步。
+- 已修复：`PersonaKind::tool_management_enabled()` 现在对 Matrix / Advisor / Coding / Server 都返回 true，因此所有静态角色都能看到自己的 `tool_manage` 入口。
+- 已修复：`server_split` 在非 Server 上从 hidden 改为 closed。这样其它角色能在 toolbox 里看到它，但默认不会直连可调用；Server 仍然 expanded。
+- 已修复：`tool_manage` 执行层现在允许各角色管理自己的 toolbox；只有 Matrix/司 才能带 `persona` 做跨 persona 治理。动态角色默认只管自己的 context，不再把 `tool_manage` 当成可打开的普通工具卡。
+- 已同步 prompt/schema：Coding、Server、Advisor、Matrix 与 Matrix 侧 `codex_tools` schema 都改成“自助管理自己的 toolbox，跨 persona 只给 Matrix/司”的口径。
+- 已补回归：
+  - Coding/Server/Matrix 的 `tool_manage` 可见性与 `server_split` 投影测试
+  - Coding 自助打开 `pty_input`，以及禁止跨 persona 管理的测试
+  - Aidebug `tool_projection_snapshot` 生成器测试：四个 builtin persona 都必须暴露 `tool_manage`，非 Server 的 `server_split` 必须是 closed，Server 必须 expanded
+  - `server_split` 创建/关闭/派发保留上下文的测试
+  - 代码和 provider schema 的全量测试
+- 结果：
+  - `cargo test --all-targets -q`：589 passed
+  - `cargo check --all-targets --manifest-path Cargo.toml`：通过
+  - `cargo build --release --manifest-path Cargo.toml`：通过
+- 运行态对账：
+  - 当前正在跑的 `/proc/27824/exe` 仍指向 `target/release/projectying (deleted)`，说明旧进程还没重启。
+  - Aidebug 快照在旧进程下仍能看到旧状态：Matrix 有 `tool_manage`，但 Advisor/Coding/Server 还没加载本轮新投影；非 Server 的 `server_split` 也仍显示 hidden。
+  - 这不是代码没改到，而是运行中的 ProjectYing 还在用旧二进制。需要重启后 Aidebug 才会反映这轮修复。

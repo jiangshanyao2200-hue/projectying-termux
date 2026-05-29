@@ -1,0 +1,191 @@
+{
+  "protocol_version": 2,
+  "ts_ms": 1780016315193,
+  "source_status_ts_ms": 1780016315189,
+  "overall_score": 100,
+  "overall_state": "PASS",
+  "chains": [
+    {
+      "id": "persona.foundation",
+      "label": "persona 基础链路",
+      "state": "PASS",
+      "score": 100,
+      "weight": 15,
+      "evidence": [
+        "persona_catalog=Matrix|Advisor|Coding|Server",
+        "active_persona=Matrix"
+      ],
+      "action_hint": null
+    },
+    {
+      "id": "dynamic_role.governance",
+      "label": "动态角色治理链路",
+      "state": "PASS",
+      "score": 100,
+      "weight": 20,
+      "evidence": [
+        "roles_total=0",
+        "enabled_roles=0",
+        "visible_tabs=0",
+        "role_ids=",
+        "registry_idle=true"
+      ],
+      "action_hint": null
+    },
+    {
+      "id": "communication.persona_manage",
+      "label": "communication 链路",
+      "state": "PASS",
+      "score": 100,
+      "weight": 15,
+      "evidence": [
+        "system_request_dispatch_state=idle",
+        "pending_system_requests=0",
+        "persona_manage protocol present in tool surface"
+      ],
+      "action_hint": null
+    },
+    {
+      "id": "memory.datememory.sql",
+      "label": "datememory SQL 日记",
+      "state": "PASS",
+      "score": 100,
+      "weight": 5,
+      "evidence": [
+        "datememory_sql_entries=74"
+      ],
+      "action_hint": null
+    },
+    {
+      "id": "memory.datememory.buffer",
+      "label": "datememory 缓冲入库链路",
+      "state": "PASS",
+      "score": 100,
+      "weight": 10,
+      "evidence": [
+        "datememory_context_kb=83",
+        "datememory_context_limit_kb=200",
+        "datememory_pressure_percent=41",
+        "datememory_context_over_limit=false"
+      ],
+      "action_hint": null
+    },
+    {
+      "id": "context.manage",
+      "label": "context 链路",
+      "state": "PASS",
+      "score": 100,
+      "weight": 15,
+      "evidence": [
+        "active_context_kb=286",
+        "context_soft_limit_kb=800",
+        "context_limit_kb=1000",
+        "context_pressure_percent=35",
+        "context_hard_pressure_percent=28",
+        "context_mode=Standard",
+        "focus_task_brief=(none)"
+      ],
+      "action_hint": null
+    },
+    {
+      "id": "token.budget",
+      "label": "token 链路",
+      "state": "PASS",
+      "score": 100,
+      "weight": 10,
+      "evidence": [
+        "current_round_input_tokens=57136",
+        "current_round_input_count=1",
+        "active_request_persona=None",
+        "active_request_role_id=None",
+        "session_input_tokens=57170",
+        "session_output_tokens=0",
+        "active_context_kb=286",
+        "context_soft_limit_kb=800",
+        "context_limit_kb=1000",
+        "context_pressure_percent=35",
+        "context_hard_pressure_percent=28",
+        "active_context_m=0.3M",
+        "context_limit_m=1.0M",
+        "datememory_context_kb=83",
+        "datememory_context_limit_kb=200",
+        "datememory_pressure_percent=41",
+        "datememory_context_over_limit=false",
+        "input_warn_tokens=160000",
+        "input_hard_tokens=200000"
+      ],
+      "action_hint": null
+    },
+    {
+      "id": "tool.mcp",
+      "label": "tool 链路",
+      "state": "PASS",
+      "score": 100,
+      "weight": 10,
+      "evidence": [
+        "ToolOutputEnvelope v1; large outputs externalize to memory/output and emit tool.output.externalized; memory_read target=output is the only model-facing live-output reader and supports latest/tail/range/since_cursor/summary/full with 32KiB default and 128KiB hard cap",
+        "DynamicRoleContract v1; Matrix-created roles expose identity/storage/capability/context_governance, standard context+memory layout, required persona_manage tooling, independent chat session, UI tab contract, and governance catalog summary",
+        "scheduler.task.started/progress/done/timeout/cancelled/skipped; dedupe_key + deadline + cancel scope; payload_policy=replace_not_stack; retries must not append prior failed payloads"
+      ],
+      "action_hint": null
+    },
+    {
+      "id": "config.governance",
+      "label": "配置治理链路",
+      "state": "PASS",
+      "score": 100,
+      "weight": 5,
+      "evidence": [
+        "tool_manage.settings governance v1; Matrix-only unified settings route manages KB tool-output budgets, Matrix system experience parameters, theme, and static persona provider/model routing; dynamic roles stay under role/context_governance routing; context_governance_set remains separate for advisor_managed/self_compact thresholds",
+        "active_provider=聚合CODEX",
+        "active_model=gpt-5.5"
+      ],
+      "action_hint": null
+    },
+    {
+      "id": "ui.contract",
+      "label": "UI 链路",
+      "state": "PASS",
+      "score": 100,
+      "weight": 5,
+      "evidence": [
+        "active_role_id=None",
+        "active_role_label=None",
+        "status_line=● Ready"
+      ],
+      "action_hint": null
+    },
+    {
+      "id": "scheduler.lifecycle",
+      "label": "调度链路",
+      "state": "PASS",
+      "score": 100,
+      "weight": 5,
+      "evidence": [
+        "active_request=false",
+        "active_request_persona=None",
+        "active_request_role_id=None",
+        "active_request_observation=idle",
+        "active_request_tool_runs=0",
+        "queued_user_messages=0"
+      ],
+      "action_hint": null
+    },
+    {
+      "id": "tool.projection",
+      "label": "tool 投影链路",
+      "state": "PASS",
+      "score": 100,
+      "weight": 8,
+      "evidence": [
+        "tool_projection_snapshot=/data/data/com.termux/files/home/AItermux/projectying/Aidebug/tool_projection_snapshot.json",
+        "builtin_personas=4",
+        "dynamic_roles=0",
+        "personas=4",
+        "projection_override_active=false",
+        "tool_drift_count=0"
+      ],
+      "action_hint": null
+    }
+  ]
+}

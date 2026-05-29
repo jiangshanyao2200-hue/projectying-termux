@@ -1,0 +1,1 @@
+{"persona":"matrix","debug_session_id":"dbg-context-governance-live-self-20260516-4","text":"使用 tool_manage。action=context_governance_set，role_ids=[\"worker\"]，mode=self_compact，manage_threshold_kb=200，compact_threshold_kb=32，report_to_matrix=true。执行后仅简短汇报结果，不要闲聊。"}

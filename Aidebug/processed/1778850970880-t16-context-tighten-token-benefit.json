@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-matrix-context-tighten-token-benefit-20260515-16",
+  "text": "Aidebug T16：健康面板驱动的最小 context 收口测试。目标：验证 Matrix 能根据 tool_manage health / status 中的 context.manage DEGRADED 做一次最小 context_manage summary 收口，并评估是否减少 active_context_entries / message_chars / estimated_input_tokens。限制：不要清空 datememory，不要删除或覆盖长期记忆，不要发送 worker，不要启动子代理，不要使用 pty，不要高频 observe。步骤：1) 先调用 tool_manage health 读取健康快照；2) 如果 context.manage 是 DEGRADED，只对 Matrix 自身做一次最小 context_manage summary，摘要内容只保留 T7-T15 已验证结论和当前下一步，不要把大段聊天正文写回；3) 退出任何 focus；4) 最终只输出这些 marker：HEALTH_TOOL_READ, CONTEXT_TIGHTEN_ACTION, NO_DESTRUCTIVE_MEMORY_ACTION, NO_WORKER_SEND, NO_PTY_OR_AGENT, FOCUS_STATUS, TOKEN_BENEFIT_NEXT_CHECK，并给出 before/after 能读到的 active entries 或说明无法读取。"
+}

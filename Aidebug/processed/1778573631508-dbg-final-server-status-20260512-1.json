@@ -1,0 +1,1 @@
+{"persona":"server","debug_session_id":"dbg-final-server-status-20260512-1","text":"【Aidebug 实机测试】请调用 server_manage status 查看当前 Server · 御 绑定服务器状态，不要执行远程命令。回复必须包含 DBG_SERVER_STATUS_OK，并说明 configured/auth/ssh/sshpass 的状态。"}

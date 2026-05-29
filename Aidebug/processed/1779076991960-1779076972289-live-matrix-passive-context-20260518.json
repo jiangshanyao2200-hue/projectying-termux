@@ -1,0 +1,1 @@
+{"persona":"matrix","debug_session_id":"live-matrix-passive-context-20260518","text":"请只做最小实机自检：1) 读取 tool_manage health；2) 读取 tool_manage list；3) 只回答你是否还会被自动推送 `上下文治理阈值已触发` 或 `上下文自管压缩` 这类系统维护批次。若只看到被动提示/状态而没有进入系统批次，请明确写 PASS；若仍收到系统维护消息，请明确写 FAIL。不要展开计划、不要修复、不要闲聊。"}

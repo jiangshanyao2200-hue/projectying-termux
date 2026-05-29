@@ -1,0 +1,5 @@
+{
+  "persona": "coding",
+  "debug_session_id": "20260524-coding-performance-followup",
+  "text": "性能复测任务：在 /data/data/com.termux/files/home/projectying-perf-demo 的番茄钟网页上做一次小迭代，新增一个深浅色切换按钮并持久化到 localStorage，保持三文件结构。请直接修改并做轻量验证，少长篇思考，完成后只报告改动和路径。"
+}

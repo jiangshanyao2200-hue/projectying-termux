@@ -1,0 +1,9 @@
+persona: matrix
+
+请对当前运行中的 ProjectYing 做一轮真实 Aidebug 探针，只记录事实，不做大修。
+
+重点检查两条：
+1. 新增的 fastmemory.public / SharedBoard 是否真的进入动态角色 provider 系统提示。请临时创建或重载一个最小动态角色探针，确认它能看到 Matrix 维护的共享板，并把共享板内容作为跨角色协调信息读取。
+2. update_plan 之后的恢复门控是否已经变轻。请验证 command 不再被无意义长时间卡住；如果仍然需要 focus_mode，也要确认这只是一次短恢复，不是任务阻塞。
+
+请把测试事实写入 Aidebug 的报告或日志，给出 PASS / FAIL / DEGRADED 结论，并保留关键证据路径。

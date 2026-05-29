@@ -1,0 +1,1155 @@
+    json!([
+        {
+            "type": "function",
+            "name": "command",
+            "description": "Run a one-shot shell command. Use this for reads, search, builds, tests, adb, or termux-api calls that should return in the same tool round. Prefer a deterministic workflow: inspect narrowly first, then widen only if needed, then modify or verify. When several independent read/search/status calls are needed, emit them directly in the same round; the runtime can batch eligible read-only calls natively. Do not use this tool for interactive or long-running terminal sessions; use `pty_run` instead.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cmd": {
+                        "type": "string",
+                        "description": "Shell command to execute. Prefer precise, low-risk commands over giant dumps; read the smallest useful slice first."
+                    },
+                    "target": {
+                        "type": "string",
+                        "enum": ["local", "ssh"],
+                        "description": "Execution target. `local` runs on this Termux device and is the default. `ssh` is only for Server · 御: it runs the command on one of the AI-managed servers, using the active server by default or a specific `server_id` / `server_name` when provided."
+                    },
+                    "server_id": {
+                        "type": "string",
+                        "description": "Optional server id or selector for `target=ssh`."
+                    },
+                    "server_name": {
+                        "type": "string",
+                        "description": "Optional server name selector for `target=ssh`."
+                    },
+                    "brief": {
+                        "type": "string",
+                        "description": "Optional short Chinese purpose sentence for UI display, such as 查看当前目录 or 运行 Rust 测试."
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Optional working directory to run the command in; defaults to the current ProjectYing project root. Relative paths resolve from the project root; use absolute paths for external directories. `home` / `home/...` is treated as a Termux home alias."
+                    },
+                    "shell": {
+                        "type": "string",
+                        "description": "Shell binary to launch. Defaults to the user's default shell."
+                    },
+                    "yield_time_ms": {
+                        "type": "number",
+                        "description": "Compatibility field. The current one-shot command runtime accepts it but does not use it to decide background promotion; command only promotes after the runtime long-command guard (about 30 seconds). Usually omit it."
+                    },
+                    "output_level": {
+                        "type": "string",
+                        "enum": ["small", "normal", "large"],
+                        "description": "Visible output budget for one-shot commands in the command family. If omitted, the runtime uses the user's current default tool-output level from Settings -> 上下文. small=120 lines / 36000 chars, normal=320 lines / 96000 chars, large=520 lines / 156000 chars, with live values still controlled there. If visible output exceeds the chosen budget, the full output is externalized and the inline receipt keeps only a compact summary with entry_id / line_range so you can continue through memory_check -> memory_read. Use a higher level only when the extra visible context is genuinely useful; a hidden 5 MB safety cap still applies."
+                    },
+                    "max_output_tokens": {
+                        "type": "number",
+                        "description": "Legacy optional token cap applied after line-budget/export handling."
+                    },
+                    "timeout_secs": {
+                        "type": "number",
+                        "description": "Optional timeout in seconds for the one-shot command. Use this to bound long-running builds, tests, or scripts."
+                    },
+                    "login": {
+                        "type": "boolean",
+                        "description": "Whether to run the shell with -l/-i semantics. Defaults to true."
+                    }
+                },
+                "required": ["cmd"],
+                "additionalProperties": false
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "chunk_id": {
+                        "type": "string",
+                        "description": "Chunk identifier included when the response reports one."
+                    },
+                    "wall_time_seconds": {
+                        "type": "number",
+                        "description": "Elapsed wall time spent waiting for output in seconds."
+                    },
+                    "exit_code": {
+                        "type": "number",
+                        "description": "Process exit code when the command finished during this call."
+                    },
+                    "session_id": {
+                        "type": "number",
+                        "description": "Only present when the command promoted into background execution."
+                    },
+                    "original_token_count": {
+                        "type": "number",
+                        "description": "Approximate token count before output truncation."
+                    },
+                    "output": {
+                        "type": "string",
+                        "description": "Command output text, possibly truncated."
+                    }
+                },
+                "required": ["wall_time_seconds", "output"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "pty_run",
+            "description": "Start a PTY terminal session for interactive or long-running terminal work. This tool only starts the session and returns the session id plus log metadata. After startup, continue with `pty_input`, wait for completion with `pty_wait`, inspect live sessions with `pty_list`, or stop the session with `pty_kill`. PTY output stays in external logs and does not go through toolmemory.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cmd": {
+                        "type": "string",
+                        "description": "Shell command to start inside the PTY session. For Server with `target=ssh`, use an empty string or omit meaningful remote command when you want an interactive remote shell; provide a remote command only when you want SSH to start that command."
+                    },
+                    "target": {
+                        "type": "string",
+                        "enum": ["local", "ssh"],
+                        "description": "Execution target. `local` starts a PTY on this Termux device and is the default. `ssh` is only for Server · 御: it starts an interactive SSH PTY against one of the AI-managed servers, using the active server by default or a specific `server_id` / `server_name` when provided."
+                    },
+                    "server_id": {
+                        "type": "string",
+                        "description": "Optional server id or selector for `target=ssh`."
+                    },
+                    "server_name": {
+                        "type": "string",
+                        "description": "Optional server name selector for `target=ssh`."
+                    },
+                    "brief": {
+                        "type": "string",
+                        "description": "Optional short Chinese purpose sentence for UI display."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional stable short name for later `pty_input` / `pty_wait` / `pty_kill` lookup."
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Optional working directory to run the PTY command in; defaults to the current ProjectYing project root."
+                    },
+                    "shell": {
+                        "type": "string",
+                        "description": "Shell binary to launch. Defaults to the user's default shell."
+                    },
+                    "yield_time_ms": {
+                        "type": "number",
+                        "description": "How long to wait before returning the startup receipt."
+                    },
+                    "timeout_secs": {
+                        "type": "number",
+                        "description": "Optional PTY timeout in seconds. Omit it if the session should keep running until you explicitly wait or kill it."
+                    },
+                    "login": {
+                        "type": "boolean",
+                        "description": "Whether to run the shell with -l/-i semantics. Defaults to true."
+                    }
+                },
+                "required": ["cmd"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "pty_input",
+            "description": "Send input into an existing PTY session. Use `session_id`, or resolve the target by `pid` or `name`. This tool only acknowledges the injected input and refreshed session stats; final output should normally be collected through `pty_wait`.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "number",
+                        "description": "PTY session identifier. Prefer this when available."
+                    },
+                    "pid": {
+                        "type": "number",
+                        "description": "Optional PTY process id selector when session_id is not available."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional PTY name selector when session_id is not available."
+                    },
+                    "chars": {
+                        "type": "string",
+                        "description": "Text to send to terminal stdin."
+                    },
+                    "yield_time_ms": {
+                        "type": "number",
+                        "description": "Optional short delay after sending input before returning the refreshed session stats."
+                    }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "pty_wait",
+            "description": "Register one wait on a PTY session. Use `session_id`, or resolve the target by `pid` or `name`. If the session has already finished, this tool returns the guarded final summary immediately. If it is still running after the optional initial wait window, this call only acknowledges that waiting is registered; the final result will auto-report back into the session when the PTY ends, so you do not need repeated `pty_wait`.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "number",
+                        "description": "PTY session identifier. Prefer this when available."
+                    },
+                    "pid": {
+                        "type": "number",
+                        "description": "Optional PTY process id selector when session_id is not available."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional PTY name selector when session_id is not available."
+                    },
+                    "timeout_secs": {
+                        "type": "number",
+                        "description": "Optional initial wait window in seconds before falling back to a registered-wait receipt. Omit it for an immediate registration-style wait."
+                    }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "view_image",
+            "description": "Load a local image file and attach it to the current round for visual analysis. Use this for screenshots, UI photos, camera photos, or saved error images on disk. Prefer local files under `media/`, especially `media/screenshot/` for Android screenshots.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Local image path. Project files may use relative paths like media/screenshot/a.jpg or ./media/screenshot/a.jpg. Passing `media/screenshot/` or another image directory automatically picks the newest image file. Termux home may use the special alias home/... . External directories outside projectying should use absolute paths."
+                    },
+                    "brief": {
+                        "type": "string",
+                        "description": "Optional short Chinese purpose sentence for UI display, such as 分析界面截图 or 查看报错图片."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "ui", "photo", "original"],
+                        "description": "Optional image handling mode. auto (default) auto-detects screenshot vs photo and compresses locally. ui keeps text/buttons clearer with gentler compression. photo compresses more aggressively for object or scene recognition. original skips local resize/compression."
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Optional working directory used to resolve relative file paths; defaults to the current ProjectYing project root. Relative paths stay inside the project unless you explicitly use home/... or an absolute path."
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Alias of cwd for compatibility."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "apply_patch",
+            "description": "Apply a Codex-style patch for code edits. Inspect the file first, then patch the smallest reliable region. Prefer several small stable patch calls over one brittle large patch. The patch must use the original Codex envelope `*** Begin Patch` ... `*** End Patch`; do not use unified diff `---/+++` headers.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input": {
+                        "type": "string",
+                        "description": "Full Codex `apply_patch` text. It must start with `*** Begin Patch` and end with `*** End Patch`. Each file block must use `*** Add File`, `*** Delete File`, or `*** Update File`; hunks must use `@@`; added file content lines must start with `+`. Use relative project paths by default; use absolute paths only when you intentionally edit outside ProjectYing."
+                    },
+                    "brief": {
+                        "type": "string",
+                        "description": "Optional short Chinese purpose sentence for UI display, such as 修改配置文件 or 调整工具逻辑."
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Optional working directory used to resolve relative file paths; defaults to the current ProjectYing project root. Relative patch paths stay inside the project unless you explicitly use home/... or an absolute path."
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Alias of cwd for compatibility."
+                    }
+                },
+                "required": ["input"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "update_plan",
+            "description": "Visible planning surface with three modes. Use `decision` for simple tasks where one clear route is enough and should not force focus mode. Use `plan` for ordinary multi-step work. Use `blueprint` for large architecture work driven by a plan document. Keep it concise, meaningful, and current. At most one step can be `in_progress` at a time.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["decision", "plan", "blueprint"],
+                        "description": "Planning posture. decision=simple route choice, plan=normal todo, blueprint=large design/task document."
+                    },
+                    "explanation": {
+                        "type": "string",
+                        "description": "Optional explanation for why the plan changed."
+                    },
+                    "decision": {
+                        "type": "string",
+                        "description": "For mode=decision, the chosen route and short reason."
+                    },
+                    "blueprint": {
+                        "type": "string",
+                        "description": "For mode=blueprint, a compact plan document or architecture note that the following steps execute."
+                    },
+                    "plan": {
+                        "type": "array",
+                        "description": "Ordered plan steps. Optional for decision mode. Keep them short and concrete, and keep at most one step `in_progress` until the task is done.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "step": {
+                                    "type": "string",
+                                    "description": "Short task step."
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "description": "One of: pending, in_progress, completed."
+                                }
+                            },
+                            "required": ["step", "status"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": [],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "tool_manage",
+            "description": "Manage ProjectYing toolboxes, hot external tools, Matrix-created dynamic roles, builtin schema overrides, system settings, persona model routing, context governance routing, and read the Aidebug health snapshot instead of treating provider schema as the source of truth. Every persona may use tool_manage to list/reload/open/close/pin/unpin its own toolbox; Matrix and 司 may also target another persona toolbox for governance. Use it to list current tool visibility, reload hot external tool manifests, create/update/remove external tools, open/close/pin/unpin tool cards, read health, create/list/update/remove/copy dynamic roles, edit their assigned tool set, list/read/update/reset builtin tool schemas, set advisor_managed/summary_compact/vision_compact context governance, or update Matrix-owned tool budgets / experience parameters / persona model selection through `settings`. Closed tools stay unavailable for direct use until opened. Matrix owns external tool manifests, role registry, tool UI display spec, schema, output policy, settings routing, compact-route assignment, and builtin schema overrides; prompt governance uses context_manage target=prompt. JSON is preferred, but the runtime also accepts the common live-provider key/value fallback for flat fields when tool output drifts.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "health", "reload", "create", "update", "remove", "open", "close", "pin", "unpin", "schema_list", "schema_get", "schema_update", "schema_reset", "context_governance_set", "settings", "role_list", "role_reload", "role_create", "role_copy", "role_update", "role_remove", "role_tool_add", "role_tool_remove"],
+                        "description": "Toolbox action. Use `list` to inspect current state. Use `health` to read the current Aidebug chain health score/status/evidence. `reload` re-reads hot external tool manifests after Matrix has edited or added them. `create` and `update` write/replace an external tool manifest from `manifest`. `remove` deletes external tool manifests by tool id. Use `schema_list` / `schema_get` / `schema_update` / `schema_reset` to inspect or override builtin tool schemas at runtime. Use open/close/pin/unpin to change visibility. Use `context_governance_set` to set a static persona or dynamic role to advisor_managed, summary_compact, or vision_compact with thresholds. Use `settings` to update Matrix-owned tool budgets, system experience parameters, and other persona model selection. Use role_* actions to govern Matrix-created dynamic roles: list/reload roles, create/copy/update/remove a role, or add/remove tools assigned to a role."
+                    },
+                    "persona": {
+                        "type": "string",
+                        "enum": ["matrix", "advisor", "coding", "server"],
+                        "description": "Optional target persona toolbox to inspect or manage. Omit to manage the current persona. Matrix and 司 may set this for cross-persona governance; other personas should omit it and manage only themselves."
+                    },
+                    "tool_ids": {
+                        "type": "array",
+                        "description": "Stable tool ids to manage. Required for visibility-changing, external tool remove, and role_tool_add / role_tool_remove actions. Use tool ids, not UI order numbers.",
+                        "items": {
+                            "type": "string"
+                        }
+                    },
+                    "role_ids": {
+                        "type": "array",
+                        "description": "Stable dynamic role ids to manage. Required for role_remove and may be used with role_tool_add / role_tool_remove / context_governance_set when role.id is omitted.",
+                        "items": {
+                            "type": "string"
+                        }
+                    },
+                    "role": {
+                        "type": "object",
+                        "description": "Dynamic role draft for role_create / role_copy / role_update / role_tool_add / role_tool_remove. `id` is stable ASCII and must not collide with matrix/advisor/coding/server. `display_name` should be a short Chinese name; `glyph` must be a single Chinese/CJK ideograph for UI labels, not emoji. `copy_from` copies a static persona (`matrix` is rejected) or an existing dynamic role. `base_persona` is the execution base used by the role runtime and can be `advisor`, `coding`, or `server` when copying. `default_tools` defines the role toolbox projection. `managed_role_ids` records the Matrix-assigned roles that this 司 replica is responsible for. `context_governance` chooses default advisor-managed precision or Matrix-authorized summary/vision compact.",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "display_name": { "type": "string", "description": "Short Chinese visible name, such as 绘 or 审校." },
+                            "glyph": { "type": "string", "description": "Single Chinese/CJK ideograph for compact UI labels, such as 绘. Do not use emoji." },
+                            "context_dir": { "type": "string" },
+                            "base_persona": {
+                                "type": "string",
+                                "enum": ["matrix", "advisor", "coding", "server"]
+                            },
+                            "copy_from": {
+                                "type": "string",
+                                "description": "Source persona slug or existing dynamic role id to copy."
+                            },
+                            "default_tools": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "managed_role_ids": {
+                                "type": "array",
+                                "description": "Matrix-assigned role ids that this role manages in the context registry.",
+                                "items": { "type": "string" }
+                            },
+                            "context_governance": {
+                                "type": "object",
+                                "description": "Context governance route for this role. Default is advisor_managed at 200KB. summary_compact means Matrix authorizes this role to use context_compact/context_summary for coarse self-management. vision_compact means Matrix authorizes this role to use context_compact/context_vision for faster self-management.",
+                                "properties": {
+                                    "mode": {
+                                        "type": "string",
+                                        "enum": ["advisor_managed", "summary_compact", "vision_compact"]
+                                    },
+                                    "manage_threshold_kb": { "type": "number" },
+                                    "compact_threshold_kb": { "type": "number" },
+                                    "report_to_matrix": { "type": "boolean" }
+                                },
+                                "additionalProperties": false
+                            },
+                            "prompt": { "type": "string" },
+                            "enabled": { "type": "boolean" }
+                        },
+                        "additionalProperties": false
+                    },
+                    "context_governance": {
+                        "type": "object",
+                        "description": "Top-level governance route for context_governance_set. Target a static persona with `persona`, or a dynamic role with `role_ids` / role.id. `advisor_managed` means 司 handles precision context_manage; `summary_compact` means Matrix authorizes that target to use context_compact/context_summary; `vision_compact` means Matrix authorizes that target to use context_compact/context_vision. When a compact mode is set, the runtime opens those tools for the target.",
+                        "properties": {
+                            "mode": {
+                                "type": "string",
+                                "enum": ["advisor_managed", "summary_compact", "vision_compact"]
+                            },
+                            "manage_threshold_kb": { "type": "number" },
+                            "compact_threshold_kb": { "type": "number" },
+                            "report_to_matrix": { "type": "boolean" }
+                        },
+                        "additionalProperties": false
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["advisor_managed", "summary_compact", "vision_compact"],
+                        "description": "Shortcut for context_governance.mode on context_governance_set."
+                    },
+                    "manage_threshold_kb": {
+                        "type": "number",
+                        "description": "Shortcut threshold for advisor_managed precision context_manage route."
+                    },
+                    "compact_threshold_kb": {
+                        "type": "number",
+                        "description": "Shortcut threshold for compact routes."
+                    },
+                    "report_to_matrix": {
+                        "type": "boolean",
+                        "description": "Whether self-managed compact overrun/completion should report to Matrix."
+                    },
+                    "provider_body": {
+                        "type": "string",
+                        "enum": ["official", "third_party"],
+                        "description": "Optional provider body to target for `settings`. When provided with `provider_index`, it must match the chosen provider."
+                    },
+                    "provider_index": {
+                        "type": "number",
+                        "description": "Optional absolute provider index to target for `settings`. If omitted, `settings` updates the current provider for the chosen body."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional provider model to write for `settings`. Use this to switch another persona's active model."
+                    },
+                    "default_tool_output_level": {
+                        "type": "string",
+                        "enum": ["small", "normal", "large"],
+                        "description": "Optional Matrix default tool-output level for `settings`."
+                    },
+                    "tool_output_small_kb": {
+                        "type": "number",
+                        "description": "Optional Matrix small tool-output budget in KB for `settings`."
+                    },
+                    "tool_output_normal_kb": {
+                        "type": "number",
+                        "description": "Optional Matrix normal tool-output budget in KB for `settings`."
+                    },
+                    "tool_output_large_kb": {
+                        "type": "number",
+                        "description": "Optional Matrix large tool-output budget in KB for `settings`."
+                    },
+                    "name_en": {
+                        "type": "string",
+                        "description": "Optional Matrix front-name update for `settings`."
+                    },
+                    "name_zh": {
+                        "type": "string",
+                        "description": "Optional Matrix back-name update for `settings`."
+                    },
+                    "agent_retention_limit": {
+                        "type": "number",
+                        "description": "Optional Matrix sub-agent retention limit for `settings`."
+                    },
+                    "permission_mode": {
+                        "type": "string",
+                        "enum": ["full", "safe"],
+                        "description": "Optional Matrix permission mode for `settings`."
+                    },
+                    "terminal_audit_interval_secs": {
+                        "type": "number",
+                        "description": "Optional PTY audit interval in seconds for `settings`."
+                    },
+                    "image_compression_quality": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "description": "Optional image compression quality for `settings`."
+                    },
+                    "image_upload_max_mb": {
+                        "type": "number",
+                        "description": "Optional image upload cap in MB for `settings`."
+                    },
+                    "theme_preset": {
+                        "type": "string",
+                        "enum": ["rose", "cyan"],
+                        "description": "Optional Matrix theme preset for `settings`."
+                    },
+                    "manifest": {
+                        "type": "object",
+                        "description": "Full external tool manifest used by create/update. It may contain name, description, program, args, working_dir, timeout_secs, enabled, parameters, kind_label, action_label, brief, display, output_policy and scheduler.",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "description": { "type": "string" },
+                            "program": { "type": "string" },
+                            "args": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "working_dir": { "type": "string" },
+                            "timeout_secs": { "type": "integer" },
+                            "enabled": { "type": "boolean" },
+                            "parameters": { "type": "object" },
+                            "kind_label": { "type": "string" },
+                            "action_label": { "type": "string" },
+                            "brief": { "type": "string" },
+                            "display": {
+                                "type": "object",
+                                "properties": {
+                                    "title": { "type": "string" },
+                                    "action_label": { "type": "string" },
+                                    "brief_template": { "type": "string" },
+                                    "collapsed_fields": {
+                                        "type": "array",
+                                        "items": { "type": "string" }
+                                    },
+                                    "expanded_sections": {
+                                        "type": "array",
+                                        "items": { "type": "string" }
+                                    },
+                                    "input_label": { "type": "string" },
+                                    "output_label": { "type": "string" },
+                                    "max_inline_bytes": { "type": "integer" },
+                                    "group_key": { "type": "string" },
+                                    "chain_mode": { "type": "string" },
+                                    "default_collapsed": { "type": "boolean" }
+                                },
+                                "additionalProperties": true
+                            },
+                            "output_policy": {
+                                "type": "object",
+                                "properties": {
+                                    "max_inline_bytes": { "type": "integer" },
+                                    "externalize_over_bytes": { "type": "integer" },
+                                    "preferred_store": { "type": "string" }
+                                },
+                                "additionalProperties": true
+                            },
+                            "scheduler": {
+                                "type": "object",
+                                "properties": {
+                                    "dedupe_key": { "type": "string" },
+                                    "single_flight": { "type": "boolean" },
+                                    "deadline_ms": { "type": "integer" },
+                                    "poll_interval_ms": { "type": "integer" },
+                                    "max_retries": { "type": "integer" },
+                                    "backoff": { "type": "string" },
+                                    "cancel_scope": { "type": "string" },
+                                    "cooldown_ms": { "type": "integer" },
+                                    "payload_policy": { "type": "string" }
+                                },
+                                "additionalProperties": true
+                            }
+                        },
+                        "additionalProperties": true
+                    },
+                    "schema": {
+                        "type": "object",
+                        "description": "Full builtin tool schema object used by schema_update. The name must match an existing builtin tool, type must be function, and parameters should remain an object schema.",
+                        "properties": {
+                            "type": { "type": "string" },
+                            "name": { "type": "string" },
+                            "description": { "type": "string" },
+                            "strict": { "type": "boolean" },
+                            "parameters": { "type": "object" },
+                            "output_schema": { "type": "object" }
+                        },
+                        "additionalProperties": true
+                    },
+                    "brief": {
+                        "type": "string",
+                        "description": "Optional short Chinese brief for UI display."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional short reason for UI or audit display."
+                    },
+                    "plan": {
+                        "type": "string",
+                        "description": "Optional immediate plan after the toolbox update, especially how a new external tool, UI display spec, schema update, or prompt change will be verified."
+                    }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "focus_mode",
+            "description": "Enter or exit focus mode directly. Use this when a short bounded burst of work would otherwise clutter standard context, such as reading large code/log output, continuous terminal observation, or tightly scoped investigate/code/debug steps. It is optional, not a required follow-up to planning. Do not use it for ordinary coordination, lightweight planning, or waiting for other personas. `enter` should declare the concrete task, why focus mode starts now, plan_a / plan_b / fallback, expected_result, and exit_condition. `exit` should declare what was completed, what changed, key steps, key information worth carrying forward, the final result, and why focus mode is ending. This is the canonical focus-mode surface; older enter/exit aliases still parse but are not the preferred form. JSON is preferred, but the runtime also accepts the common live-provider key/value fallback when tool output drifts.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["enter", "exit", "task_enter", "task_exit", "focus_enter", "focus_exit"],
+                        "description": "Focus-mode action. Prefer `enter` / `exit`; older task_* / focus_* forms still parse but are only compatibility aliases."
+                    },
+                    "brief": {
+                        "type": "string",
+                        "description": "Optional short Chinese brief for UI, usually the task title."
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "Required for `enter`. The concrete focused task."
+                    },
+                    "user_goal": {
+                        "type": "string",
+                        "description": "Optional user goal for `enter`."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional reason explaining why focus mode should start now."
+                    },
+                    "plan_a": {
+                        "type": "string",
+                        "description": "Optional primary execution plan for `enter`."
+                    },
+                    "plan_b": {
+                        "type": "string",
+                        "description": "Optional backup plan for `enter`."
+                    },
+                    "fallback": {
+                        "type": "string",
+                        "description": "Optional fallback strategy if both plan_a and plan_b fail."
+                    },
+                    "plan_c": {
+                        "type": "string",
+                        "description": "Legacy alias of `fallback` for compatibility."
+                    },
+                    "expected_result": {
+                        "type": "string",
+                        "description": "Optional expected result for `enter`."
+                    },
+                    "exit_condition": {
+                        "type": "string",
+                        "description": "Optional exit condition for `enter`."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Required for `exit`. Final summary to carry back into standard context."
+                    },
+                    "completed": {
+                        "type": "string",
+                        "description": "Optional `exit` field describing what was completed."
+                    },
+                    "implemented": {
+                        "type": "string",
+                        "description": "Optional `exit` field describing what was implemented."
+                    },
+                    "steps": {
+                        "type": "string",
+                        "description": "Optional `exit` field listing the actual execution steps."
+                    },
+                    "key_info": {
+                        "type": "string",
+                        "description": "Optional `exit` field listing key information worth preserving."
+                    },
+                    "result": {
+                        "type": "string",
+                        "description": "Optional `exit` field describing the final result."
+                    },
+                    "exit_reason": {
+                        "type": "string",
+                        "description": "Optional `exit` field describing why focus mode is ending."
+                    },
+                    "fastmemory_text": {
+                        "type": "string",
+                        "description": "Optional fastmemory experience note to write during `exit`. Use it for reusable lessons, strategies, and operational experience rather than raw task logs."
+                    }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "memory_check",
+            "description": "First-pass locator for long-term memory before deep reading. Start here to find the relevant day, month, entry group, or tool transcript window. `datememory` helps locate diary-style memories by date or scope. `metamemory` should be checked with an exact day (`YYYY-MM-DD`) or exact month (`YYYY-MM`) plus keywords, then refined with `memory_read`. `toolmemory` should normally be checked by `entry_id`, with `tool_ref` kept only as a legacy fallback. Externalized live output under memory/output is read through `memory_read target=output` when you already have a path/ref.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "enum": ["datememory", "metamemory", "toolmemory"],
+                        "description": "Which long-term memory store to search. For externalized live output, use memory_read target=output rather than memory_check."
+                    },
+                    "persona": {
+                        "type": "string",
+                        "description": "Optional memory owner persona. Omit for the current persona; Matrix or 司 can set advisor/coding/server to inspect that persona's memory store."
+                    },
+                    "keywords": {
+                        "type": "array",
+                        "description": "Search keywords. Prefer 1-5 concrete keywords that are likely to co-occur, such as people, tasks, project names, bugs, tools, or results.",
+                        "items": { "type": "string" }
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["recent", "past", "old", "custom"],
+                        "description": "Search scope. Default is recent. recent=recent 3 months, past=3-12 months, old=>1 year, custom=start/end range."
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "Exact selector. Use YYYY-MM-DD for an exact day. `metamemory` also accepts YYYY-MM for an exact month."
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Custom start date in YYYY-MM-DD format."
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Custom end date in YYYY-MM-DD format."
+                    },
+                    "tool_ref": {
+                        "type": "string",
+                        "description": "Legacy exact toolmemory ref lookup. Prefer entry_id."
+                    },
+                    "entry_id": {
+                        "type": "number",
+                        "description": "Optional exact entry id. Prefer this for `toolmemory`; other stores may use it for narrow exact checks."
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Optional result limit. Keep this small when you are locating and will refine with search/read next."
+                    },
+                    "brief": {
+                        "type": "string",
+                        "description": "Optional short Chinese summary for UI display."
+                    }
+                },
+                "required": ["target"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "memory_read",
+            "description": "Read long-term memory or externalized output in detail. Use this only after you already know the day, month, entry id, exact entry-id list, narrow range, or output path/ref you need. `datememory` can read a full day, one entry, or a contiguous entry-id range. `metamemory` can read an exact day/month, one entry, multiple exact entries, or a contiguous entry-id range, and can also be narrowed by line range. `toolmemory` should normally be read by entry id, with `tool_ref` kept only as a legacy fallback. `output` reads memory/output live streams by latest/tail/range/since_cursor.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "enum": ["datememory", "metamemory", "toolmemory", "output"],
+                        "description": "Which long-term memory store to read. `output` reads externalized live output streams under memory/output."
+                    },
+                    "persona": {
+                        "type": "string",
+                        "description": "Optional memory owner persona. Omit for the current persona; Matrix or 司 can set advisor/coding/server to inspect that persona's memory store."
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "Exact date in YYYY-MM-DD format."
+                    },
+                    "tool_ref": {
+                        "type": "string",
+                        "description": "Legacy exact tool_ref for toolmemory read. Prefer entry_id."
+                    },
+                    "entry_id": {
+                        "type": "number",
+                        "description": "Specific datememory, metamemory, or toolmemory entry id."
+                    },
+                    "entry_ids": {
+                        "type": "array",
+                        "description": "Optional exact entry-id list. Prefer this for non-contiguous `metamemory` reads.",
+                        "items": { "type": "number" }
+                    },
+                    "entry_start_id": {
+                        "type": "number",
+                        "description": "Optional datememory or metamemory start entry id for contiguous range reading."
+                    },
+                    "entry_end_id": {
+                        "type": "number",
+                        "description": "Optional datememory or metamemory end entry id for contiguous range reading."
+                    },
+                    "line_start": {
+                        "type": "number",
+                        "description": "Optional 1-based start line for metamemory or fine-grained datememory/toolmemory transcript reads."
+                    },
+                    "line_end": {
+                        "type": "number",
+                        "description": "Optional 1-based end line for metamemory or fine-grained datememory/toolmemory transcript reads."
+                    },
+                    "ref_id": {
+                        "type": "string",
+                        "description": "Optional OutputRef id for target=output. `toolmemory:<id>` should be read with target=toolmemory instead."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Project-relative or absolute path under memory/output for target=output."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["latest", "tail", "range", "since_cursor", "summary", "full"],
+                        "description": "Output read mode for target=output. Default latest."
+                    },
+                    "tail_lines": {
+                        "type": "number",
+                        "description": "Tail line count for target=output latest/tail/summary."
+                    },
+                    "cursor": {
+                        "type": "string",
+                        "description": "Cursor from a previous target=output read, currently byte:N or line:N,byte:M."
+                    },
+                    "max_bytes": {
+                        "type": "number",
+                        "description": "Max bytes returned for target=output. Still clamped by runtime hard limit."
+                    },
+                    "brief": {
+                        "type": "string",
+                        "description": "Optional short Chinese summary for UI display."
+                    }
+                },
+                "required": ["target"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "ask_user",
+            "description": "Request structured user input through the inline reconciliation UI and wait for the reply. Use this whenever the user must settle direction, boundaries, risks, or missing constraints that you should not guess. Prefer a single concise question; ask multiple items only when they are tightly related. Suggested options should stay short, while the custom answer path remains the primary route.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "description": "Questions to show in the reconciliation UI. Prefer 1 and do not exceed 10. Use this for genuine user decisions or uncertainty resolution, not casual chat or things you can infer safely.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "Stable unique identifier for mapping answers, such as confirm_path."
+                                },
+                                "header": {
+                                    "type": "string",
+                                    "description": "Short header label shown in the UI (12 or fewer chars); keep it compact for the inline input area."
+                                },
+                                "question": {
+                                    "type": "string",
+                                    "description": "Single-sentence prompt shown to the user."
+                                },
+                                "options": {
+                                    "type": "array",
+                                    "description": "Provide 1-3 mutually exclusive suggested choices. Put the recommended option first when applicable, keep labels concise, and remember the UI will also provide a custom answer path as the main free-form route.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {
+                                                "type": "string",
+                                                "description": "User-facing label (1-5 words)."
+                                            },
+                                            "description": {
+                                                "type": "string",
+                                                "description": "One short sentence explaining impact or tradeoff if selected."
+                                            }
+                                        },
+                                        "required": ["label", "description"],
+                                        "additionalProperties": false
+                                    }
+                                }
+                            },
+                            "required": ["id", "header", "question", "options"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["questions"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "spawn_agent",
+            "description": "Spawn a sub-agent for a well-scoped side task, bounded exploration, or parallel batch work. Delegate only when it materially helps: the task should be concrete, self-contained, and worth parallelizing. Do not hand off the immediate blocking step when the main thread can just finish it directly.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Initial plain-text task for the new agent. Use either message or items."
+                    },
+                    "items": {
+                        "type": "array",
+                        "description": "Structured input items. Use this to pass explicit mentions or non-text payloads.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": { "type": "string" },
+                                "text": { "type": "string" },
+                                "image_url": { "type": "string" },
+                                "path": { "type": "string" },
+                                "name": { "type": "string" }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "agent_type": {
+                        "type": "string",
+                        "description": "Optional agent role label, such as worker or explorer."
+                    },
+                    "fork_context": {
+                        "type": "boolean",
+                        "description": "When true, fork the current thread history into the new agent."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional model override for the new agent."
+                    },
+                    "reasoning_effort": {
+                        "type": "string",
+                        "description": "Optional reasoning effort override for the new agent."
+                    }
+                },
+                "additionalProperties": false
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Thread-like identifier for the spawned agent."
+                    },
+                    "nickname": {
+                        "type": ["string", "null"],
+                        "description": "User-facing nickname when available."
+                    }
+                },
+                "required": ["agent_id", "nickname"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "send_input",
+            "description": "Send follow-up instructions, corrections, or extra material to an existing agent. Use this to refine scope or provide missing input without spawning a new agent. Set `interrupt=true` only when the current direction is wrong or must be redirected immediately.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Agent id to message (from spawn_agent)."
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Legacy plain-text message to send to the agent. Use either message or items."
+                    },
+                    "items": {
+                        "type": "array",
+                        "description": "Structured input items. Use this to pass explicit mentions or non-text payloads.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": { "type": "string" },
+                                "text": { "type": "string" },
+                                "image_url": { "type": "string" },
+                                "path": { "type": "string" },
+                                "name": { "type": "string" }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "interrupt": {
+                        "type": "boolean",
+                        "description": "When true, stop the agent's current task and handle this immediately."
+                    }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "submission_id": {
+                        "type": "string",
+                        "description": "Identifier for the queued input submission."
+                    }
+                },
+                "required": ["submission_id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "wait_agent",
+            "description": "Register one wait on one or more active agents when you need to watch them now. Normal flow does not require repeated waiting because completed agents auto-report back into the session. If no watched agent reaches a final status within the optional initial wait window, this call only returns a registered-wait receipt plus progress; you do not need repeated `wait_agent`.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ids": {
+                        "type": "array",
+                        "description": "Agent ids to wait on. Pass multiple ids to wait for whichever finishes first.",
+                        "items": {
+                            "type": "string"
+                        }
+                    },
+                    "timeout_ms": {
+                        "type": "number",
+                        "description": "Optional initial wait window in milliseconds before falling back to a registered-wait receipt. Omit it for an immediate registration-style wait."
+                    }
+                },
+                "required": ["ids"],
+                "additionalProperties": false
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "object",
+                        "description": "Latest observed statuses keyed by agent id. On timeout this can include running or pending agents."
+                    },
+                    "timed_out": {
+                        "type": "boolean",
+                        "description": "Whether the wait returned due to timeout before any watched agent reached a final status."
+                    },
+                    "progress": {
+                        "type": "array",
+                        "description": "Compact progress lines for each watched agent, suitable for quick polling updates.",
+                        "items": {
+                            "type": "string"
+                        }
+                    }
+                },
+                "required": ["status", "timed_out", "progress"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "list_agent",
+            "description": "List current active sub-agents and their log paths. Use this to inspect what is still running, decide whether to send more input, wait, or close an agent.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "number"
+                    },
+                    "agents": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "nickname": { "type": ["string", "null"] },
+                                "agent_type": { "type": ["string", "null"] },
+                                "status": {},
+                                "task_preview": { "type": "string" },
+                                "latest_event": { "type": ["string", "null"] },
+                                "log_path": { "type": "string" },
+                                "created_at": { "type": "number" }
+                            },
+                            "required": ["id", "nickname", "agent_type", "status", "task_preview", "latest_event", "log_path", "created_at"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["count", "agents"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "close_agent",
+            "description": "Close one or more agents when they are no longer needed and return their latest status summary. Use this to retire finished or abandoned side-task agents and keep the agent pool tidy.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Single agent id to close."
+                    },
+                    "ids": {
+                        "type": "array",
+                        "description": "Optional batch close list. Prefer this when multiple agents should be closed together.",
+                        "items": {
+                            "type": "string"
+                        }
+                    }
+                },
+                "additionalProperties": false
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "statuses": {}
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "pty_list",
+            "description": "List live PTY terminal sessions and their external log metadata. Use this before `pty_input`, `pty_wait`, or `pty_kill` when you need the current session inventory.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        },
+        {
+            "type": "function",
+            "name": "pty_kill",
+            "description": "Terminate one or more PTY terminal sessions. Use `session_id` when possible, or resolve a single target through `pid` or `name`.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "number",
+                        "description": "Single PTY session identifier to terminate."
+                    },
+                    "session_ids": {
+                        "type": "array",
+                        "description": "Optional batch terminate list. Prefer this when multiple PTY sessions should be stopped together.",
+                        "items": {
+                            "type": "number"
+                        }
+                    },
+                    "pid": {
+                        "type": "number",
+                        "description": "Optional single-session pid selector when session_id is not available."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional single-session name selector when session_id is not available."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }
+    ])

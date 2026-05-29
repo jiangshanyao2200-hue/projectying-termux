@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-matrix-toolmanage-health-20260515-13",
+  "text": "Aidebug T13：tool_manage health 实机回归。不要修改代码，不要清空记忆，不要启动子代理，不要使用 pty。目标是验证重启后 Matrix 能直接调用 `tool_manage` 的 `health` 动作读取 Aidebug health 快照，而不是只能通过 observe/status 间接判断。\n\n请严格按步骤执行，并在最终回复中使用固定 marker：\n\n1. 直接调用 `tool_manage`，action=`health`。读取 health 总分、总状态、每条 chain 状态，尤其是 `memory.datememory`。\n2. 如果 `tool_manage health` 不可用，请明确 `HEALTH_TOOL_UNAVAILABLE`，不要改用 command/pty 读文件。\n3. 只做只读判断，不要发送 worker 消息，不要写 memory/context，不要清空 datememory。\n4. 结合 health 判断下一步治理：当前 datememory over-limit 如果存在，应判定为 `HEALTH_MEMORY_DEGRADED_EXPECTED`，治理建议仍是需要司按 maintenance payload 归档，不应盲目清空。\n5. 复查 status/focus/request 是否闭环；不需要进入 focus，若进入则结束前退出。\n\n最终回复必须包含：\nHEALTH_TOOL_READ: PASS/FAIL/HEALTH_TOOL_UNAVAILABLE\nHEALTH_VALUES: 简写 overall_score/overall_state/memory_state 或 unknown\nHEALTH_DECISION: NEED_ADVISOR_MAINTENANCE_PAYLOAD/NO_ACTION/FAIL\nNO_DESTRUCTIVE_ACTION: PASS/FAIL\nNO_WORKER_SEND: PASS/FAIL\nNO_PTY_OR_AGENT: PASS/FAIL\nFOCUS_STATUS: PASS/FAIL\nBUGS_FOUND: none 或逐条列出\nEVIDENCE: 简短列出关键工具结果。"
+}

@@ -1,0 +1,112 @@
+{
+  "api_body": "third_party",
+  "current_official_provider": 1,
+  "current_third_party_provider": 4,
+  "providers": [
+    {
+      "body": "official",
+      "official_kind": "codex",
+      "name": "CODEX",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "",
+      "api_keys": [],
+      "current_api_key": 0,
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "reasoning_summary": "auto",
+      "sse_on": true,
+      "timeout_secs": 240
+    },
+    {
+      "body": "official",
+      "official_kind": "deep_seek",
+      "name": "DEEPSEEK",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key": "",
+      "api_keys": [],
+      "current_api_key": 0,
+      "model": "deepseek-reasoner",
+      "sse_on": true,
+      "timeout_secs": 240
+    },
+    {
+      "body": "third_party",
+      "official_kind": "codex",
+      "name": "聚合CODEX",
+      "base_url": "http://154.44.8.149:3500/openai/plus",
+      "api_key": "sk-user-c74fdd958576121620968b9c",
+      "api_keys": [
+        "sk-user-c74fdd958576121620968b9c",
+        "sk-user-266c7e263167f22ca9356de8"
+      ],
+      "current_api_key": 0,
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "reasoning_summary": "auto",
+      "sse_on": true,
+      "timeout_secs": 240
+    },
+    {
+      "body": "third_party",
+      "official_kind": "codex",
+      "name": "清风CODEX",
+      "base_url": "http://45.205.26.177:9999/v1",
+      "api_key": "sk-hU6KIO7t9saSbkRa0PkU5YQRCsS6Ut8yWAUYam8YfnY26eze",
+      "api_keys": [
+        "sk-hU6KIO7t9saSbkRa0PkU5YQRCsS6Ut8yWAUYam8YfnY26eze",
+        "sk-v8HfwkYo1ApRCtoQiXz4ixs9sWTiCG0prCzaOkoWrM93wiOM"
+      ],
+      "current_api_key": 0,
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "reasoning_summary": "auto",
+      "sse_on": true,
+      "timeout_secs": 240
+    },
+    {
+      "body": "third_party",
+      "official_kind": "codex",
+      "name": "大猫",
+      "base_url": "https://api.rainp.xyz/v1",
+      "api_key": "sk-d0UB32BhdvCQ6CnkEkZp5zkM7E2U5JmiLZgO2HcPWbmTJ8xN",
+      "api_keys": [
+        "sk-XzdhqxtaOYL2pXRyGh6NJ1sMuAdf3dkmkgihrCMlKfxOS58y",
+        "sk-d0UB32BhdvCQ6CnkEkZp5zkM7E2U5JmiLZgO2HcPWbmTJ8xN"
+      ],
+      "current_api_key": 1,
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "reasoning_summary": "auto",
+      "sse_on": true,
+      "timeout_secs": 240
+    },
+    {
+      "body": "third_party",
+      "official_kind": "codex",
+      "name": "小蓝",
+      "base_url": "https://www.inroi.shop/v1",
+      "api_key": "sk-368d5834e1c0c2fae5400f8259e482f3e16273192a2945b4b3a912ba8a6f595b",
+      "api_keys": [
+        "sk-368d5834e1c0c2fae5400f8259e482f3e16273192a2945b4b3a912ba8a6f595b"
+      ],
+      "current_api_key": 0,
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "reasoning_summary": "auto",
+      "sse_on": true,
+      "timeout_secs": 240
+    },
+    {
+      "body": "third_party",
+      "official_kind": "deep_seek",
+      "name": "中转DEEPSEEK",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key": "",
+      "api_keys": [],
+      "current_api_key": 0,
+      "model": "deepseek-reasoner",
+      "sse_on": true,
+      "timeout_secs": 240
+    }
+  ]
+}

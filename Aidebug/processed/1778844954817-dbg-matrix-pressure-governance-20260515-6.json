@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-matrix-pressure-governance-20260515-6",
+  "text": "Aidebug 压力治理测试：继续验证 Matrix 的管理能力，但这次重点只测 Matrix 自身 context / datememory 压力治理，不做代码修改，不做 UI 修改。API/provider 失败只记 PROVIDER_BLOCKED。\n\n请按步骤执行，并在最终回复中使用固定 marker：\n\n1. 读取当前治理状态，确认 Matrix 的 `active_context_entries` 与 `datememory_context_over_limit` 仍然偏高，记录是否需要行动。\n2. 对 Matrix 自己执行最小治理动作：优先尝试 `context_manage` 的 `summary` / `compact` / `replace` 之一，把 Matrix context 做一次最小范围收口。不要大清空，只压缩最明显的冗余片段。\n3. 如果治理面允许，再尝试一次 `memory_read target=output` 或相关读法，确认外部化输出/工具结果是否还能按协议回收，不要把大输出直接塞回聊天面。\n4. 再次观察 Matrix：确认压缩/收口后，Matrix 页面仍只保留调度/工具回执，避免把治理正文污染为普通聊天正文。\n5. 如果工具明确拒绝 Matrix 自治理或需要 司 才能执行，明确写成 NEED_DA / PROVIDER_BLOCKED，不要误报 PASS。\n\n最终回复必须包含：\nCONTEXT_TIGHTEN: PASS/FAIL/NEED_DA/PROVIDER_BLOCKED\nOUTPUT_RECALL: PASS/FAIL/NEED_DA/PROVIDER_BLOCKED\nMATRIX_POLLUTION: PASS/FAIL\nBUGS_FOUND: none 或逐条列出\nEVIDENCE: 简短列出关键工具结果。"
+}

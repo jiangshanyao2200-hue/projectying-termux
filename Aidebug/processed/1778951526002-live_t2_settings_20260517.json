@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "live-t2-settings-20260517",
+  "text": "Aidebug live T2 settings smoke。请只做两步：1) 调用 tool_manage settings，目标仍是 Matrix，字段只给默认工具输出等级 normal 和主题 rose，不要改 provider/model/角色；2) 紧接着再调用 tool_manage health。最后极短汇报 settings 是否成功、health 是否仍然 PASS，以及是否出现 config.governance 异常。"
+}

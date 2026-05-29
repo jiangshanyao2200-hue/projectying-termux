@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-matrix-multistep-dispatch-20260515-8",
+  "text": "Aidebug T8：多步调度压力测试。不要修改代码，不要清空笔记。目标是验证 Matrix 在一次任务内连续完成动态角色治理读取、worker 调度、worker memory/context 写入、污染检查、focus/status 闭环。\n\n请严格按步骤执行，并在最终回复中使用固定 marker：\n\n1. 读取当前动态角色治理清单和 worker contract，确认 worker enabled/visible，并列出 role_id、display_label、tab_title/status_title/input_status_title、default_tools、context/memory layout。\n2. 如有必要，进入一个短期 focus，brief 写明 T8 多步调度压力；任务结束前请退出 focus，除非有明确保持原因。\n3. 给 worker 投递一条带唯一标记 `T8_WORKER_ROUTE_20260515` 的短任务：要求 worker 回复 `T8_WORKER_ROUTE_OK`，并只作为 worker 会话正文出现。\n4. 写入 worker memory 一条唯一标记 `T8_WORKER_MEMORY_20260515`，再检查能否从 worker memory 命中。\n5. 写入 worker context 一条唯一标记 `T8_WORKER_CONTEXT_20260515`，再 observe worker 验证它落在 worker/Role_worker 侧。\n6. observe Matrix，确认 Matrix 普通聊天正文没有出现 worker 回复正文、worker memory 标记、worker context 标记。\n7. 检查当前 status/focus/request 状态，确认没有卡住的 active_request 或无法退出的 focus。\n\n最终回复必须包含：\nROLE_CONTRACT: PASS/FAIL\nWORKER_DISPATCH: PASS/FAIL\nWORKER_MEMORY: PASS/FAIL\nWORKER_CONTEXT: PASS/FAIL\nMATRIX_POLLUTION: PASS/FAIL\nFOCUS_STATUS: PASS/FAIL\nBUGS_FOUND: none 或逐条列出\nEVIDENCE: 简短列出关键工具结果。"
+}

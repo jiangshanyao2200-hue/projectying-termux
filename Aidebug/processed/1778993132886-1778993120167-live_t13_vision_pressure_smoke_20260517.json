@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "live-t13-vision-pressure-smoke-20260517",
+  "text": "Aidebug live T13 vision pressure smoke. 只做最小验证，不 build，不 adb，不改代码。任务：1) 保持 `vision_probe` 为 `vision_compact`；2) 通过 `persona_manage.send` 给 `vision_probe` 发送一个足够大的压力 payload，目标至少要明显超过 32KB，内容可用 `MAINTENANCE_STRESS_BLOCK_20260517` 重复很多次，但不要省略，不要截断，不要总结；3) 发送后立刻 `observe` 该角色，检查是否出现 pending maintenance；4) 若出现维护票，确认文本优先指向 `context_vision + context_compact`，并强调这是模型自管路线；5) 再抽样普通角色工具箱，确认 `context_system` 仍是折叠抽屉语义。最终只回报：ROLE / TOOL / MAINTENANCE / DRAWER 四项 PASS 或 FAIL，并给最小证据。"
+}

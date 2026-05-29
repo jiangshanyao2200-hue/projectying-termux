@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-matrix-coordination-upgrade-20260526-1",
+  "text": "请你作为 Matrix · 萤，做一轮真实的全链路协作测试，不要只给计划。\n\n我的观察是：Matrix 现在更像门户和调度母体，应该主动把任务派给其他角色，然后继续保持主任务，不是发完就结束。你这次要验证的就是这个链路。\n\n请你直接把任务拆给两个部门：\n1. Server：只读检查当前 ProjectYing 运行态，重点看 Aidebug/status.json、health.json、performance.json、events.jsonl 的最新状态，判断当前是否真的空闲、是否有 pending 调度、是否有明显卡顿或失败。不要做任何破坏性操作。\n2. Coding：检查源码里 Matrix / persona_manage / 反馈回流链路，重点判断当前是不是存在“Matrix 发出任务后，部门反馈没有及时回到 Matrix”或者“需要 WAIT / observe 但没有形成闭环”的问题，必要时指出代码坐标或 Aidebug 证据。\n\n你自己不要停在发任务上。发出去以后继续观察回执，必要时用 persona_manage.observe 把折叠结果收回来，然后把两边的反馈合并成一份给用户看的结论。\n\n最后回复请直接给我这几项：\n- 你发给 Server 和 Coding 的实际任务摘要\n- 两边回来了什么关键反馈\n- 你判断 Matrix 现在是否真的在发挥调度母体作用\n- 如果链路还有缺口，下一步最小修复方向是什么\n\n请保持中文，简洁但要有事实。不要把任务再改写成空泛计划。"
+}

@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "live-t11-vision-compact-smoke-20260517",
+  "text": "Aidebug live T11 Context Vision / vision_compact smoke。请只做最小验证，不扩写产品，不 build，不 adb，不改代码。任务：1) Matrix 创建或重载一个动态角色 `vision_probe`，上下文治理模式必须是 `vision_compact`，默认工具至少应包含 `context_vision` 和 `context_compact`；2) 让 `vision_probe` 做一次短 probe，必须实际调用 `context_vision`，可用 `context_percent=0` 或 `mode=tiny`，并回报下一轮可见度提示；3) 再让它做一次稍深的对账，必须把可见度提升到中档或更高，优先验证提示中出现“可见度约 xx%”而不是只显示 tiny/medium/full；4) 检查达到治理条件时，维护提示是否指向 `context_vision + context_compact`；5) 复查工具箱里 `context_system` 是否是折叠抽屉语义，且普通角色没有同时泛滥展开 `context_manage/context_summary/context_vision/context_compact`。最终只回报：ROLE / TOOL / VISIBILITY / MAINTENANCE / DRAWER 五项 PASS 或 FAIL，并注明最小证据。"
+}

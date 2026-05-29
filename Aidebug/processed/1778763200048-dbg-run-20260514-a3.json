@@ -1,0 +1,1 @@
+{"persona":"matrix","debug_session_id":"dbg-run-20260514-a3","text":"只做一件事：进入 focus 后，验证动态角色 工（role_tool_probe）的角色专属工具链路，不改代码。要求：1) 进入 focus；2) 向 工 发送一条最小消息，让它执行 role_hello_tool；3) 再检查普通 Coding 常驻工具列表里不应出现 role_hello_tool。结尾只输出三行：A) role_topbar_idle PASS/FAIL；B) role_tool_execution PASS/FAIL；C) coding_tool_leak PASS/FAIL；每行后面跟最短证据。"}

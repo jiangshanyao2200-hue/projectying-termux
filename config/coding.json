@@ -1,0 +1,116 @@
+{
+  "api_body": "third_party",
+  "current_official_provider": 1,
+  "current_third_party_provider": 5,
+  "provider_selection_override": true,
+  "providers": [
+    {
+      "body": "official",
+      "official_kind": "codex",
+      "name": "CODEX",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "",
+      "api_keys": [],
+      "current_api_key": 0,
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "reasoning_summary": "auto",
+      "sse_on": true,
+      "timeout_secs": 240
+    },
+    {
+      "body": "official",
+      "official_kind": "deep_seek",
+      "name": "DEEPSEEK",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key": "",
+      "api_keys": [],
+      "current_api_key": 0,
+      "model": "deepseek-reasoner",
+      "sse_on": true,
+      "timeout_secs": 240
+    },
+    {
+      "body": "third_party",
+      "official_kind": "codex",
+      "name": "聚合CODEX",
+      "base_url": "http://154.44.8.149:3500/openai/plus",
+      "api_key": "sk-user-c74fdd958576121620968b9c",
+      "api_keys": [
+        "sk-user-c74fdd958576121620968b9c",
+        "sk-user-266c7e263167f22ca9356de8"
+      ],
+      "current_api_key": 0,
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "reasoning_summary": "auto",
+      "sse_on": true,
+      "timeout_secs": 240
+    },
+    {
+      "body": "third_party",
+      "official_kind": "codex",
+      "name": "清风CODEX",
+      "base_url": "http://45.205.26.177:9999/v1",
+      "api_key": "sk-v8HfwkYo1ApRCtoQiXz4ixs9sWTiCG0prCzaOkoWrM93wiOM",
+      "api_keys": [
+        "sk-hU6KIO7t9saSbkRa0PkU5YQRCsS6Ut8yWAUYam8YfnY26eze",
+        "sk-v8HfwkYo1ApRCtoQiXz4ixs9sWTiCG0prCzaOkoWrM93wiOM"
+      ],
+      "current_api_key": 1,
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "reasoning_summary": "auto",
+      "sse_on": true,
+      "timeout_secs": 240
+    },
+    {
+      "body": "third_party",
+      "official_kind": "deep_seek",
+      "name": "中转DEEPSEEK",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key": "",
+      "api_keys": [],
+      "current_api_key": 0,
+      "model": "deepseek-reasoner",
+      "sse_on": true,
+      "timeout_secs": 240
+    },
+    {
+      "body": "third_party",
+      "official_kind": "codex",
+      "name": "大猫",
+      "base_url": "https://api.rainp.xyz/v1",
+      "api_key": "sk-FtRjfDfFCDlN9O6swI20VdAmEtETn7LxVPfbGH0FKvqPZ7Ni",
+      "api_keys": [
+        "sk-i6sZ20hrtfQcSI0wniG0gwndcmwmvzBOh0M0NGiwjVSVyt8Y",
+        "sk-TESkxPrCVaLh1cdR8OuzAjJpR1RVW3FjAxtplaAxGDeOKiMQ",
+        "sk-Y9oBGnToqX4Hg5Z3ZOY3k50mo9JB2CxBIOOBg7eHRq7JGhkt",
+        "sk-FtRjfDfFCDlN9O6swI20VdAmEtETn7LxVPfbGH0FKvqPZ7Ni"
+      ],
+      "current_api_key": 3,
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "reasoning_summary": "auto",
+      "sse_on": true,
+      "timeout_secs": 300
+    },
+    {
+      "body": "third_party",
+      "official_kind": "codex",
+      "name": "新提供方",
+      "base_url": "https://api.xiaojiu.one",
+      "api_key": "sk-ac13d0b22f290d58da43813c74ed8c839b6e2a034ed9baffcabab4ec0d2e4a1c",
+      "api_keys": [
+        "sk-ac13d0b22f290d58da43813c74ed8c839b6e2a034ed9baffcabab4ec0d2e4a1c"
+      ],
+      "current_api_key": 0,
+      "model": "gpt-5.5",
+      "reasoning_effort": "medium",
+      "reasoning_summary": "auto",
+      "service_tier": "fast",
+      "sse_on": true,
+      "timeout_secs": 240
+    }
+  ]
+}

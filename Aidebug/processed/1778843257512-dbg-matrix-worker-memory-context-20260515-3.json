@@ -1,0 +1,5 @@
+{
+  "persona": "matrix",
+  "debug_session_id": "dbg-matrix-worker-memory-context-20260515-3",
+  "text": "继续做一个小批次测试，只验证 worker 的 memory/context 独立路由，不做 persona_send。请按顺序执行：\n1. 用 memory_add persona=worker 写入短记忆：Aidebug worker memory route test 2026-05-15。\n2. 用 memory_check 或 memory_read persona=worker 读取刚写入内容，确认 worker 可读。\n3. 用 context_manage persona=worker 写入或追加短上下文：Aidebug worker context route test 2026-05-15。\n4. 再用 context_manage 或折叠观察确认 worker context 作用域独立，不污染 Matrix。\n5. 简单报告 datememory_context_over_limit 状态，但不要整理大记忆。\n\n最终只回复：MEMORY_ROUTE、CONTEXT_ROUTE、MATRIX_POLLUTION、DATEMEMORY_LIMIT、BUGS_FOUND。"
+}

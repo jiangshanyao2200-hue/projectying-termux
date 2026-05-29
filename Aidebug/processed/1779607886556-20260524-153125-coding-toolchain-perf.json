@@ -1,0 +1,5 @@
+{
+  "persona": "coding",
+  "debug_session_id": "20260524-coding-toolchain-perf",
+  "text": "全面性能测试任务：请在 /data/data/com.termux/files/home/projectying-perf-demo 番茄钟网页上做一次很小的工程迭代：新增 prefers-reduced-motion 支持，并在页面底部增加一个极简版本号 v0.2。保持 index.html/style.css/app.js 三文件结构。请直接施工，少长篇思考；完成后运行轻量验证并只报告改动文件和路径。"
+}
